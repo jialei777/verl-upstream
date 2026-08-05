@@ -20,7 +20,6 @@ import ray
 import ray._private.worker
 import torch
 
-from .platform_manager import get_platform
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -69,22 +68,16 @@ def patch_ray_worker():
         original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
 
         def patched_func(self, resource_name, resource_regex):
-            if hasattr(self, "original_visible_accelerator_ids") and isinstance(
-                self.original_visible_accelerator_ids, dict
-            ):
-                self.original_visible_accelerator_ids.pop(resource_name, None)
             try:
                 return original_func(self, resource_name, resource_regex)
-            except Exception:
-                resource_ids = self.core_worker.resource_ids()
-                assigned_ids = set()
-                import re
+            except IndexError as e:
+                import traceback
 
-                for resource, assignment in resource_ids.items():
-                    if resource == resource_name or re.match(resource_regex, resource):
-                        for resource_id, _ in assignment:
-                            assigned_ids.add(resource_id)
-                return [str(i) for i in assigned_ids]
+                print(
+                    f"[patch_ray_worker] Intercepted Ray accelerator lookup IndexError for resource '{resource_name}': {e}\n"
+                    f"{traceback.format_exc()}"
+                )
+                return []
 
         ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource = patched_func
     except Exception as e:
@@ -188,6 +181,8 @@ def get_platform_worker_env_vars(
     device_name: str,
 ) -> dict:
     """Generates platform-specific environment variables for worker nodes."""
+    from verl.plugin.platform import get_platform
+
     env_vars = {}
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]

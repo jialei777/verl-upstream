@@ -44,13 +44,13 @@ python3 -m verl.trainer.sft_trainer_ray \
     data.val_max_samples=32 \
     data.train_batch_size=16 \
     data.micro_batch_size_per_gpu=2 \
-    data.pad_mode=tpu_binned_pack \
+    data.pad_mode=no_padding \
     data.truncation=error \
     data.use_dynamic_bsz=False \
     data.max_length=2048 \
     data.max_token_len_per_gpu=2048 \
     data.ignore_input_ids_mismatch=True \
-    model.use_remove_padding=False \
+    model.use_remove_padding=True \
     engine=torchtitan \
     model=hf_model \
     model.path="${MODEL_PATH}" \
@@ -77,6 +77,7 @@ python3 -m verl.trainer.sft_trainer_ray \
     trainer.experiment_name="${exp_name}" \
     trainer.total_epochs=2 \
     trainer.resume_mode=disable \
+    trainer.device=tpu \
     trainer.nnodes="${NNODES_TRAINER}" \
     trainer.n_gpus_per_node="${N_CHIPS_TRAINER}" \
     "$@"

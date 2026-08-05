@@ -21,7 +21,21 @@ Environment variables required:
 
 ---
 
-### 2. Submit a GRPO Training Job
+### 2. Ensure Clean Cluster and Set Up Port Forwarding (Optional)
+
+Before submitting a new job, you can reset TPU cluster state by deleting all cluster pods (or worker pods), which will be automatically recreated by the KubeRay operator:
+
+```bash
+# Delete all pods to reset head and worker nodes
+kubectl delete pod -l ray.io/cluster=ray-tpu-v6e-cluster
+
+# Port forward Ray head dashboard service to local port 23333 in the background
+kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 23333:8265 > /dev/null 2>&1 &
+```
+
+---
+
+### 3. Submit a GRPO Training Job
 
 You can submit the training job to your Ray cluster using the Ray CLI (`ray job submit`):
 
@@ -42,8 +56,7 @@ ray job submit --address "${RAY_ADDRESS}" \
       "RAY_memory_monitor_refresh_ms": "0",
       "RAY_memory_usage_threshold": "0.99",
       "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
-      "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
-      "WANDB_API_KEY": "'"${WANDB_API_KEY}"'"
+      "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"
     }
   }' \
   -- bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh

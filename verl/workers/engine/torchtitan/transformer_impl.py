@@ -57,10 +57,6 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     compute_global_batch_num_tokens,
     compute_tpu_max_seq_len,
     monkey_patch_varlen_attention_tpu,
-    prepare_tpu_binned_pack_micro_batches,
-    prepare_tpu_model_outputs_if_packed,
-    reconstruct_tpu_packed_metadata_tensors,
-    safe_to_padded_tensor,
     synchronize_tpu_loss,
     unwrap_metadata,
 )
@@ -370,14 +366,11 @@ class TorchTitanEngine(BaseEngine):
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-        if is_tpu and pad_mode == DatasetPadMode.NO_PADDING:
-            micro_batches, indices = prepare_tpu_binned_pack_micro_batches(data)
-        else:
-            micro_batches, indices = prepare_micro_batches(
-                data=data,
-                dp_group=self.get_data_parallel_group(),
-                same_micro_num_in_dp=True,
-            )
+        micro_batches, indices = prepare_micro_batches(
+            data=data,
+            dp_group=self.get_data_parallel_group(),
+            same_micro_num_in_dp=True,
+        )
 
         output_lst = []
 
@@ -629,39 +622,11 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
     """TorchTitan engine implementation for language models with LM head."""
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
-        if "tpu_custom_attention_mask" in micro_batch.keys():
-            # Packed TPU format
-            input_ids = micro_batch["input_ids"]
-            position_ids = micro_batch["position_ids"]
-            labels = torch.roll(input_ids, shifts=-1, dims=1)
-            labels[:, -1] = -100
-            attention_mask = micro_batch["tpu_custom_attention_mask"]
-            extra_inputs = {"positions": position_ids}
-            extra_kwargs = {"attention_masks": attention_mask}
-            output_args = {"labels": labels}
-
-            # Send to TPU device and ensure contiguous
-            device = self.trainer.device
-            input_ids = input_ids.to(device).contiguous()
-            extra_inputs = {
-                k: v.to(device).contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()
-            }
-            extra_kwargs = {
-                k: v.to(device).contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()
-            }
-            output_args = {
-                k: v.to(device).contiguous() if isinstance(v, torch.Tensor) else v for k, v in output_args.items()
-            }
-
-            return input_ids, extra_inputs, extra_kwargs, output_args
-
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         assert pad_mode in (
             DatasetPadMode.NO_PADDING,
             DatasetPadMode.RIGHT,
-            DatasetPadMode.TPU_BINNED_PACK,
-            "tpu_binned_pack",
         ), f"pad_mode {pad_mode} not supported"
 
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
@@ -754,8 +719,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         assert pad_mode in (
             DatasetPadMode.NO_PADDING,
             DatasetPadMode.RIGHT,
-            DatasetPadMode.TPU_BINNED_PACK,
-            "tpu_binned_pack",
         ), f"pad_mode {pad_mode} not supported"
 
         temperature = micro_batch["temperature"]
@@ -767,18 +730,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         labels = output_args["labels"]
         model_output = {}
 
-        tpu_outputs = prepare_tpu_model_outputs_if_packed(
-            logits=logits,
-            labels=labels,
-            micro_batch=micro_batch,
-            temperature=temperature,
-            calculate_entropy=calculate_entropy,
-            entropy_checkpointing=self.engine_config.entropy_checkpointing,
-        )
-
-        if tpu_outputs is not None:
-            log_probs, entropy = tpu_outputs
-        elif pad_mode == DatasetPadMode.RIGHT:
+        if pad_mode == DatasetPadMode.RIGHT:
             logits = logits / temperature
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
@@ -789,10 +741,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             log_probs = logprobs_from_logits(logits=logits, labels=labels)
         else:
             input_ids = micro_batch["input_ids"]
-            if hasattr(input_ids, "offsets"):
-                cu_seqlens = input_ids.offsets()
-            else:
-                cu_seqlens = micro_batch["tpu_cu_seqlens"].squeeze(0)
+            cu_seqlens = input_ids.offsets()
             if use_remove_padding:
                 labels = labels.squeeze(0)
                 logits_rmpad = logits.squeeze(0)
@@ -853,10 +802,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         micro_batch = micro_batch.to(get_device_id())
-
-        # Guard TPU-specific packed metadata reconstruction to run only on TPU devices
-        if device_name == "tpu":
-            reconstruct_tpu_packed_metadata_tensors(micro_batch, get_device_id())
 
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 

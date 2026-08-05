@@ -53,9 +53,10 @@ python3 -m verl.trainer.main_ppo \
     +data.max_token_len_per_gpu=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    +data.pad_mode=no_padding \
     actor_rollout_ref.actor.strategy=torchtitan \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.model.use_remove_padding=False \
+    actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
@@ -87,7 +88,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len=512 \
     trainer.val_before_train=False \
-    trainer.logger="['console','tensorboard','wandb']" \
+    trainer.logger="['console','tensorboard']" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.save_freq=-1 \
