@@ -19,8 +19,6 @@ from tensordict.tensorclass import NonTensorData
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
-from verl.utils.device import get_device_name
-from verl.workers.utils.tpu_static_packing import get_packed_sequence_offsets_and_lens_tpu
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -117,10 +115,6 @@ def get_packed_sequence_offsets_and_lens(
             - response_lens (torch.Tensor): Length of the response section for each sequence.
             - max_response_len (int): Maximum response length across the batch.
     """
-    is_tpu = get_device_name() == "tpu" or "tpu_custom_attention_mask" in data.keys()
-    if is_tpu and not (getattr(tensor, "is_nested", False) or hasattr(tensor, "offsets")):
-        return get_packed_sequence_offsets_and_lens_tpu(tensor, data, values)
-
     if "prompts" in data.keys() and "responses" in data.keys():
         prompt_ids = data["prompts"]
         response_ids = data["responses"]
@@ -200,7 +194,7 @@ def get_packed_sequence_offsets_and_lens(
         sequence_lens = prompt_lens + response_lens
         sequence_offsets = sequence_lens.cumsum(dim=0)
     else:
-        return get_packed_sequence_offsets_and_lens_tpu(tensor, data, values)
+        raise ValueError("Unable to extract sequence offsets and lengths from input tensor and data.")
 
     return sequence_offsets, response_lens, max_response_len
 
