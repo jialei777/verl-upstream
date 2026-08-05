@@ -77,6 +77,7 @@ python3 -m verl.trainer.sft_trainer_ray \
     trainer.experiment_name="${exp_name}" \
     trainer.total_epochs=2 \
     trainer.resume_mode=disable \
+    trainer.device=tpu \
     trainer.nnodes="${NNODES_TRAINER}" \
     trainer.n_gpus_per_node="${N_CHIPS_TRAINER}" \
     "$@"

@@ -20,7 +20,6 @@ import ray
 import ray._private.worker
 import torch
 
-from verl.plugin.platform import get_platform
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -182,6 +181,8 @@ def get_platform_worker_env_vars(
     device_name: str,
 ) -> dict:
     """Generates platform-specific environment variables for worker nodes."""
+    from verl.plugin.platform import get_platform
+
     env_vars = {}
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
