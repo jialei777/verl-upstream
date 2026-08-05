@@ -233,10 +233,11 @@ class vLLMColocateWorkerExtension:
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
 
-        if self.device is None:
-            # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
+        if getattr(self, "device", None) is None:
+            # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU, TPU);
             # fall back to the worker's local rank on the current accelerator.
             self.device = torch.device(f"{get_device_name()}:{self.local_rank}")
+        assert self.device is not None
 
         # =========================== step 1: prepare for weight loading ===========================
         quant_reload_states = None
