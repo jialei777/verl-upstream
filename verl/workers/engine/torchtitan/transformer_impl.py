@@ -55,7 +55,6 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
     compute_global_batch_num_tokens,
-    compute_tpu_max_seq_len,
     monkey_patch_varlen_attention_tpu,
     synchronize_tpu_loss,
     unwrap_metadata,
@@ -365,7 +364,6 @@ class TorchTitanEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         micro_batches, indices = prepare_micro_batches(
             data=data,
             dp_group=self.get_data_parallel_group(),
@@ -624,25 +622,14 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-        assert pad_mode in (
-            DatasetPadMode.NO_PADDING,
-            DatasetPadMode.RIGHT,
-        ), f"pad_mode {pad_mode} not supported"
+        assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
         output_args = {}
 
-        if pad_mode == DatasetPadMode.RIGHT:
-            # For static/pre-padded RIGHT padding format, no nested/jagged tensor mechanics are needed.
-            # Shifting input_ids by -1 yields target labels.
-            labels = torch.roll(input_ids, shifts=-1, dims=1)
-            labels[:, -1] = -100  # Mask out the last wrapped label token
-            attention_mask = micro_batch["attention_mask"]
-            if position_ids.dim() == 3:
-                position_ids = position_ids.transpose(0, 1)
-        elif use_remove_padding:
+        if use_remove_padding:
             input_ids = input_ids.values().unsqueeze(0)
             if position_ids.dim() == 3:
                 position_ids = position_ids.values().unsqueeze(1)
@@ -660,26 +647,27 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
-            if self.engine_config.max_seq_len is not None:
-                max_seq_len = self.engine_config.max_seq_len
-            elif input_ids.device.type == "tpu":
-                max_seq_len = compute_tpu_max_seq_len(input_ids)
-            else:
-                max_seq_len = max(input_ids.offsets().diff())
+            max_seq_len = max(input_ids.offsets().diff())
 
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
-            input_ids = safe_to_padded_tensor(input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len))
+            input_ids = torch.nested.to_padded_tensor(
+                input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
+            )
 
             if position_ids.dim() == 3:
-                position_ids = safe_to_padded_tensor(
+                position_ids = torch.nested.to_padded_tensor(
                     position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
                 ).transpose(0, 1)
             else:
-                position_ids = safe_to_padded_tensor(position_ids, padding=0, output_size=(batch_size, max_seq_len))
+                position_ids = torch.nested.to_padded_tensor(
+                    position_ids, padding=0, output_size=(batch_size, max_seq_len)
+                )
 
             attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
             attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-            attention_mask = safe_to_padded_tensor(attention_mask, padding=0, output_size=(batch_size, max_seq_len))
+            attention_mask = torch.nested.to_padded_tensor(
+                attention_mask, padding=0, output_size=(batch_size, max_seq_len)
+            )
 
         extra_inputs = {
             "positions": position_ids,
@@ -716,10 +704,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         pad_mode = unwrap_metadata(pad_mode)
-        assert pad_mode in (
-            DatasetPadMode.NO_PADDING,
-            DatasetPadMode.RIGHT,
-        ), f"pad_mode {pad_mode} not supported"
+        assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
         temperature = micro_batch["temperature"]
         temperature = unwrap_metadata(temperature)
@@ -730,7 +715,41 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         labels = output_args["labels"]
         model_output = {}
 
-        if pad_mode == DatasetPadMode.RIGHT:
+        input_ids = micro_batch["input_ids"]
+        cu_seqlens = input_ids.offsets()
+        if use_remove_padding:
+            labels = labels.squeeze(0)
+            logits_rmpad = logits.squeeze(0)
+            # PyTorch's autograd doesn't allow in-place modification of views when gradients need to flow back
+            logits_rmpad = logits_rmpad / temperature
+
+            inplace_backward = True
+            if calculate_entropy:
+                inplace_backward = False
+            log_probs = logprobs_from_logits(
+                logits=logits_rmpad,
+                labels=labels,
+                inplace_backward=inplace_backward,
+            )
+
+            if calculate_entropy:
+                if not self.engine_config.entropy_checkpointing:
+                    if self.engine_config.entropy_from_logits_with_chunking:
+                        entropy_rmpad = self.compute_entropy_from_logits(
+                            logits_rmpad,
+                            chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+                        )  # ((total_nnz / sp) + pad)
+                    else:
+                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                else:
+                    entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                        self.compute_entropy_from_logits, logits_rmpad
+                    )
+
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
+            if calculate_entropy:
+                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+        else:
             logits = logits / temperature
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
@@ -738,60 +757,16 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            log_probs = logprobs_from_logits(logits=logits, labels=labels)
-        else:
-            input_ids = micro_batch["input_ids"]
-            cu_seqlens = input_ids.offsets()
-            if use_remove_padding:
-                labels = labels.squeeze(0)
-                logits_rmpad = logits.squeeze(0)
-                # PyTorch's autograd doesn't allow in-place modification of views when gradients need to flow back
-                logits_rmpad = logits_rmpad / temperature
-
-                inplace_backward = True
-                if calculate_entropy:
-                    inplace_backward = False
-                log_probs = logprobs_from_logits(
-                    logits=logits_rmpad,
-                    labels=labels,
-                    inplace_backward=inplace_backward,
-                )
-
-                if calculate_entropy:
-                    if not self.engine_config.entropy_checkpointing:
-                        if self.engine_config.entropy_from_logits_with_chunking:
-                            entropy_rmpad = self.compute_entropy_from_logits(
-                                logits_rmpad,
-                                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
-                            )  # ((total_nnz / sp) + pad)
-                        else:
-                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
-                    else:
-                        entropy_rmpad = torch.utils.checkpoint.checkpoint(
-                            self.compute_entropy_from_logits, logits_rmpad
-                        )
-
-                log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
-                if calculate_entropy:
-                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
-            else:
-                logits = logits / temperature
-                if calculate_entropy:
-                    if not self.engine_config.entropy_checkpointing:
-                        entropy = verl_F.entropy_from_logits(logits)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
-
-                seq_lengths = cu_seqlens.diff()
-                starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
-                logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
-                logits_rmpad = torch.cat([t for t in logits.unbind()])
-                log_probs = logprobs_from_logits(logits=logits_rmpad, labels=output_args["labels"])
-                log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
-                if calculate_entropy:
-                    entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
-                    entropy_rmpad = torch.cat([t for t in entropy.unbind()])
-                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+            seq_lengths = cu_seqlens.diff()
+            starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
+            logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
+            logits_rmpad = torch.cat([t for t in logits.unbind()])
+            log_probs = logprobs_from_logits(logits=logits_rmpad, labels=output_args["labels"])
+            log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+            if calculate_entropy:
+                entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
+                entropy_rmpad = torch.cat([t for t in entropy.unbind()])
+                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
 
         model_output["log_probs"] = log_probs
         if calculate_entropy:
