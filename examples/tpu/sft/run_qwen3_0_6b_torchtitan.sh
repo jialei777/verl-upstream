@@ -70,7 +70,7 @@ python3 -m verl.trainer.sft_trainer_ray \
     engine.use_torch_compile=False \
     engine.attn_type=varlen \
     engine.max_seq_len=2048 \
-    trainer.test_freq=after_each_epoch \
+    trainer.test_freq=-1 \
     trainer.save_freq=-1 \
     trainer.logger="['console']" \
     trainer.project_name="${project_name}" \
