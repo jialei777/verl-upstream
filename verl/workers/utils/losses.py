@@ -27,75 +27,34 @@ from verl.workers.utils.padding import no_padding_2_padding
 from verl.workers.engine.torchtitan.tpu_utils import safe_to_padded_tensor
 
 
-class DummyConfig:
-    """Fallback configuration object when config is passed as None during SFT loss evaluation."""
 
-    def __init__(self):
-        self.global_batch_info = {}
-        self.loss_scale_factor = None
-        self.loss_agg_mode = "token-mean"
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
-    """Compute Supervised Fine-Tuning (SFT) loss for actor model.
-
-    Supports both padded (RIGHT) and packed/nested sequence representations.
-
-    Args:
-        config (ActorConfig): Configuration object for actor training.
-        model_output (dict): Model forward outputs containing 'log_probs'.
-        data (TensorDict): Data batch containing token IDs, masks, and metadata.
-        dp_group: Data parallel process group (optional).
-
-    Returns:
-        tuple[torch.Tensor, dict]: Computed SFT loss and empty metrics dict.
-    """
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-
     dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
     batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
 
     log_prob = model_output["log_probs"]
 
     if pad_mode == DatasetPadMode.NO_PADDING:
-        log_prob = no_padding_2_padding(log_prob, data)
+        # log_prob and loss mask are nested tensors of shape [bsz, j1]
+        # for each sample, loss mask shape is [1, prompt_length + response_length]
+        loss_mask = data["loss_mask"]
 
-        # construct global batch info
-        if config is None:
-            config = DummyConfig()
+        log_prob_flatten = log_prob.values()
+        loss_mask_flatten = loss_mask.values()
 
-        config.global_batch_info["dp_size"] = dp_size
-        config.global_batch_info["batch_num_tokens"] = batch_num_tokens
-        config.global_batch_info["global_batch_size"] = data["global_batch_size"]
-        config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+        # left-shift the loss mask by one token to align with log_prob
+        loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
 
-        mask_key = "response_mask" if "response_mask" in data.keys() else "loss_mask"
-        response_mask = data[mask_key]
-        if getattr(response_mask, "is_nested", False):
-            response_mask = no_padding_2_padding(response_mask, data).to(bool)
-        else:
-            response_mask = response_mask.to(bool)
-
-        # Bypass zero-sequence length empty tensor backward pass issues
-        if log_prob.shape[1] == 0:
-            log_prob = torch.zeros(
-                (log_prob.shape[0], 1), device=log_prob.device, dtype=log_prob.dtype, requires_grad=True
-            )
-            response_mask = torch.zeros((response_mask.shape[0], 1), device=response_mask.device, dtype=torch.bool)
-
-        loss = agg_loss(
-            loss_mat=-log_prob, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
-        )
-    elif pad_mode == DatasetPadMode.RIGHT:
-        if "response_mask" in data.keys():
-            mask = data["response_mask"].to(bool)
-            mask[:, -1] = False
-        else:
-            mask = data["loss_mask"].to(bool)
-            mask = torch.cat([mask[:, 1:], torch.zeros_like(mask[:, :1])], dim=1)
-        loss = -masked_sum(log_prob, mask) / batch_num_tokens * dp_size
+        # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
+        # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
+        # the loss should be scaled by `num_microbatches` for pp schedule.
+        loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
     else:
-        raise ValueError(f"Unsupported pad_mode: {pad_mode}")
+        response_mask = data["response_mask"].to(bool)
+        loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
 
     return loss, {}
 
@@ -126,7 +85,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
-    # assumes that if any of the global batch info is set, the policy_loss_fn will
+    # global mini-batch loss normalization
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
     # to reflect the mean loss over the global batch
     if (
@@ -148,6 +107,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
 
+    # HACK: PyTorch TPU (torch_tpu) lacks native C++ kernel support for aten::_jagged_to_padded_dense_forward.
+    # We use safe_to_padded_tensor fallback to unbind and slice-assign NestedTensors into padded 2D dense tensors.
+    # TODO: Remove HACK once aten::_jagged_to_padded_dense_forward is supported natively in torch_tpu,
+    # and revert to standard data.select(*fields).to_padded_tensor().
     if get_device_name() == "tpu":
         padded_dict = {}
         for k in fields:
@@ -246,6 +209,9 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     else:
         metric_aggregation = AggregationType.MEAN
 
+    # HACK: PyTorch TPU (torch_tpu) lacks native C++ kernel support for aten::_jagged_to_padded_dense_forward.
+    # We use safe_to_padded_tensor fallback to unbind and slice-assign NestedTensors into padded 2D dense tensors.
+    # TODO: Remove HACK once aten::_jagged_to_padded_dense_forward is supported natively in torch_tpu.
     if get_device_name() == "tpu":
         padded_dict = {}
         for k in ("values", "returns", "response_mask"):

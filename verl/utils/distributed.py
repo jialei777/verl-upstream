@@ -92,7 +92,7 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
 
     # On TPU platforms, import torch_tpu to register the TPU communication backend with torch.distributed.
     if get_platform().device_name == "tpu":
-        pass
+        import torch_tpu  # noqa: F401
 
     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
     backend = backend or f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"

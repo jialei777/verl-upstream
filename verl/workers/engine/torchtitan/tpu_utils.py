@@ -30,8 +30,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# Default sequence packing constants
-SEQUENCE_ALIGNMENT_MULTIPLE = 128
+
 
 
 def unwrap_metadata(val):
@@ -124,23 +123,12 @@ def synchronize_tpu_loss(loss: torch.Tensor):
         pass
 
 
-def compute_tpu_max_seq_len(input_ids: torch.Tensor) -> int:
-    """Rounds up sequence length to a multiple of 128 to ensure memory stride alignment on TPU."""
-    offsets = input_ids.offsets()
-    offsets_tpu = torch.empty(offsets.shape, dtype=offsets.dtype, device=offsets.device)
-    offsets_tpu.copy_(offsets)
-    max_seq_len = int(max(offsets_tpu.cpu().diff()))
-    max_seq_len = (
-        (max_seq_len + SEQUENCE_ALIGNMENT_MULTIPLE - 1) // SEQUENCE_ALIGNMENT_MULTIPLE
-    ) * SEQUENCE_ALIGNMENT_MULTIPLE
-    return max_seq_len
-
-
 def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) -> torch.Tensor:
     """Safely converts a NestedTensor to a padded dense tensor on TPU.
 
-    PyTorch TPU currently lacks native C++ kernel support for `aten::_jagged_to_padded_dense_forward`.
+    HACK: PyTorch TPU currently lacks native C++ kernel support for `aten::_jagged_to_padded_dense_forward`.
     Falling back to `unbind()` + tensor slice assignment avoids operator runtime errors on TPU.
+    TODO: Remove HACK once `aten::_jagged_to_padded_dense_forward` is natively supported in torch_tpu.
     """
     if not getattr(nt, "is_nested", False):
         return nt
@@ -160,3 +148,5 @@ def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) ->
             slices = (i,) + tuple(slice(0, s) for s in t.shape)
             out[slices] = t
         return out
+
+

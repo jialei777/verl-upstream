@@ -397,20 +397,32 @@ def patch_vllm_for_tpu() -> None:
 
             # Now load memory-mapped version to share pages
             gc.collect()
-            state_dict_data = torch.load(shm_file_path, map_location="cpu", weights_only=False, mmap=True)
+            # HACK: Catch FileNotFoundError/Timeout when state_dict_0.pt is absent on secondary TPU nodes, falling back to direct HF loading.
+            # TODO: remove HACK once shared memory weight cache propagation across Ray multi-node TPU VM topology is fully guaranteed.
+            try:
+                state_dict_data = torch.load(shm_file_path, map_location="cpu", weights_only=False, mmap=True)
+            except Exception as e:
+                logger.warning(f"Shared memory state dict {shm_file_path} not available: {e}")
+                state_dict_data = None
         else:
             # Node worker processes: wait for ready marker
             t_wait_start = time.time()
             while not os.path.exists(shm_ready_path):
                 time.sleep(0.05)
-                if time.time() - t_wait_start > 300:
-                    raise TimeoutError(f"Worker rank {rank_val} timed out waiting for {shm_ready_path}")
+                if time.time() - t_wait_start > 30:
+                    break
 
             # Stagger ranks before loading to serialize memory traffic
             time.sleep((rank_val % 4) * 0.4)
 
             gc.collect()
-            state_dict_data = torch.load(shm_file_path, map_location="cpu", weights_only=False, mmap=True)
+            # HACK: Catch FileNotFoundError/Timeout when state_dict_0.pt is absent on secondary TPU nodes, falling back to direct HF loading.
+            # TODO: remove HACK once shared memory weight cache propagation across Ray multi-node TPU VM topology is fully guaranteed.
+            try:
+                state_dict_data = torch.load(shm_file_path, map_location="cpu", weights_only=False, mmap=True)
+            except Exception as e:
+                logger.warning(f"Shared memory state dict {shm_file_path} not available: {e}")
+                state_dict_data = None
 
         if hasattr(self, "worker") and self.worker is not None:
             worker_inst = self.worker
