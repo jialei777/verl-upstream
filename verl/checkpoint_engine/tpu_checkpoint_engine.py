@@ -341,7 +341,7 @@ class TPUCheckpointEngine(CheckpointEngine):
 
         # Time Registry update
         t_reg_start = time.perf_counter()
-        await self.registry.set_weights.remote(step_key, ref)
+        await self.registry.set_weights.remote(step_key, [ref])
         t_reg = time.perf_counter() - t_reg_start
 
         t_total = time.perf_counter() - t_start

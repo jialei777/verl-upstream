@@ -362,6 +362,8 @@ def patch_vllm_for_tpu() -> None:
                         pass
                 return 0
 
+            if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
+                state_dict_ref = state_dict_ref[0]   # unwrap the nesting from set_weights
             if isinstance(state_dict_ref, str):
                 state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
             elif isinstance(state_dict_ref, ray.ObjectRef):
