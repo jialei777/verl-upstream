@@ -90,9 +90,17 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
 
     import torch.distributed
 
-    # On TPU platforms, import torch_tpu to register the TPU communication backend with torch.distributed.
+    # On TPU platforms, import torch_tpu and ensure PjRtClient is initialized before process group creation
     if get_platform().device_name == "tpu":
-        pass
+        try:
+            import torch_tpu
+
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            if hasattr(torch, "tpu") and hasattr(torch.tpu, "set_device"):
+                torch.tpu.set_device(local_rank)
+            _ = torch.empty(1, device="tpu")
+        except Exception as e:
+            logger.warning(f"Failed to pre-initialize TPU runtime: {e}")
 
     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
     backend = backend or f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}"

@@ -24,12 +24,12 @@ MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
 
-# TPU 2-slice v6e-8 configurations
-export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
-export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+# TPU 2-slice v6e-8 configurations (1 chip trainer, 1 chip sampler/rollout)
+export NNODES_TRAINER=1       # 1 host for training
+export N_CHIPS_TRAINER=1      # 1 TPU chip for training
 
-export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+export NNODES_ROLLOUT=1       # 1 host for rollout
+export N_CHIPS_ROLLOUT=1      # 1 TPU chip for rollout
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 
@@ -70,8 +70,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.actor.torchtitan.tensor_parallel_size=2 \
-    actor_rollout_ref.actor.torchtitan.data_parallel_shard_size=4 \
+    actor_rollout_ref.actor.torchtitan.tensor_parallel_size=1 \
+    actor_rollout_ref.actor.torchtitan.data_parallel_shard_size=1 \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.rollout.name=vllm \
@@ -93,7 +93,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=2 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=5 \
+    trainer.total_training_steps=1 \
     trainer.nnodes="${NNODES_TRAINER}" \
     trainer.n_gpus_per_node="${N_CHIPS_TRAINER}" \
     actor_rollout_ref.rollout.nnodes="${NNODES_ROLLOUT}" \

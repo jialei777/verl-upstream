@@ -188,6 +188,14 @@ class Worker(WorkerHelper):
         # construct a meta from environment variable. Note that the import must be inside the class because
         # it is executed remotely
         import os
+        from verl.plugin.platform import get_platform
+
+        if get_platform().device_name == "tpu":
+            # Remove GKE-injected pod-level cluster metadata that interferes with per-worker/slice slicebuilder runtime
+            for var_to_pop in ["TPU_NAME", "TPU_DEVICE_PLUGIN_HOST_IP", "TPU_DEVICE_PLUGIN_ADDR"]:
+                os.environ.pop(var_to_pop, None)
+            if int(os.environ.get("WORLD_SIZE", "1")) == 1:
+                os.environ.pop("TPU_WORKER_HOSTNAMES", None)
 
         self._setup_env_cuda_visible_devices()
 
@@ -283,9 +291,9 @@ class Worker(WorkerHelper):
 
             os.environ["LOCAL_RANK"] = str(local_rank)
 
-            # Avoid eager device initialization for non-TPU engine workers (e.g. CheckpointEngineWorker)
-            # which could lock TPU chips unnecessarily.
-            if self.__class__.__name__ != "CheckpointEngineWorker" or device_name != "TPU":
+            # Avoid eager device initialization for TPU or non-engine workers (e.g. CheckpointEngineWorker)
+            # which could lock TPU chips unnecessarily before distributed environment is initialized.
+            if device_name != "TPU" and self.__class__.__name__ != "CheckpointEngineWorker":
                 get_torch_device().set_device(int(local_rank))
 
     def _configure_with_store(self, store: dict):

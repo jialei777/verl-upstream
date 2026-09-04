@@ -50,11 +50,15 @@ TPU_HBM_BYTES_MAP = {
 # TPU default 3D mesh topology mappings by pod type or total chips
 TPU_TOPOLOGY_MAP = {
     "v6e-32": "4,8,1",
+    "v6e-16": "4,4,1",
     "v6e-8": "2,4,1",
     "v6e-4": "2,2,1",
+    "v6e-1": "1,1,1",
     32: "4,8,1",
+    16: "4,4,1",
     8: "2,4,1",
     4: "2,2,1",
+    1: "1,1,1",
 }
 
 
@@ -195,7 +199,11 @@ class TPUDeviceModuleProxy:
         return False
 
     def set_device(self, device_index: Any) -> None:
-        pass
+        if hasattr(self._original_module, "set_device"):
+            try:
+                self._original_module.set_device(device_index)
+            except Exception as e:
+                logger.warning(f"torch.tpu.set_device() failed: {e}")
 
     def current_device(self) -> int:
         if hasattr(self._original_module, "current_device"):
@@ -357,22 +365,60 @@ class PlatformTPU(PlatformCUDA):
             "TPU_PROCESS_ADDRESSES": ",".join(sb_addresses),
             "TPU_PROCESS_PORT": str(base_port + local_rank),
             "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
-            "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
             "TPU_VISIBLE_CHIPS": str(local_rank),
+            "ALLOW_MULTIPLE_LIBTPU_LOAD": "1",
+            "TPU_SKIP_MDS_QUERY": "true",
         }
+        if world_size > 1:
+            env_vars["TPU_WORKER_HOSTNAMES"] = ",".join(unique_hostnames)
 
-        # Apply TPU topology and host bounds based on TPU pod type or world size
+        # Apply TPU topology and host bounds based on world size or TPU pod type
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
-        topo = TPU_TOPOLOGY_MAP.get(tpu_type, TPU_TOPOLOGY_MAP.get(world_size, "1,1,1"))
+        topo = TPU_TOPOLOGY_MAP.get(world_size, TPU_TOPOLOGY_MAP.get(tpu_type, "1,1,1"))
+
+        if world_size == 1 or topo == "1,1,1":
+            host_bounds = "1,1,1"
+            chips_per_host_bounds = "1,1,1"
+            chips_per_host = "1"
+            accel_type = "v6e-1"
+            tpu_topo_str = "1x1"
+        elif topo == "2,2,1":
+            host_bounds = "1,1,1"
+            chips_per_host_bounds = "2,2,1"
+            chips_per_host = "4"
+            accel_type = "v6e-4"
+            tpu_topo_str = "2x2"
+        elif topo == "2,4,1":
+            host_bounds = "1,2,1"
+            chips_per_host_bounds = "2,2,1"
+            chips_per_host = "4"
+            accel_type = "v6e-8"
+            tpu_topo_str = "2x4"
+        elif topo == "4,8,1":
+            host_bounds = "2,4,1"
+            chips_per_host_bounds = "2,2,1"
+            chips_per_host = "4"
+            accel_type = "v6e-16"
+            tpu_topo_str = "4x4"
+        else:
+            host_bounds = topo
+            chips_per_host_bounds = "1,1,1"
+            chips_per_host = "1"
+            accel_type = f"v6e-{world_size}"
+            tpu_topo_str = topo.replace(",", "x")
 
         env_vars.update(
             {
                 "TORCH_TPU_TOPOLOGY": topo,
-                "TPU_HOST_BOUNDS": topo,
-                "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-                "CHIPS_PER_HOST": "4",
+                "TPU_TOPOLOGY": tpu_topo_str,
+                "TPU_ACCELERATOR_TYPE": accel_type,
+                "TPU_HOST_BOUNDS": host_bounds,
+                "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
+                "CHIPS_PER_HOST": str(chips_per_host),
+                "TPU_WORKER_ID": str(rank // local_world_size),
+                "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
             }
         )
 
