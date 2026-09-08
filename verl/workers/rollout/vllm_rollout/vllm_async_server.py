@@ -630,6 +630,7 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
+        print(f"[DEBUG VLLM_SERVER] generate: starting engine.generate for request_id={request_id}, prompt_len={len(prompt_ids)}", flush=True)
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
             generator = self.engine.generate(
                 prompt=prompt,
@@ -644,6 +645,7 @@ class vLLMHttpServer:
             async for output in generator:
                 final_res = output
             assert final_res is not None
+            print(f"[DEBUG VLLM_SERVER] generate: engine.generate completed for request_id={request_id}! Generated {len(final_res.outputs[0].token_ids if final_res.outputs else [])} tokens", flush=True)
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),

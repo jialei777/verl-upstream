@@ -30,6 +30,7 @@ import numpy as np
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from verl.plugin.platform.platform_tpu import get_tpu_chip_generation, get_tpu_topology
 from verl.utils.device import get_resource_name
 
 # --- Google TPU specific global constants ---
@@ -215,6 +216,15 @@ def _patched_run_engine_core(*args, **kwargs):
         import vllm.v1.engine.core as v1_core
 
         _orig_run_engine_core = getattr(v1_core.EngineCoreProc, "_unpatched_run_engine_core", None)
+        candidate = getattr(v1_core.EngineCoreProc, "_unpatched_run_engine_core", None)
+        if candidate is not None and candidate is not _patched_run_engine_core:
+            _orig_run_engine_core = candidate
+        else:
+            raw = getattr(v1_core.EngineCoreProc, "run_engine_core", None)
+            if hasattr(raw, "__func__"):
+                raw = raw.__func__
+            if raw is not None and raw is not _patched_run_engine_core:
+                _orig_run_engine_core = raw
 
     if hasattr(_orig_run_engine_core, "__func__"):
         _orig_run_engine_core = _orig_run_engine_core.__func__
@@ -224,6 +234,108 @@ def _patched_run_engine_core(*args, **kwargs):
     raise RuntimeError("[TPU ERROR] _orig_run_engine_core could not be resolved in _patched_run_engine_core")
 
 
+def patch_torch_tpu_pallas() -> None:
+    """Monkey-patches torch_tpu._internal.pallas.pallas.JaxCallable.__call__ to register textual MLIR
+
+    bypassing MLIR bytecode parser attribute version mismatches between JAX export and torch_tpu libxla.
+    """
+    try:
+        import jax
+        import torch_tpu._internal.pallas.pallas as pallas
+
+        if getattr(pallas.JaxCallable, "_patched_text_mlir", False):
+            return
+
+        def patched_call(self, *args, **kwargs):
+            self._validate_args(*args)
+
+            kernel_key = pallas._get_kernel_invocation_key(
+                self.trace_key, args, kwargs, self.static_argnums
+            )
+            output_shapes, out_tree = self.output_shapes.get(kernel_key, (None, None))
+            kernel_exists = pallas.tpu_torch_pallas.lookup_custom_kernel(self.name, kernel_key)
+            if not output_shapes or not kernel_exists:
+                jax_args = pallas.jax_placeholders(
+                    args, mesh=self.mesh, partition_specs=self.input_partition_specs
+                )
+                with jax._src.config.export_ignore_forward_compatibility(True):
+                    lowered = self.exported(*jax_args, **kwargs)
+                try:
+                    serialized_mod = lowered.mlir_module()
+                except Exception:
+                    serialized_mod = lowered.mlir_module_serialized
+                pallas.tpu_torch_pallas.register_custom_kernel(
+                    self.name,
+                    kernel_key,
+                    serialized_mlir_module=serialized_mod,
+                )
+                output_shapes = [
+                    pallas.torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
+                ]
+                out_tree = lowered.out_tree
+                self.output_shapes[kernel_key] = (output_shapes, out_tree)
+
+            tensor_args = [
+                arg
+                for i, arg in enumerate(args)
+                if arg is not None and i not in self.static_argnums
+            ]
+
+            results = pallas.tpu_torch_pallas.call_custom_kernel(
+                self.name,
+                kernel_key,
+                inputs=tensor_args,
+                output_shapes=output_shapes,
+                donate_argnums=self.donate_argnums,
+            )
+            return out_tree.unflatten(results)
+
+        pallas.JaxCallable.__call__ = patched_call
+        pallas.JaxCallable._patched_text_mlir = True
+    except Exception:
+        pass
+
+
+def patch_mosaic_serde() -> None:
+    """Patches jax._src.tpu_custom_call._lower_mosaic_module_to_asm to target version 13
+
+    and emit textual MLIR assembly, preventing MLIR bytecode version / attribute code 23 mismatches with libtpu.
+    """
+    try:
+        import jax._src.tpu_custom_call as tcc
+
+        if getattr(tcc, "_tpu_text_patched", False):
+            return
+
+        def text_lower(module, *, ir_version=None):
+            has_communication, has_custom_barrier = tcc.tpu.private_has_communication(
+                module.operation
+            )
+            ctx = module.context
+            with ctx, module.operation.location:
+                module_op = module.operation.clone(ip=False)
+                prev = ctx.allow_unregistered_dialects
+                ctx.allow_unregistered_dialects = True
+                target_ver = ir_version if (ir_version is not None and ir_version <= 13) else 13
+                target_version_str = f"target-version={target_ver}"
+                try:
+                    pipeline = tcc.PassManager.parse(
+                        "builtin.module(mosaic-serde{serialize=true " + target_version_str + "})"
+                    )
+                    pipeline.enable_verifier(bool(tcc.config.enable_checks.value))
+                    pipeline.run(module_op)
+                finally:
+                    ctx.allow_unregistered_dialects = prev
+
+                asm = module_op.get_asm().encode("utf-8")
+                return asm, (has_communication, has_custom_barrier)
+
+        tcc._lower_mosaic_module_to_asm = text_lower
+        tcc._tpu_text_patched = True
+    except Exception:
+        pass
+
+
 def patch_vllm_for_tpu() -> None:
     """
     Apply TPU-specific patches and workarounds to vLLM and torchtpu-vllm workers.
@@ -231,6 +343,49 @@ def patch_vllm_for_tpu() -> None:
     and driver-worker environment synchronization on GKE TPU v6e instances.
     """
     logger = logging.getLogger(__name__)
+
+    if os.path.exists("/home/ray/anaconda3/lib/python3.12/site-packages/libtpu/libtpu.so"):
+        os.environ.setdefault("TPU_LIBRARY_PATH", "/home/ray/anaconda3/lib/python3.12/site-packages/libtpu/./libtpu.so")
+
+    try:
+        import jax._src.cloud_tpu_init as cti
+
+        cti.is_libtpu_at_least = lambda version_str: True
+    except Exception:
+        pass
+
+    try:
+        import jax._src.pallas.mosaic.lowering as pml
+
+        pml.is_libtpu_at_least = lambda version_str: True
+    except Exception:
+        pass
+
+    patch_torch_tpu_pallas()
+    patch_mosaic_serde()
+
+    try:
+        from torch_tpu._internal import execution_mode
+
+        execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
+    except Exception:
+        pass
+
+    for mod_name in ["vllm_torchtpu.platforms.tpu_platform", "tpu_inference.platforms.tpu_platform"]:
+        try:
+            import importlib
+
+            mod = importlib.import_module(mod_name)
+
+            def _safe_configure_torchtpu_eager_mode() -> None:
+                from torch_tpu._internal import execution_mode
+
+                execution_mode.eager_mode = execution_mode.EagerMode.DEFER_NEVER
+
+            mod._configure_torchtpu_eager_mode = _safe_configure_torchtpu_eager_mode
+            mod._torchtpu_eager_mode_configured = True
+        except Exception:
+            pass
 
     try:
         import torch
@@ -499,9 +654,11 @@ def patch_vllm_for_tpu() -> None:
 
                 def patched_create_engine_config(self, *args, **kwargs):
                     is_tpu = get_resource_name() == "TPU" or os.environ.get("VLLM_USE_V1") == "0"
+                    gen = get_tpu_chip_generation()
                     is_multi_host = (
-                        self.tensor_parallel_size > 4
-                        or int(os.environ.get("NNODES_ROLLOUT", "1")) > 1
+                        int(os.environ.get("NNODES_ROLLOUT", "1")) > 1
+                        or (gen != "v7x" and self.tensor_parallel_size > 4)
+                        or (gen == "v7x" and self.tensor_parallel_size > 8)
                         or os.environ.get("TPU_MULTIHOST_BACKEND") == "ray"
                     )
                     if is_tpu:
@@ -583,8 +740,19 @@ def patch_vllm_for_tpu() -> None:
         except Exception as e:
             logger.warning(f"Failed to patch TPUWorker class directly: {e}")
 
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+        gen = get_tpu_chip_generation()
+        if gen == "v7x":
+            ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "1,2,1,2"
+            ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,2,1,2"
+        else:
+            ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
+            ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+
+        env_topo = os.environ.get("TORCH_TPU_TOPOLOGY") or os.environ.get("TPU_TOPOLOGY")
+        if env_topo:
+            for k in (4, 8, 16, 32, 64):
+                if k == int(os.environ.get("TOTAL_ROLLOUT_CHIPS", 0)):
+                    ray_distributed_executor.TPU_TOPOLOGY_MAP[k] = env_topo.replace("x", ",")
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -908,26 +1076,48 @@ def patch_vllm_for_tpu() -> None:
             logger.info(f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {sb_addresses_str}")
 
             total_chips = len(self.workers)
-            if total_chips == 32:
-                topology = "4,8,1"
-                host_bounds = "4,8,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 8:
-                topology = "2,4,1"
-                host_bounds = "2,4,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 4:
-                topology = "2,2,1"
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "2,2,1" if num_nodes == 1 else "1,1,1"
-                chips_per_host = "4"
+            gen = get_tpu_chip_generation()
+
+            env_topo = os.environ.get("TORCH_TPU_TOPOLOGY") or os.environ.get("TPU_TOPOLOGY")
+            if env_topo:
+                topology = env_topo.replace("x", ",")
+                host_bounds = os.environ.get("TPU_HOST_BOUNDS", "1,1,1" if num_nodes == 1 else topology)
+                chips_per_host_bounds = os.environ.get(
+                    "TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1" if (num_nodes == 1 and (gen == "v7x" or total_chips == 4)) else "1,1,1"
+                )
+                chips_per_host = os.environ.get("CHIPS_PER_HOST", "4")
+            elif gen == "v7x":
+                chips_per_host = os.environ.get("CHIPS_PER_HOST", "4")
+                if total_chips == 8 and num_nodes == 1:
+                    topology = "2,2,1,2"
+                    host_bounds = os.environ.get("TPU_HOST_BOUNDS", "1,1,1")
+                    chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1")
+                elif total_chips == 4 and num_nodes == 1:
+                    topology = "1,2,1,2"
+                    host_bounds = os.environ.get("TPU_HOST_BOUNDS", "1,1,1")
+                    chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1")
+                else:
+                    topology = get_tpu_topology(world_size=total_chips)
+                    host_bounds = os.environ.get("TPU_HOST_BOUNDS", topology)
+                    chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "1,1,1")
             else:
-                topology = TPU_TOPOLOGY_MAP_local.get(total_chips, "1,1,1")
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
+                chips_per_host = os.environ.get("CHIPS_PER_HOST", "4")
+                if total_chips == 32:
+                    topology = "4,8,1"
+                    host_bounds = "4,8,1"
+                    chips_per_host_bounds = "1,1,1"
+                elif total_chips == 8:
+                    topology = "2,4,1"
+                    host_bounds = "2,4,1"
+                    chips_per_host_bounds = "1,1,1"
+                elif total_chips == 4:
+                    topology = "2,2,1"
+                    host_bounds = "1,1,1"
+                    chips_per_host_bounds = "2,2,1" if num_nodes == 1 else "1,1,1"
+                else:
+                    topology = TPU_TOPOLOGY_MAP_local.get(total_chips, get_tpu_topology(world_size=total_chips))
+                    host_bounds = "1,1,1"
+                    chips_per_host_bounds = "1,1,1"
 
             rank_0_node_id = unique_node_ids[0]
             rank_0_worker_index = node_workers[rank_0_node_id][0]
@@ -990,7 +1180,7 @@ def patch_vllm_for_tpu() -> None:
                     args["TORCH_TPU_TOPOLOGY"] = topology
                     args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
                     args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
-                    if total_chips > 4 or num_nodes > 1:
+                    if num_nodes > 1 or (gen != "v7x" and total_chips > 4) or (gen == "v7x" and total_chips > 8):
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
                     logger.info(

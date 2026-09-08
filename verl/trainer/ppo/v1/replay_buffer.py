@@ -543,6 +543,7 @@ class ReplayBufferAsync(ReplayBuffer):
         """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups."""
         last_debug_time = time.time()
         eviction_metrics: dict = {}
+        poll_count = 0
 
         while True:
             # Eviction and selection share one snapshot so newly terminal stale groups wait for the next eviction pass.
@@ -559,6 +560,9 @@ class ReplayBufferAsync(ReplayBuffer):
                 continue
 
             sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
+            if poll_count % 20 == 0:
+                print(f"[DEBUG REPLAY_BUFFER] polling {partition_id}: sampleable={len(sampleable_keys)}/{batch_size}, pending={len(self.pending_keys[partition_id])}, running={len(self.running_keys[partition_id])}, finished={len(self.finished_keys[partition_id])}, failure={len(self.failure_keys[partition_id])}", flush=True)
+            poll_count += 1
             if self._has_enough_samples(global_steps, partition_id, batch_size, sampleable_keys):
                 selected_prompt_uids, partition_snapshot, prompt_global_steps_snapshot = self._select_prompt_uids(
                     partition_id, sampleable_keys, batch_size

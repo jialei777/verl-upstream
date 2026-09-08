@@ -118,6 +118,20 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    for key in (
+        "VERL_PLATFORM",
+        "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
+        "LIBTPU_INIT_ARGS",
+        "TPU_ACCELERATOR_TYPE",
+        "TORCH_TPU_TOPOLOGY",
+        "TPU_TOPOLOGY",
+        "TPU_HOST_BOUNDS",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "CHIPS_PER_HOST",
+        "TPU_LIBRARY_PATH",
+    ):
+        if os.environ.get(key) is not None:
+            runtime_env["env_vars"][key] = os.environ[key]
     # Forward PYTHONPATH to Ray workers so packages exposed only via PYTHONPATH (e.g. the
     # Megatron-LM baked into the CI image at /workspace/Megatron-LM, which is not installed
     # into site-packages) stay importable. Workers do not inherit the driver's PYTHONPATH when

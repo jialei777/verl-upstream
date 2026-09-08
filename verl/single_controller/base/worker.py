@@ -277,7 +277,7 @@ class Worker(WorkerHelper):
             # so we need to set local rank when the flag is set.
             device_name = get_resource_name()
             if device_name == "TPU":
-                local_rank = os.environ.get("TPU_VISIBLE_CHIPS", "0")
+                local_rank = os.environ.get("LOCAL_RANK") or os.environ.get("TPU_VISIBLE_CHIPS", "0")
             else:
                 local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
 

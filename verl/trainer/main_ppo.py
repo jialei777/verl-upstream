@@ -54,6 +54,8 @@ def run_ppo(config, task_runner_class) -> None:
     if "rl_insight" in ([trainer_logger] if isinstance(trainer_logger, str) else trainer_logger or []):
         os.environ["VERL_RL_INSIGHT_ENABLE"] = "1"
 
+    default_runtime_env = get_ppo_ray_runtime_env(config)
+
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
@@ -81,6 +83,14 @@ def run_ppo(config, task_runner_class) -> None:
                 ray_init_dict["runtime_env"][k] = v
         ray.init(**ray_init_dict)
 
+    runner_runtime_env = {"env_vars": {}}
+    if "env_vars" in default_runtime_env:
+        runner_runtime_env["env_vars"].update(default_runtime_env["env_vars"])
+    if os.environ.get("VERL_PLATFORM"):
+        runner_runtime_env["env_vars"]["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+    elif get_platform().device_name != "cuda":
+        runner_runtime_env["env_vars"]["VERL_PLATFORM"] = get_platform().device_name
+
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (
@@ -96,6 +106,8 @@ def run_ppo(config, task_runner_class) -> None:
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        runner_runtime_env["nsight"] = nsight_options
+        runner = task_runner_class.options(runtime_env=runner_runtime_env).remote()
     elif get_platform().device_name == "tpu":
         from verl.plugin.platform.platform_tpu_workarounds import (
             DEFAULT_TASK_RUNNER_CONCURRENCY,
@@ -103,10 +115,13 @@ def run_ppo(config, task_runner_class) -> None:
         )
 
         runner = task_runner_class.options(
-            num_cpus=DEFAULT_TASK_RUNNER_CPUS, max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY
+            num_cpus=DEFAULT_TASK_RUNNER_CPUS,
+            max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY,
+            runtime_env=runner_runtime_env,
         ).remote()
     else:
         runner = task_runner_class.remote()
+        runner = task_runner_class.options(runtime_env=runner_runtime_env).remote()
 
     try:
         ray.get(runner.run.remote(config))
@@ -151,6 +166,14 @@ class TaskRunnerV1:
     def run(self, config: DictConfig):
         """Run the PPO training process."""
         configure_verl_logging()
+
+        if config.trainer.device:
+            os.environ["VERL_PLATFORM"] = config.trainer.device
+            from verl.plugin.platform.platform_manager import PlatformRegistry, set_platform
+
+            platform_cls = PlatformRegistry.get(config.trainer.device)
+            if platform_cls:
+                set_platform(platform_cls())
 
         import transfer_queue as tq
 

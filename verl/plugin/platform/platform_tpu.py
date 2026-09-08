@@ -48,7 +48,26 @@ TPU_HBM_BYTES_MAP = {
 }
 
 # TPU default 3D mesh topology mappings by pod type or total chips
+TPU_V7X_TOPOLOGY_MAP = {
+    "v7x-8": "2,2,1,2",
+    "v7x-4": "1,2,1,2",
+    8: "2,2,1,2",
+    4: "1,2,1,2",
+}
+
+TPU_V6E_TOPOLOGY_MAP = {
+    "v6e-32": "4,8,1",
+    "v6e-8": "2,4,1",
+    "v6e-4": "2,2,1",
+    32: "4,8,1",
+    8: "2,4,1",
+    4: "2,2,1",
+}
+
+# TPU default 3D/4D mesh topology mappings by pod type or total chips
 TPU_TOPOLOGY_MAP = {
+    "v7x-8": "2,2,1,2",
+    "v7x-4": "1,2,1,2",
     "v6e-32": "4,8,1",
     "v6e-8": "2,4,1",
     "v6e-4": "2,2,1",
@@ -63,6 +82,45 @@ def get_tpu_chip_hbm_bytes() -> int:
     tpu_type = ""
 
     # Query Ray cluster node labels for TPU resource type
+def get_tpu_chip_generation() -> str:
+    """Detects TPU generation (e.g. 'v7x', 'v6e', 'v5p') from Ray node labels or environment variables."""
+    # 1. Check Ray node labels
+    try:
+        if ray.is_initialized():
+            tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+            if tpu_nodes:
+                labels = tpu_nodes[0].get("Labels", {})
+                tpu_type = (labels.get("ray.io/accelerator-type") or labels.get("ray.io/tpu-pod-type") or "").lower()
+                pod_or_acc = (
+                    labels.get("ray.io/accelerator-type")
+                    or labels.get("ray.io/tpu-pod-type")
+                    or labels.get("cloud.google.com/gke-tpu-accelerator")
+                    or ""
+                ).lower()
+                for gen in ["v7x", "v6e", "v5p", "v5e", "v4"]:
+                    if gen in pod_or_acc:
+                        return gen
+    except Exception as e:
+        logger.warning(f"Unable to query Ray node labels for TPU chip type: {e}")
+        logger.warning(f"Unable to query Ray node labels for TPU chip generation: {e}")
+
+    # 2. Check environment variables
+    for k in ["TPU_ACCELERATOR_TYPE", "ACCELERATOR_TYPE", "TPU_TYPE"]:
+        val = os.environ.get(k, "").lower()
+        for gen in ["v7x", "v6e", "v5p", "v5e", "v4"]:
+            if gen in val:
+                return gen
+    return ""
+
+
+def get_tpu_chip_hbm_bytes() -> int:
+    """Detects the TPU chip generation from Ray node labels or environment variables and returns its HBM capacity."""
+    gen = get_tpu_chip_generation()
+    if gen in TPU_HBM_BYTES_MAP:
+        return TPU_HBM_BYTES_MAP[gen]
+
+    # Query Ray cluster node labels for TPU resource type
+    tpu_type = ""
     try:
         if ray.is_initialized():
             tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
@@ -86,6 +144,59 @@ def get_tpu_chip_hbm_bytes() -> int:
             return hbm_bytes
 
     logger.warning(f"Unable to determine TPU chip HBM bytes for tpu_type='{tpu_type}'. Returning -1.")
+    return -1
+def get_tpu_topology(pod_type: str = "", world_size: int = 1) -> str:
+    """Resolves the TPU mesh topology string from environment, pod type, generation, or world size."""
+    # 1. Explicit user environment override takes highest priority
+    env_topo = os.environ.get("TORCH_TPU_TOPOLOGY") or os.environ.get("TPU_TOPOLOGY")
+    if env_topo:
+        return env_topo.replace("x", ",")
+
+    # 2. Query GKE TPU topology from Ray node labels if present
+    try:
+        if ray.is_initialized():
+            tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+            if tpu_nodes:
+                labels = tpu_nodes[0].get("Labels", {})
+                gke_topo = labels.get("cloud.google.com/gke-tpu-topology") or labels.get("ray.io/tpu-topology")
+                if gke_topo:
+                    parts = gke_topo.replace("x", ",").split(",")
+                    if len(parts) == 3:
+                        gen = get_tpu_chip_generation()
+                        if gen == "v7x" and world_size == 8 and parts == ["2", "2", "1"]:
+                            return "2,2,1,2"
+                        return f"{parts[0]},{parts[1]},{parts[2]}"
+    except Exception:
+        pass
+
+    clean_pod = pod_type.lower().strip()
+    gen = get_tpu_chip_generation()
+
+    # 3. Lookup by generation and world_size / pod_type
+    if gen == "v7x":
+        if clean_pod in TPU_V7X_TOPOLOGY_MAP:
+            return TPU_V7X_TOPOLOGY_MAP[clean_pod]
+        if world_size in TPU_V7X_TOPOLOGY_MAP:
+            return TPU_V7X_TOPOLOGY_MAP[world_size]
+    elif gen == "v6e":
+        if clean_pod in TPU_V6E_TOPOLOGY_MAP:
+            return TPU_V6E_TOPOLOGY_MAP[clean_pod]
+        if world_size in TPU_V6E_TOPOLOGY_MAP:
+            return TPU_V6E_TOPOLOGY_MAP[world_size]
+
+    if clean_pod in TPU_TOPOLOGY_MAP:
+        return TPU_TOPOLOGY_MAP[clean_pod]
+
+    return TPU_TOPOLOGY_MAP.get(world_size, "1,1,1")
+
+
+def get_tpu_chip_hbm_bytes() -> int:
+    """Detects the TPU chip generation from Ray node labels or environment variables and returns its HBM capacity."""
+    gen = get_tpu_chip_generation()
+    if gen in TPU_HBM_BYTES_MAP:
+        return TPU_HBM_BYTES_MAP[gen]
+
+    logger.warning(f"Unable to determine TPU chip HBM bytes for gen='{gen}'. Returning -1.")
     return -1
 
 
@@ -161,11 +272,14 @@ class TPUDeviceModuleProxy:
         elif name == "reset_peak_memory_stats":
             return lambda *args, **kwargs: None
         elif name == "get_device_properties":
+            gen = get_tpu_chip_generation()
+            tpu_name = f"Google TPU {gen.upper()}" if gen else "Google TPU"
 
             class DummyDeviceProperties:
                 def __init__(self, total_memory=32 * 1024 * 1024 * 1024):
                     self.total_memory = total_memory
                     self.name = "Google TPU"
+                    self.name = tpu_name
                     self.major = 1
                     self.minor = 0
 
@@ -238,6 +352,104 @@ class PlatformTPU(PlatformCUDA):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        try:
+            import jax._src.cloud_tpu_init as cti
+
+            cti.is_libtpu_at_least = lambda version_str: True
+        except Exception:
+            pass
+        try:
+            import jax._src.pallas.mosaic.lowering as pml
+
+            pml.is_libtpu_at_least = lambda version_str: True
+        except Exception:
+            pass
+        try:
+            import jax
+            import torch_tpu._internal.pallas.pallas as pallas
+
+            if not getattr(pallas.JaxCallable, "_patched_text_mlir", False):
+
+                def patched_call(self, *args, **kwargs):
+                    self._validate_args(*args)
+
+                    kernel_key = pallas._get_kernel_invocation_key(
+                        self.trace_key, args, kwargs, self.static_argnums
+                    )
+                    output_shapes, out_tree = self.output_shapes.get(kernel_key, (None, None))
+                    kernel_exists = pallas.tpu_torch_pallas.lookup_custom_kernel(self.name, kernel_key)
+                    if not output_shapes or not kernel_exists:
+                        jax_args = pallas.jax_placeholders(
+                            args, mesh=self.mesh, partition_specs=self.input_partition_specs
+                        )
+                        with jax._src.config.export_ignore_forward_compatibility(True):
+                            lowered = self.exported(*jax_args, **kwargs)
+                        try:
+                            serialized_mod = lowered.mlir_module()
+                        except Exception:
+                            serialized_mod = lowered.mlir_module_serialized
+                        pallas.tpu_torch_pallas.register_custom_kernel(
+                            self.name,
+                            kernel_key,
+                            serialized_mlir_module=serialized_mod,
+                        )
+                        output_shapes = [
+                            pallas.torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
+                        ]
+                        out_tree = lowered.out_tree
+                        self.output_shapes[kernel_key] = (output_shapes, out_tree)
+
+                    tensor_args = [
+                        arg
+                        for i, arg in enumerate(args)
+                        if arg is not None and i not in self.static_argnums
+                    ]
+
+                    results = pallas.tpu_torch_pallas.call_custom_kernel(
+                        self.name,
+                        kernel_key,
+                        inputs=tensor_args,
+                        output_shapes=output_shapes,
+                        donate_argnums=self.donate_argnums,
+                    )
+                    return out_tree.unflatten(results)
+
+                pallas.JaxCallable.__call__ = patched_call
+                pallas.JaxCallable._patched_text_mlir = True
+        except Exception:
+            pass
+        try:
+            import jax._src.tpu_custom_call as tcc
+
+            if not getattr(tcc, "_tpu_text_patched", False):
+
+                def text_lower(module, *, ir_version=None):
+                    has_communication, has_custom_barrier = tcc.tpu.private_has_communication(
+                        module.operation
+                    )
+                    ctx = module.context
+                    with ctx, module.operation.location:
+                        module_op = module.operation.clone(ip=False)
+                        prev = ctx.allow_unregistered_dialects
+                        ctx.allow_unregistered_dialects = True
+                        target_ver = ir_version if (ir_version is not None and ir_version <= 13) else 13
+                        target_version_str = f"target-version={target_ver}"
+                        try:
+                            pipeline = tcc.PassManager.parse(
+                                "builtin.module(mosaic-serde{serialize=true " + target_version_str + "})"
+                            )
+                            pipeline.enable_verifier(bool(tcc.config.enable_checks.value))
+                            pipeline.run(module_op)
+                        finally:
+                            ctx.allow_unregistered_dialects = prev
+
+                        asm = module_op.get_asm().encode("utf-8")
+                        return asm, (has_communication, has_custom_barrier)
+
+                tcc._lower_mosaic_module_to_asm = text_lower
+                tcc._tpu_text_patched = True
+        except Exception:
+            pass
 
     @property
     def vendor_name(self) -> str:
@@ -282,6 +494,15 @@ class PlatformTPU(PlatformCUDA):
             return True
         if "TPU_NAME" in os.environ or "TPU_VISIBLE_DEVICES" in os.environ:
             return True
+        try:
+            import ray
+
+            if ray.is_initialized():
+                for node in ray.nodes():
+                    if node.get("Alive", False) and node.get("Resources", {}).get("TPU", 0) > 0:
+                        return True
+        except Exception:
+            pass
         return False
 
     def ray_resource_name(self) -> str:
@@ -289,6 +510,8 @@ class PlatformTPU(PlatformCUDA):
 
     def ray_resource_options(self, num_gpus: float) -> dict[str, Any]:
         tpu_chips = int(num_gpus)
+        if os.environ.get("RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS") == "1":
+            return {}
         return {"resources": {"TPU": tpu_chips}} if tpu_chips >= 1 else {}
 
     def communication_backend_name(self) -> str:
@@ -359,22 +582,58 @@ class PlatformTPU(PlatformCUDA):
             "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
             "TPU_VISIBLE_CHIPS": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
         }
 
         # Apply TPU topology and host bounds based on TPU pod type or world size
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
+        tpu_type = ""
+        if tpu_nodes:
+            labels = tpu_nodes[0].get("Labels", {})
+            tpu_type = (
+                labels.get("ray.io/tpu-pod-type")
+                or labels.get("ray.io/accelerator-type")
+                or labels.get("cloud.google.com/gke-tpu-accelerator")
+                or ""
+            )
 
         topo = TPU_TOPOLOGY_MAP.get(tpu_type, TPU_TOPOLOGY_MAP.get(world_size, "1,1,1"))
+        topo = get_tpu_topology(pod_type=tpu_type, world_size=world_size)
+        is_single_host = len(unique_hostnames) <= 1 or world_size <= local_world_size
+        gen = get_tpu_chip_generation()
+
+        if is_single_host:
+            host_bounds = os.environ.get("TPU_HOST_BOUNDS", "1,1,1")
+            if gen == "v7x":
+                chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1")
+            elif local_world_size == 4:
+                chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "2,2,1")
+            else:
+                chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "1,1,1")
+        else:
+            host_bounds = os.environ.get("TPU_HOST_BOUNDS", topo)
+            chips_per_host_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS", "1,1,1")
+
+        chips_per_host = os.environ.get("CHIPS_PER_HOST", "4")
 
         env_vars.update(
             {
-                "TORCH_TPU_TOPOLOGY": topo,
-                "TPU_HOST_BOUNDS": topo,
-                "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-                "CHIPS_PER_HOST": "4",
+                # "TORCH_TPU_TOPOLOGY": topo,
+                # "TPU_HOST_BOUNDS": topo,
+                # "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+                # "CHIPS_PER_HOST": "4",
+                "TORCH_TPU_TOPOLOGY": os.environ.get("TORCH_TPU_TOPOLOGY", topo),
+                "TPU_HOST_BOUNDS": host_bounds,
+                "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
+                "CHIPS_PER_HOST": chips_per_host,
             }
         )
+
+        if os.environ.get("TPU_LIBRARY_PATH"):
+            env_vars["TPU_LIBRARY_PATH"] = os.environ["TPU_LIBRARY_PATH"]
+        elif os.path.exists("/home/ray/anaconda3/lib/python3.12/site-packages/libtpu/libtpu.so"):
+            env_vars["TPU_LIBRARY_PATH"] = "/home/ray/anaconda3/lib/python3.12/site-packages/libtpu/./libtpu.so"
 
         if is_rollout:
             env_vars.update(
@@ -384,7 +643,8 @@ class PlatformTPU(PlatformCUDA):
                 }
             )
             if world_size > 1:
-                env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
+                if not is_single_host:
+                    env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
 
         return env_vars
 
