@@ -151,12 +151,17 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
+        print(f"[DEBUG TRAINER] PPOTrainerSeparateAsync.on_train_begin called. skip={self.config.skip.rollout_tq.enable}", flush=True)
         if self.config.skip.rollout_tq.enable:
             return
         num_warmup_batches = self.config.trainer.v1.separate_async.num_warmup_batches
-        for _ in range(num_warmup_batches):
+        print(f"[DEBUG TRAINER] Adding {num_warmup_batches} warmup batches...", flush=True)
+        for i in range(num_warmup_batches):
+            print(f"[DEBUG TRAINER] Calling _add_batch_to_generate for warmup batch {i}...", flush=True)
             self._add_batch_to_generate()
+            print(f"[DEBUG TRAINER] Finished _add_batch_to_generate for warmup batch {i}", flush=True)
         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
+        print(f"[DEBUG TRAINER] on_train_begin completed successfully!", flush=True)
 
     def on_validate_begin(self):
         if self.current_mode == HybridEngineMode.TRAINER:

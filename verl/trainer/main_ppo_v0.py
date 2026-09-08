@@ -164,6 +164,13 @@ class TaskRunner(BaseTaskRunner):
         from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+        if config.trainer.device:
+            os.environ["VERL_PLATFORM"] = config.trainer.device
+            from verl.plugin.platform.platform_manager import PlatformRegistry, set_platform
+
+            platform_cls = PlatformRegistry.get(config.trainer.device)
+            if platform_cls:
+                set_platform(platform_cls())
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 

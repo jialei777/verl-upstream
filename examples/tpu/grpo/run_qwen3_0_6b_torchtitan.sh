@@ -24,14 +24,31 @@ MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
 
-# TPU 2-slice v6e-8 configurations
-export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
-export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+if [[ "${TPU_ACCELERATOR_TYPE}" =~ "v7x" || "${TPU_ACCELERATOR_TYPE}" =~ "7x" ]]; then
+    # TPU 7x single-host (2x2x1) 8 devices/cores per slice
+    export NNODES_TRAINER=1
+    export N_CHIPS_TRAINER=8
+    export NNODES_ROLLOUT=1
+    export N_CHIPS_ROLLOUT=8
+    export TORCH_TPU_TOPOLOGY="${TORCH_TPU_TOPOLOGY:-2,2,1,2}"
+    export TPU_TOPOLOGY="${TPU_TOPOLOGY:-2x2x1}"
+    export TPU_HOST_BOUNDS="${TPU_HOST_BOUNDS:-1,1,1}"
+    export TPU_CHIPS_PER_HOST_BOUNDS="${TPU_CHIPS_PER_HOST_BOUNDS:-2,2,1}"
+    export CHIPS_PER_HOST="${CHIPS_PER_HOST:-4}"
+else
+    # TPU v6e multi-host 2-slice defaults
+    export NNODES_TRAINER=2
+    export N_CHIPS_TRAINER=4
+    export NNODES_ROLLOUT=2
+    export N_CHIPS_ROLLOUT=4
+fi
 
-export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+if [ -f /home/ray/anaconda3/lib/python3.12/site-packages/libtpu/libtpu.so ]; then
+    export TPU_LIBRARY_PATH="/home/ray/anaconda3/lib/python3.12/site-packages/libtpu/./libtpu.so"
+fi
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
+export TOTAL_ROLLOUT_CHIPS
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -53,6 +70,7 @@ python3 -m verl.trainer.main_ppo \
     +data.max_token_len_per_gpu=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    data.dataloader_num_workers=0 \
     +data.pad_mode=no_padding \
     actor_rollout_ref.actor.strategy=torchtitan \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
@@ -85,7 +103,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
-    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.max_model_len=512 \
     trainer.val_before_train=False \
     trainer.logger="['console','tensorboard']" \

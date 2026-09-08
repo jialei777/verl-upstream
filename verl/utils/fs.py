@@ -211,6 +211,14 @@ def copy_to_local(
     # Save to a local path for persistence.
     local_path = copy_local_path_from_hdfs(src, cache_dir, filelock, verbose, always_recopy)
 
+    if isinstance(local_path, str) and not os.path.exists(local_path):
+        for base in [os.environ.get("RAY_DATA_HOME"), "/data/jialei", "/data"]:
+            if base and os.path.isdir(base):
+                candidate = os.path.join(base, local_path)
+                if os.path.exists(candidate):
+                    local_path = candidate
+                    break
+
     if use_shm and isinstance(local_path, str) and not os.path.exists(local_path):
         try:
             from huggingface_hub import snapshot_download

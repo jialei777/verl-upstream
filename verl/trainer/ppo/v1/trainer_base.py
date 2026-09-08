@@ -459,6 +459,7 @@ class PPOTrainer(ABC):
         self.global_steps += 1
         # SkipManager skips warmup batches in async trainers, so it doesn't conflict with reissue.
         SkipManager.set_step(self.global_steps)
+        print(f"[DEBUG TRAINER] fit: calling _reissue_inflight_prompts()", flush=True)
         self._reissue_inflight_prompts()
         self.prev_step_profile = False
         self.curr_step_profile = (
@@ -468,7 +469,9 @@ class PPOTrainer(ABC):
         )
         self.next_step_profile = False
 
+        print(f"[DEBUG TRAINER] fit: calling on_train_begin()", flush=True)
         self.on_train_begin()
+        print(f"[DEBUG TRAINER] fit: on_train_begin() finished. Entering training while loop...", flush=True)
         last_val_metrics = None
         while current_epoch < self.config.trainer.total_epochs and self.global_steps <= self.total_training_steps:
             is_last_step = self.global_steps >= self.total_training_steps
@@ -480,7 +483,9 @@ class PPOTrainer(ABC):
                 self.on_step_begin()
 
                 self._start_profiling()
+                print(f"[DEBUG TRAINER] fit: calling self.step(global_steps={self.global_steps})...", flush=True)
                 batch = self.step(metrics, self.timing_raw)
+                print(f"[DEBUG TRAINER] fit: self.step finished!", flush=True)
                 self._stop_profiling()
 
                 # 2. save checkpoint
@@ -545,7 +550,9 @@ class PPOTrainer(ABC):
         )
         sample_batch_size = train_batch_size // self.parameter_sync_step
 
+        print(f"[DEBUG TRAINER] step(): calling _add_batch_to_generate()...", flush=True)
         self._add_batch_to_generate()
+        print(f"[DEBUG TRAINER] step(): _add_batch_to_generate() finished! Starting local updates...", flush=True)
 
         metrics_aggregator = MetricsAggregator()
         combined_keys: list = []
@@ -554,7 +561,9 @@ class PPOTrainer(ABC):
         for trigger_idx in range(self.parameter_sync_step):
             self.local_trigger_step = trigger_idx
             iter_metrics: dict = {}
+            print(f"[DEBUG TRAINER] step(): calling _step_once(trigger_idx={trigger_idx})...", flush=True)
             batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            print(f"[DEBUG TRAINER] step(): _step_once finished with {len(batch.keys)} keys!", flush=True)
             sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
             metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
             combined_keys.extend(batch.keys)
@@ -569,11 +578,13 @@ class PPOTrainer(ABC):
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
+            print(f"[DEBUG TRAINER] _step_once: calling self.replay_buffer.sample(global_steps={self.global_steps}, batch_size={sample_batch_size})...", flush=True)
             batch, off_policy_metrics = self.replay_buffer.sample(
                 global_steps=self.global_steps,
                 partition_id="train",
                 batch_size=sample_batch_size,
             )
+            print(f"[DEBUG TRAINER] _step_once: replay_buffer.sample() RETURNED with {len(batch.keys)} samples!", flush=True)
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
@@ -1364,6 +1375,7 @@ class PPOTrainer(ABC):
 
     def _fetch_one_gen_batch(self) -> TensorDict:
         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
+        print(f"[DEBUG TRAINER] _fetch_one_gen_batch: getting next batch from dataloader...", flush=True)
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
@@ -1372,8 +1384,12 @@ class PPOTrainer(ABC):
             self.train_dataloader_it = iter(self.train_dataloader)
             batch_dict = next(self.train_dataloader_it)
 
+        print(f"[DEBUG TRAINER] _fetch_one_gen_batch: got batch_dict, creating uids...", flush=True)
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         return tu.get_tensordict(batch_dict)
+        td = tu.get_tensordict(batch_dict)
+        print(f"[DEBUG TRAINER] _fetch_one_gen_batch: tensordict created successfully!", flush=True)
+        return td
 
     def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
         """Fetch and coalesce the requested number of prompts."""
@@ -1394,6 +1410,7 @@ class PPOTrainer(ABC):
 
     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
+        print(f"[DEBUG TRAINER] _submit_batch_to_rollout: putting {len(batch)} prompts into TQ...", flush=True)
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
             tq.kv_batch_put(
@@ -1407,7 +1424,9 @@ class PPOTrainer(ABC):
         else:
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
+        print(f"[DEBUG TRAINER] _submit_batch_to_rollout: tq.kv_batch_put finished! Calling agent_loop_manager.generate_sequences...", flush=True)
         self.agent_loop_manager.generate_sequences(batch)
+        print(f"[DEBUG TRAINER] _submit_batch_to_rollout: agent_loop_manager.generate_sequences finished!", flush=True)
         return len(batch)
 
     def _add_prompts_to_generate(self, num_prompts: int) -> int:
@@ -1418,8 +1437,11 @@ class PPOTrainer(ABC):
     @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
     def _add_batch_to_generate(self):
         """Add one training batch to the AgentLoopManager."""
+        print(f"[DEBUG TRAINER] _add_batch_to_generate: calling _next_train_batch()...", flush=True)
         batch = self._next_train_batch()
+        print(f"[DEBUG TRAINER] _add_batch_to_generate: got batch {len(batch)}. Calling _submit_batch_to_rollout...", flush=True)
         self._submit_batch_to_rollout(batch)
+        print(f"[DEBUG TRAINER] _add_batch_to_generate: _submit_batch_to_rollout finished!", flush=True)
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
         """Compute the reward score with a colocated reward model."""

@@ -98,6 +98,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     logger.exception(f"Unsupported type {type(v)} for key {k}")
 
             # “fire-and-forget” background tasks
+            print(f"[DEBUG AGENT_WORKER] creating background task _run_prompt for prompt uid={prompt.get('uid')}", flush=True)
             task = asyncio.create_task(
                 self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
             )
@@ -108,11 +109,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
         uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
         global_steps = prompt.get("global_steps", 0)
+        print(f"[DEBUG AGENT_WORKER] _run_prompt: uid={uid}, partition={partition_id}, calling async_kv_put(running)...", flush=True)
         await tq.async_kv_put(
             key=uid,
             partition_id=partition_id,
             tag={"is_prompt": True, "status": "running", "global_steps": global_steps},
         )
+        print(f"[DEBUG AGENT_WORKER] _run_prompt: uid={uid} async_kv_put(running) done!", flush=True)
         tasks = []
         try:
             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
@@ -125,6 +128,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 apply_greedy_sampling_params(run_sampling_params)
 
             tasks = []
+            print(f"[DEBUG AGENT_WORKER] _run_prompt: spawning {n} agent loops for uid={uid}...", flush=True)
             for i in range(n):
                 task = asyncio.create_task(
                     self._run_agent_loop(
@@ -232,12 +236,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 }
             )
 
+        print(f"[DEBUG AGENT_WORKER] _agent_loop_postprocess: putting {len(keys)} outputs to TQ for uid={uid}...", flush=True)
         await tq.async_kv_batch_put(
             keys=keys,
             fields=list_of_dict_to_tensordict(fields),
             tags=tags,
             partition_id="train" if not validate else "val",
         )
+        print(f"[DEBUG AGENT_WORKER] _agent_loop_postprocess: TQ async_kv_batch_put done for uid={uid}!", flush=True)
 
 
 class AgentLoopManagerTQ(AgentLoopManager):
@@ -262,9 +268,11 @@ class AgentLoopManagerTQ(AgentLoopManager):
             prompts (TensorDict): Input batch from train or validation dataset.
         """
         chunkes = prompts.chunk(len(self.agent_loop_workers))
+        print(f"[DEBUG AGENT_MGR] generate_sequences: dispatching {len(chunkes)} chunks to {len(self.agent_loop_workers)} workers...", flush=True)
         ray.get(
             [
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]
         )
+        print(f"[DEBUG AGENT_MGR] generate_sequences: all workers returned from remote generate_sequences!", flush=True)

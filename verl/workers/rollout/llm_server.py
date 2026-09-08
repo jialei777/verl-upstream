@@ -248,7 +248,9 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        print(f"[DEBUG CLIENT] generate: acquiring server for request_id={request_id}...", flush=True)
         server_id, server = await self._acquire_server(request_id)
+        print(f"[DEBUG CLIENT] generate: acquired server_id={server_id}, calling server.generate.remote...", flush=True)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -270,6 +272,7 @@ class LLMServerClient:
                 **priority_kwargs,
                 **kwargs,
             )
+            print(f"[DEBUG CLIENT] generate: server.generate.remote returned {len(output.token_ids)} tokens!", flush=True)
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
