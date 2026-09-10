@@ -26,6 +26,7 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from verl.plugin.platform import get_platform
+from verl.plugin.platform.platform_tpu_workarounds import get_platform_worker_env_vars
 from verl.protocol import DataProto, _padding_size_key
 from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
 from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
@@ -81,9 +82,13 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
     pg_ip = {}
     for pg in pgs:
         specs = ray._private.state.state.placement_group_table(pg.id)
-        # all bunles should be on the same node
-        node_id = specs["bundles_to_node_id"][0]
-        pg_ip[pg.id] = node_ip[node_id]
+        bundles_map = specs.get("bundles_to_node_id", {})
+        if bundles_map:
+            min_b_idx = min(bundles_map.keys())
+            node_id = bundles_map[min_b_idx]
+            pg_ip[pg.id] = node_ip.get(node_id, "")
+        else:
+            pg_ip[pg.id] = ""
     return sorted(pgs, key=lambda pg: pg_ip[pg.id])
 
 
@@ -120,12 +125,16 @@ class RayResourcePool(ResourcePool):
         detached=False,
         accelerator_type: Optional[str] = None,
     ) -> None:
+        if get_platform().device_name == "tpu":
+            max_colocate_count = 1
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
         # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
         self.pgs = None
         self.detached = detached
+        if accelerator_type is None and get_platform().device_name == "tpu":
+            accelerator_type = get_platform().auto_assign_accelerator_type(self.name_prefix, accelerator_type)
         self.accelerator_type = accelerator_type
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
@@ -144,8 +153,13 @@ class RayResourcePool(ResourcePool):
         device_name = current_platform.ray_resource_name()
 
         bundle = {"CPU": self.max_colocate_count}
-        if self.use_gpu:
-            bundle[device_name] = 1
+        if get_platform().device_name == "tpu":
+            get_platform().configure_placement_group_bundle(
+                bundle, self.use_gpu, device_name, self.name_prefix, self.accelerator_type
+            )
+        else:
+            if self.use_gpu:
+                bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
@@ -192,6 +206,10 @@ class ResourcePoolManager:
     max_colocate_count: int = 3
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
+    def __post_init__(self):
+        if get_platform().device_name == "tpu":
+            self.max_colocate_count = 1
+
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
 
@@ -225,20 +243,17 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
-        node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
-
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
+        device_name = get_platform().ray_resource_name()
+        total_cluster_gpus = sum(
+            node.get("Resources", {}).get(device_name, 0) for node in ray.nodes() if node.get("Alive", False)
+        )
         total_required_gpus = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
-        if total_available_gpus < total_required_gpus:
+        if total_cluster_gpus < total_required_gpus:
             raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
+                f"Total cluster {device_name} count ({total_cluster_gpus}) "
+                f"is less than total desired ({total_required_gpus})"
             )
 
 
@@ -638,6 +653,16 @@ class RayWorkerGroup(WorkerGroup):
             "MASTER_ADDR": self._master_addr,
             "MASTER_PORT": self._master_port,
         }
+        platform_env = get_platform_worker_env_vars(
+            resource_pool=resource_pool,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            name_prefix=self.name_prefix,
+            device_name=self.device_name,
+        )
+        env_vars.update(platform_env)
         if worker_env is not None:
             logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")
             conflict_env_vars = set(env_vars.keys()) & set(worker_env.keys())
