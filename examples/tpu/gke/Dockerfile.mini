@@ -1,0 +1,31 @@
+# Build directly upon the verified baseline verl-tpu image matching cluster pod
+FROM us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260630-159c2e3e
+
+USER root
+
+ENV PATH="/home/ray/anaconda3/bin:${PATH}"
+
+# Install TPU Raiden / TPU Sync wheel
+COPY *tpu_raiden_torch*.whl /tmp/
+RUN for PY in /home/ray/anaconda3/bin/python3 /usr/bin/python3; do \
+      if [ -x "$PY" ]; then \
+        SITE_DIR=$($PY -c "import site; print(site.getsitepackages()[0])") && \
+        $PY -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/*tpu_raiden_torch*.whl && \
+        if [ -d "${SITE_DIR}/torch_tpu/common" ]; then \
+          cd "${SITE_DIR}/torch_tpu/common" && \
+          ln -sfn libpywrap_torch_tpu_common.so libpywrap_2_11_0_common.so && \
+          ln -sfn libpywrap_torch_tpu_common.so libpywrap_2_12_0_common.so && \
+          ln -sfn libpywrap_torch_tpu_common.so libpywrap_2_13_0_common.so; \
+        fi && \
+        echo "${SITE_DIR}/torch_tpu/common" > /etc/ld.so.conf.d/torch_tpu.conf && \
+        echo "${SITE_DIR}/torch_tpu" >> /etc/ld.so.conf.d/torch_tpu.conf && \
+        echo "${SITE_DIR}/torch/lib" >> /etc/ld.so.conf.d/torch_tpu.conf; \
+      fi; \
+    done && \
+    rm -f /tmp/*tpu_raiden_torch*.whl && \
+    ldconfig
+
+WORKDIR /app
+
+ENV LD_LIBRARY_PATH="/home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu/common:/home/ray/anaconda3/lib/python3.12/site-packages/torch_tpu:/home/ray/anaconda3/lib/python3.12/site-packages/torch/lib:/home/ray/anaconda3/lib/python3.12/site-packages/tpu_sync/frameworks/torch:${LD_LIBRARY_PATH}"
+ENV PYTHONPATH="${PYTHONPATH}:/app:/torchtitan:/torchtitan/torchtitan"
