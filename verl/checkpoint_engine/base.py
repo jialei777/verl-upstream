@@ -19,6 +19,11 @@ from typing import Any, AsyncGenerator, Generator
 import ray
 import torch
 
+try:
+    import tpu_sync
+except ImportError:
+    pass
+
 from verl.plugin.platform import get_platform
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -417,6 +422,44 @@ class CheckpointEngineManager:
         self.actor_wg = actor_wg
         self.replicas = replicas
 
+        self.raiden_controller = None
+        self.raiden_server = None
+        if self.backend == "raiden":
+            try:
+                from tpu_sync.rpc import raiden_controller
+                import logging
+                logger = logging.getLogger(__name__)
+                self.raiden_controller = raiden_controller.RaidenController(port=0)
+                self.raiden_server = raiden_controller.RaidenControllerServer(self.raiden_controller)
+                self.raiden_port = self.raiden_server.start()
+                ip = ray.util.get_node_ip_address().strip("[]")
+                self.raiden_address = f"{ip}:{self.raiden_port}"
+                logger.info(f"RaidenControllerServer started on Headnode: {self.raiden_address}")
+                registry = None
+                try:
+                    registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
+                except Exception:
+                    try:
+                        from verl.checkpoint_engine.tpu_weight_registry import TPUWeightRegistry
+                        registry = TPUWeightRegistry.options(
+                            name="TPUWeightRegistry", namespace="verl", lifetime="detached"
+                        ).remote()
+                    except Exception:
+                        try:
+                            registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
+                        except Exception as e:
+                            logger.error(f"Failed to get or create TPUWeightRegistry: {e}")
+
+                if registry is not None:
+                    try:
+                        ray.get(registry.set_controller_address.remote(self.raiden_address))
+                        logger.info(f"Successfully stored RaidenController address ({self.raiden_address}) in TPUWeightRegistry")
+                    except Exception as reg_err:
+                        logger.warning(f"Could not store controller address in TPUWeightRegistry: {reg_err}")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Could not start embedded RaidenControllerServer on Headnode: {e}")
+
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
         actor_wg = self.actor_wg
@@ -516,6 +559,11 @@ class CheckpointEngineManager:
             from .tpu_checkpoint_engine import update_tpu_weights
 
             return await update_tpu_weights(self, global_steps=global_steps)
+
+        if self.backend == "raiden":
+            from .raiden_checkpoint_engine import update_raiden_weights
+
+            return await update_raiden_weights(self, global_steps=global_steps)
 
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()

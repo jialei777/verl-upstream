@@ -29,8 +29,10 @@ from typing import Any
 import numpy as np
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+import torch
 
 from verl.utils.device import get_resource_name
+from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension as _BaseWorkerExtension
 
 # --- Google TPU specific global constants ---
 TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
@@ -42,9 +44,10 @@ CHIPS_PER_HOST_VAL = "4"
 # -------------------------------------------
 
 try:
-    import torch_tpu
+    import tpu_sync
 except ImportError:
-    torch_tpu = None
+    pass
+
 
 try:
     from verl.checkpoint_engine.tpu_checkpoint_engine import load_weights_on_worker
@@ -201,7 +204,257 @@ def patch_multiprocessing_for_tpu() -> None:
     multiprocessing.process.BaseProcess._tpu_patched = True
 
 
-_orig_run_engine_core = None
+class vLLMColocateWorkerExtension(_BaseWorkerExtension):
+    """
+    vLLM Worker Extension for Google Cloud TPU.
+    Inherits base worker patches (LoRA, FP8) and implements zero-copy DMA Raiden P2P weight synchronization.
+    """
+
+    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
+        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController."""
+        if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
+            return True
+
+        if hasattr(self, "worker") and self.worker is not None:
+            worker_inst = self.worker
+        else:
+            worker_inst = self
+
+        if hasattr(worker_inst, "get_model"):
+            vllm_model = worker_inst.get_model()
+        else:
+            vllm_model = getattr(worker_inst, "model_runner", None)
+            if vllm_model is not None and hasattr(vllm_model, "model"):
+                vllm_model = vllm_model.model
+
+        if vllm_model is None:
+            logging.getLogger(__name__).warning("Raiden Sampler: could not locate vllm_model to bind parameters.")
+            return False
+
+        if hasattr(torch, "tpu") and hasattr(torch.tpu, "synchronize"):
+            torch.tpu.synchronize()
+
+        from verl.checkpoint_engine.raiden_checkpoint_engine import (
+            _create_torch_weight_synchronizer,
+        )
+        from tpu_sync.rpc import raiden_service_pb2
+
+        bind_ip = ray.util.get_node_ip_address().strip("[]")
+        rank_val = getattr(
+            self, "rank", getattr(self, "adjusted_rank", getattr(self, "rpc_rank", int(os.environ.get("RANK", "0"))))
+        )
+        listener_port = 12000 + rank_val
+
+        # Bind parameters via dynamic per-layer tensor lists
+        named_params = list(vllm_model.named_parameters())
+        has_embed = any("embed_tokens" in k or "tok_embeddings" in k for k, _ in named_params)
+        if has_embed:
+            named_params = [
+                (k, v) for k, v in named_params
+                if not (k == "lm_head.weight" or k.endswith(".lm_head.weight"))
+            ]
+        sorted_params = sorted(named_params, key=lambda x: x[0])
+
+        device = torch.device("tpu:0" if hasattr(torch, "tpu") else "tpu")
+        valid_params = []
+        for name, p in sorted_params:
+            if p is None:
+                continue
+            t = p.data if hasattr(p, "data") else p
+            if hasattr(t, "to_local"):
+                t = t.to_local()
+            if hasattr(t, "data"):
+                t = t.data
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.numel() == 0 or getattr(t, "is_meta", False):
+                continue
+            if not (hasattr(t, "device") and str(t.device).startswith("tpu")):
+                try:
+                    t = t.to(device)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Could not move {name} to TPU: {e}")
+                    continue
+            if not t.is_contiguous():
+                t = t.contiguous()
+            valid_params.append((name, t, p))
+
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
+
+        self._sorted_vllm_params = [(name, t, p) for name, t, p in valid_params]
+        sampler_tensors = [[t] for name, t, p in valid_params]
+
+        print(
+            f"@@@ [RAIDEN SAMPLER] Rank {rank_val}: binding {len(sampler_tensors)} tensors to WeightSynchronizer "
+            f"(sample tensor: name={valid_params[0][0]}, device={valid_params[0][1].device}, dtype={valid_params[0][1].dtype}, "
+            f"total numel={sum(t.numel() for t in [v[1] for v in valid_params])})",
+            flush=True,
+        )
+
+        self._raiden_ws = _create_torch_weight_synchronizer(
+            sampler_tensors,
+            local_port=0,
+            parallelism=parallelism,
+            listener_port=listener_port,
+            bind_ip=bind_ip,
+        )
+
+        # Build variable metadata protos for each dynamic tensor
+        variable_protos = []
+        for idx, (name, t, _) in enumerate(valid_params):
+            shape = list(t.shape)
+            itemsize = t.element_size()
+            layout = list(range(len(shape) - 1, -1, -1))
+            variable_protos.append(
+                raiden_service_pb2.VariableMetadataProto(
+                    name=name,
+                    shape=shape,
+                    mesh_shape=[1] * len(shape),
+                    layout=layout,
+                    item_size=itemsize,
+                    layer_idx=idx,
+                )
+            )
+
+        try:
+            from tpu_sync.rpc import raiden_controller
+
+            controller_addr = None
+            for _ in range(30):
+                try:
+                    registry = ray.get_actor(TPU_WEIGHT_REGISTRY_ACTOR_NAME, namespace=TPU_WEIGHT_REGISTRY_NAMESPACE)
+                    controller_addr = ray.get(registry.get_controller_address.remote())
+                    if controller_addr:
+                        break
+                except Exception:
+                    pass
+                import time
+                time.sleep(0.5)
+
+            if controller_addr and ":" in controller_addr:
+                ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
+                unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+                ctrl_client.register_work_unit(
+                    unit_id,
+                    [f"{bind_ip}:{self._raiden_ws.local_port}"],
+                    f"{bind_ip}:{self._raiden_ws.listener_port}",
+                    mesh_shape=[1, 1],
+                    variables=variable_protos,
+                    mesh_axes=["fsdp", "tp"],
+                )
+                logging.getLogger(__name__).info(
+                    f"Raiden Sampler Rank {rank_val} bound {len(sampler_tensors)} dynamic tensors and registered directly with "
+                    f"RaidenController ({controller_addr}): data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
+                )
+            else:
+                raise RuntimeError(f"Raiden Sampler Rank {rank_val}: No RaidenController address found in TPUWeightRegistry after timeout")
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Raiden Sampler Rank {rank_val} failed to register with RaidenController: {e}")
+            raise
+
+        return True
+
+    @torch.no_grad()
+    def install_raiden_weights(self) -> int:
+        """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA."""
+        if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
+            logging.getLogger(__name__).warning("Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized.")
+            return 0
+
+        t_start = time.perf_counter()
+
+        if hasattr(self._raiden_ws, "h2d"):
+            self._raiden_ws.h2d()
+        else:
+            self._raiden_ws.H2d()
+
+        # Copy newly synchronized weights from TPU tensor into model parameter if separate
+        for name, t, p in self._sorted_vllm_params:
+            target_p = p.to_local() if hasattr(p, "to_local") else p
+            if target_p.data_ptr() != t.data_ptr():
+                target_p.data.copy_(t)
+
+        # Handle tied word embeddings
+        worker_inst = self.worker if hasattr(self, "worker") else self
+        vllm_model = (
+            worker_inst.get_model()
+            if hasattr(worker_inst, "get_model")
+            else getattr(worker_inst, "model_runner", None)
+        )
+        if vllm_model is not None and hasattr(vllm_model, "model"):
+            vllm_model = vllm_model.model
+        if vllm_model is not None and hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
+            if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
+                vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
+
+        t_sync_start = time.perf_counter()
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
+        t_sync = time.perf_counter() - t_sync_start
+        t_total = time.perf_counter() - t_start
+
+        logging.getLogger(__name__).info(
+            f"[RAIDEN TELEMETRY | Sampler Worker] install_raiden_weights completed in {t_total:.4f}s "
+            f"(TPUSyncBarrier={t_sync:.4f}s)"
+        )
+        return 1
+
+    def get_model_weights_checksum(self) -> dict:
+        """Computes deterministic parameter count, L1 norm, L2 norm, and SHA-256 hash across all model parameters."""
+        worker_inst = self.worker if hasattr(self, "worker") else self
+        vllm_model = (
+            worker_inst.get_model()
+            if hasattr(worker_inst, "get_model")
+            else getattr(worker_inst, "model_runner", None)
+        )
+        if vllm_model is not None and hasattr(vllm_model, "model"):
+            vllm_model = vllm_model.model
+
+        if vllm_model is None:
+            return {"error": "No model found on worker"}
+
+        import hashlib
+        import torch
+
+        if hasattr(self, "_sorted_vllm_params") and self._sorted_vllm_params:
+            tensors = [p for _, p in self._sorted_vllm_params]
+        else:
+            named_params = list(vllm_model.named_parameters())
+            has_embed = any("embed_tokens" in k or "tok_embeddings" in k for k, _ in named_params)
+            if has_embed:
+                named_params = [
+                    (k, v) for k, v in named_params
+                    if not (k == "lm_head.weight" or k.endswith(".lm_head.weight"))
+                ]
+            tensors = [p for _, p in sorted(named_params, key=lambda x: x[0])]
+
+        hasher = hashlib.sha256()
+        total_numel = 0
+        total_l1 = 0.0
+        total_l2_sq = 0.0
+
+        for p in tensors:
+            p_local = p.to_local() if hasattr(p, "to_local") else p
+            p_cpu = p_local.detach().cpu().contiguous()
+            hasher.update(p_cpu.flatten().view(torch.uint8).numpy().tobytes())
+            total_numel += p_cpu.numel()
+            total_l1 += float(p_cpu.float().abs().sum().item())
+            total_l2_sq += float(p_cpu.float().pow(2).sum().item())
+
+        return {
+            "sha256": hasher.hexdigest(),
+            "total_numel": total_numel,
+            "num_tensors": len(tensors),
+            "l1_norm": total_l1,
+            "l2_norm": float(total_l2_sq**0.5),
+        }
 
 
 def _patched_run_engine_core(*args, **kwargs):
@@ -212,9 +465,11 @@ def _patched_run_engine_core(*args, **kwargs):
 
     global _orig_run_engine_core
     if _orig_run_engine_core is None:
-        import vllm.v1.engine.core as v1_core
-
-        _orig_run_engine_core = getattr(v1_core.EngineCoreProc, "_unpatched_run_engine_core", None)
+        try:
+            import vllm.v1.engine.core as v1_core
+            _orig_run_engine_core = getattr(v1_core.EngineCoreProc, "_unpatched_run_engine_core", None)
+        except Exception:
+            pass
 
     if hasattr(_orig_run_engine_core, "__func__"):
         _orig_run_engine_core = _orig_run_engine_core.__func__
@@ -224,6 +479,7 @@ def _patched_run_engine_core(*args, **kwargs):
     raise RuntimeError("[TPU ERROR] _orig_run_engine_core could not be resolved in _patched_run_engine_core")
 
 
+
 def patch_vllm_for_tpu() -> None:
     """
     Apply TPU-specific patches and workarounds to vLLM and torchtpu-vllm workers.
@@ -231,39 +487,6 @@ def patch_vllm_for_tpu() -> None:
     and driver-worker environment synchronization on GKE TPU v6e instances.
     """
     logger = logging.getLogger(__name__)
-
-    try:
-        import torch
-        import torch._dynamo
-        import torch._ops
-        import torch.compiler
-
-        def _allow(op):
-            if op is not None:
-                for fn in (
-                    getattr(torch.compiler, "allow_in_graph", None),
-                    getattr(torch._dynamo, "allow_in_graph", None),
-                ):
-                    if fn:
-                        try:
-                            fn(op)
-                        except Exception:
-                            pass
-
-        for ns_name in ["_c10d_functional", "c10d_functional"]:
-            if hasattr(torch.ops, ns_name):
-                ns = getattr(torch.ops, ns_name)
-                _allow(ns)
-                for name in dir(ns):
-                    try:
-                        attr = getattr(ns, name)
-                        _allow(attr)
-                        if hasattr(attr, "default"):
-                            _allow(attr.default)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
 
     try:
         import tpu_inference.worker.tpu_worker as tw
@@ -664,15 +887,16 @@ def patch_vllm_for_tpu() -> None:
                 import vllm.v1.engine.core as v1_core
 
                 if not getattr(v1_core, "_verl_tpu_patched", False):
-                    v1_core._verl_tpu_patched = True
-                    global _orig_run_engine_core
                     raw_fn = v1_core.EngineCoreProc.run_engine_core
                     if hasattr(raw_fn, "__func__"):
                         raw_fn = raw_fn.__func__
-                    _orig_run_engine_core = raw_fn
-                    v1_core.EngineCoreProc._unpatched_run_engine_core = raw_fn
+                    if raw_fn is not _patched_run_engine_core and raw_fn is not None:
+                        global _orig_run_engine_core
+                        _orig_run_engine_core = raw_fn
+                        v1_core.EngineCoreProc._unpatched_run_engine_core = raw_fn
                     v1_core.EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)
                     v1_core.run_engine_core = _patched_run_engine_core
+                    v1_core._verl_tpu_patched = True
             except Exception as e3:
                 logger.warning(f"Failed to patch v1_core.run_engine_core: {e3}")
 
@@ -965,11 +1189,13 @@ def patch_vllm_for_tpu() -> None:
                     node_id = worker_node_and_tpu_ids[i][0]
                     host_idx = unique_node_ids.index(node_id)
                     local_chip_id = node_workers[node_id].index(i)
+                    assigned_tpus = worker_node_and_tpu_ids[i][1] if len(worker_node_and_tpu_ids[i]) > 1 else []
+                    assigned_chip = str(assigned_tpus[0]) if (assigned_tpus and len(assigned_tpus) > 0) else str(local_chip_id)
                     args = self._env_vars_for_all_workers[i]
                     args["RANK"] = str(i)
                     args["LOCAL_RANK"] = str(local_chip_id)
-                    args["TPU_VISIBLE_CHIPS"] = str(local_chip_id)
-                    args["TPU_PROCESS_PORT"] = str(base_port + local_chip_id)
+                    args["TPU_VISIBLE_CHIPS"] = assigned_chip
+                    args["TPU_PROCESS_PORT"] = str(base_port + int(assigned_chip))
                     args["CLOUD_TPU_TASK_ID"] = str(host_idx)
                     args["TPU_WORKER_HOSTNAMES"] = host_names_str
                     args["TPU_HOST_BOUNDS"] = host_bounds
@@ -982,8 +1208,8 @@ def patch_vllm_for_tpu() -> None:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
                     logger.info(
-                        f"[TPU HACK 11] Patched worker {i} (host {host_idx}, chip {local_chip_id}) env vars: "
-                        f"TPU_VISIBLE_CHIPS={local_chip_id}, TPU_PROCESS_PORT={base_port + local_chip_id}, "
+                        f"[TPU HACK 11] Patched worker {i} (host {host_idx}, chip {assigned_chip}) env vars: "
+                        f"TPU_VISIBLE_CHIPS={assigned_chip}, TPU_PROCESS_PORT={base_port + int(assigned_chip)}, "
                         f"CLOUD_TPU_TASK_ID={host_idx}"
                     )
             except Exception as patch_err:

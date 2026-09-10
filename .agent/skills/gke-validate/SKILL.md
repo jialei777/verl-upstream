@@ -1,51 +1,69 @@
 ---
 name: gke-validate
-description: Trigger this skill when the user wants to clean up stale locks, configure local port forwarding on port 23333, and submit a new GRPO RL training job to the cluster. For checking existing job progress without resetting the cluster, use monitor-tpu-job instead.
+description: Trigger this skill when the user wants to validate TPU RL training changes on the GKE Ray cluster, ensure port forwarding is active, and submit/monitor a GRPO RL training job. Supports fast re-use and optional cluster resets.
 ---
 
 # TPU RL Job Submission & Monitoring Agent Skill
 
-This skill provides direct, step-by-step instructions for an agent to cleanly establish local port connections, submit PyTorch/XLA RL jobs (such as GRPO) to the active GKE Ray cluster, and monitor progress. 
+This skill provides direct, step-by-step instructions for an agent to establish local port connections, submit PyTorch/XLA RL jobs (such as GRPO) to the active GKE Ray cluster, and monitor progress efficiently.
 
-The cluster to use is "alekseyv-tpu-v6e8-spot-xpk", the project is tpu-pytorch, and the region is us-central2, the kubeconfig is located at "/tmp/jialei-kubeconfig"
+* **Cluster Name**: `alekseyv-tpu-v6e8-spot-xpk`
+* **GCP Project**: `tpu-pytorch`
+* **Region**: `us-central2`
+* **Kubeconfig Path**: `/tmp/alekseyv-kubeconfig`
+* **Ray Head Service**: `svc/ray-tpu-v6e-cluster-head-svc`
+
+---
 
 ## 🤖 Agent Execution Workflow
 
-### Step 1: Pre-Submission Port Cleanup
-Before starting any Ray submissions or local port connections, cleanly terminate any zombie processes on port `23333` to prevent port-already-bound or connection-refused errors:
-```bash
-fuser -k 23333/tcp || true
-```
----
-
-### Step 2: Reset / Restart GKE TPU Cluster Pods
-To ensure that the Ray cluster is in a completely healthy and clean state, and to clear any lingering TPU memory locks or zombie processes, restart all pods in the Ray cluster:
+### Step 1: Pre-Submission Port Cleanup & Check
+Before starting any Ray submissions or local port connections, ensure port `23333` is clear or check if port-forwarding is already active:
 
 ```bash
-kubectl delete pod -l ray.io/cluster=ray-tpu-v6e-cluster
+# Check if port forwarding is already active and healthy
+if ! curl -s http://localhost:23333/api/version >/dev/null 2>&1; then
+    fuser -k 23333/tcp || true
+    kubectl --kubeconfig=/tmp/alekseyv-kubeconfig port-forward svc/ray-tpu-v6e-cluster-head-svc 23333:8265 >/dev/null 2>&1 &
+    sleep 3
+fi
 ```
-
-> [!IMPORTANT]
-> **Wait for Recovery:** After deleting the pods, wait approximately 30–60 seconds for GKE to re-schedule and successfully spin up the new TPU head and worker pods. You can check the status via:
-> ```bash
-> kubectl get pods -l ray.io/cluster=ray-tpu-v6e-cluster
-> ```
-> Wait until all pods (head and workers) show `Running` and `Ready` (e.g., `2/2`) status before proceeding to Step 3.
 
 ---
 
-### Step 3: Establish Background Port Forwarding
-Set up background port-forwarding from the local dev VM to the GKE Ray TPU head service on port `23333` as an asynchronous background task:
+### Step 2: Cluster Health Check (Fast Path vs. Cold Reset)
+
+> [!TIP]
+> **Avoid Unnecessary Cold Starts:** 
+> Deleting pods triggers a **~16.8 minute cold-start XLA re-compilation** (Torchtitan ~7m + vLLM ~9.5m). 
+> **Always prefer reusing existing healthy pods** unless the cluster is in an `Error`, `CrashLoopBackOff`, or TPU hardware deadlock state.
+
+1. **Inspect Cluster Pod Health**:
+   ```bash
+   kubectl --kubeconfig=/tmp/alekseyv-kubeconfig get pods -l ray.io/cluster=ray-tpu-v6e-cluster
+   ```
+   * **If all pods are `Running` and `Ready` (e.g. `2/2`)**: Proceed directly to **Step 3** (Fast Path).
+   * **If pods are in an `Error`/deadlocked state or a clean reset is explicitly requested**: Execute a cluster restart:
+     ```bash
+     kubectl --kubeconfig=/tmp/alekseyv-kubeconfig delete pod -l ray.io/cluster=ray-tpu-v6e-cluster
+     ```
+     Wait approximately 30–60 seconds until all pods return to `Running` and `Ready` (2/2) status.
+
+---
+
+### Step 3: Verify Local Ray Client Environment
+Ensure the local Ray CLI with submission dependencies is in `$PATH`:
+
 ```bash
-kubectl port-forward svc/ray-tpu-v6e-cluster-head-svc 23333:8265
+export PATH="/usr/local/google/home/wenjung/.local/bin:$PATH"
+export KUBECONFIG="/tmp/alekseyv-kubeconfig"
+export RAY_ADDRESS="http://localhost:23333"
 ```
 
 ---
 
 ### Step 4: Programmatic Ray Job Submission
-Submit the Ray job to `http://localhost:23333`. Specify the following `excludes`, environment variables, and output redirects. 
-
-Save `LOG_FILE` to your environment by exporting it so that all subsequent tracking and plotting steps reference the exact active file:
+Submit the Ray job to `http://localhost:23333` using `run.sh` and redirect output to a structured log file:
 
 ```bash
 # Create the logs directory
@@ -54,45 +72,40 @@ mkdir -p logs/
 # Export the active log file path
 export LOG_FILE="logs/grpo_v1_run_$(date +%Y%m%d_%H%M%S).log"
 echo "Logging to: $LOG_FILE"
+echo "$LOG_FILE" > .current_log_file
 
-source /mnt/pd/daily/verl/bin/activate
-
-# Submit the Ray Job (WandB API key is passed securely from your environment variable)
-export RAY_ADDRESS="http://localhost:23333"
-
-# Submit GRPO RL training job
+# Submit GRPO RL training job in background
 bash run.sh > "$LOG_FILE" 2>&1 &
 ```
 
 ---
 
-### Step 5: Anti-Hang Monitoring & Verification
-Monitor the exported `$LOG_FILE` continuously to ensure progress and prevent silent hangs (such as XLA device locking or compilation jams):
+### Step 5: Anti-Hang Monitoring & Verification Protocol
 
 1. **Verify Log Updates**:
-   Track log line counts to ensure they are increasing:
+   Track log line counts to confirm steady progress:
    ```bash
    wc -l "$LOG_FILE"
    ```
-2. **Monitor Step Progression**:
+
+2. **Stream / Inspect Live Ray Job Logs**:
+   ```bash
+   # Extract the Ray Submission ID from $LOG_FILE or API
+   SUBMISSION_ID=$(curl -s http://localhost:23333/api/jobs/ | python3 -c "import sys, json; print(json.load(sys.stdin)[0]['submission_id'])" 2>/dev/null)
+   
+   # Fetch recent log output
+   ray job logs --address http://localhost:23333 "$SUBMISSION_ID" | tail -n 40
+   ```
+
+3. **Check Current Step Progress & Metrics**:
    Filter the active log for step numbers, validation progress, and metrics:
    ```bash
-   grep -Ei "step|loss|reward" "$LOG_FILE" | tail -n 20
-   ```
-3. **Trace console updates**:
-   ```bash
-   tail -f "$LOG_FILE"
+   ray job logs --address http://localhost:23333 "$SUBMISSION_ID" | grep -Ei "step:|loss|reward|val-core|TPU weight sync" | tail -n 25
    ```
 
 > [!IMPORTANT]
-> **Periodic Monitoring Protocol:** 
-> * **Every 1 Minutes:** Actively check on the submitted job every 1 minutes.
-> * **Verify Log Updates:** Run `wc -l "$LOG_FILE"` to confirm that the log line count is continuously and steadily increasing.
-> * **Check Current Step Progress:** Run `grep "Progress" "$LOG_FILE"` or search the logs for the keyword `"Progress"` to immediately identify which training step or validation iteration the job is currently executing.
-> * **Timeout Session:** If the job has been running for over 10 minutes, stop it.
-> * **Wait For Review:** If any failure happens, find the rootcause and propose the fix in production code, you must wait for the reviewer's approval before executing the next step. But if just adding debugging logs or excute test scrips, you can execute it directly without any supervision.
-
-> [!TIP]
-> **Detecting Hangs:** If the line count from `wc -l` remains static over a 30–60 second window during training, or if no new `step:` outputs appear after several minutes, check the worker pod logs using `kubectl logs` to diagnose possible TPU synchronization or communication issues.
-
-Continue to monitor the step progression (ensuring validation rewards show monotonically increasing values, e.g., from step 5 $\to$ 10 $\to$ 15).
+> **Periodic Monitoring Checklist:**
+> * **Every 1 Minute:** Actively check on the submitted job.
+> * **Verify Output Growth:** Confirm that `wc -l` or `ray job logs` line count is steadily growing.
+> * **Track Steps:** Check for `step: 0`, `step: 1`, `TPU weight sync completed in Xs`.
+> * **Timeout Rule:** If the job hangs with zero log updates for more than 5 minutes during training, inspect worker pod logs with `kubectl logs`.

@@ -10,8 +10,9 @@ export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
-# JAX/XLA Launch Barrier Configuration
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
+# JAX/XLA Launch Barrier & Compilation Configuration
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536"
+export XLA_FLAGS="--xla_disable_hlo_passes=instruction-fusion,fusion-merger,multi-output-fusion,horizontal-fusion"
 
 # Project and Experiment details
 project_name='verl_tpu_grpo'
@@ -83,7 +84,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len=512 \
     trainer.val_before_train=False \
