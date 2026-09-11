@@ -1141,6 +1141,25 @@ class vLLMReplica(RolloutReplica):
         )
 
         if is_tpu_vllm_run():
+            # [TPU HACK 23] Engine-internal data parallelism cannot work on TPU.
+            # torch_tpu builds a single global mesh per server actor, so every
+            # compiled program must satisfy partition_count == mesh size. With
+            # DP > 1 a replica owns TP * DP chips while each program is only TP
+            # wide, and the workers outside the program's device assignment abort
+            # in profile_run. It also buys nothing: data_parallel_size == 1
+            # already yields one TP-sized replica per TP chips. Fail fast rather
+            # than dying deep inside libtpu.
+            if self.config.data_parallel_size > 1:
+                raise NotImplementedError(
+                    "actor_rollout_ref.rollout.data_parallel_size="
+                    f"{self.config.data_parallel_size} is not supported on TPU. The TPU "
+                    "distributed runtime requires each compiled program to span the whole "
+                    "TPU mesh, but a single DP group only spans "
+                    f"tensor_model_parallel_size={self.config.tensor_model_parallel_size} "
+                    "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
+                    "then creates one rollout replica per tensor_model_parallel_size chips, "
+                    "which is equivalent to engine-internal data parallelism."
+                )
             await self._launch_tpu_servers()
             return
 
