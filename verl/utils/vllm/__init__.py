@@ -14,6 +14,7 @@
 
 
 from .npu_vllm_patch import apply_npu_vllm_patches
+from .tpu_vllm_patch import apply_tpu_vllm_patches
 from .utils import TensorLoRARequest, VLLMHijack, is_version_ge
 
 # The contents of vllm/patch.py should not be imported here, because the contents of
@@ -24,6 +25,9 @@ from .utils import TensorLoRARequest, VLLMHijack, is_version_ge
 # Apply NPU-specific vLLM patches when this module is imported.
 # Remove this when https://github.com/vllm-project/vllm-ascend/issues/5915 is fixed.
 apply_npu_vllm_patches()
+
+# Apply TPU-specific vLLM patches (b/501165531 workaround for unaligned DUS in RoPE)
+apply_tpu_vllm_patches()
 
 __all__ = [
     "TensorLoRARequest",

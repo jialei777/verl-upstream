@@ -68,6 +68,7 @@ _VLLM_VERSION = version.parse(vllm.__version__)
 
 if get_resource_name() == "TPU":
     from verl.workers.rollout.vllm_rollout.tpu_utils import (
+        _tpu_preflight_log,
         get_tpu_server_launch_config,
         is_tpu_vllm_run,
         override_vllm_configs_for_tpu,
@@ -1312,13 +1313,44 @@ class vLLMReplica(RolloutReplica):
         else:
             name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
 
+        platform_env_vars = get_platform().rollout_env_vars()
         env_vars = {
             **{var: "1" for var in get_platform().ray_noset_envvars()},
-            **get_platform().rollout_env_vars(),
+            **platform_env_vars,
             **tpu_env_vars,
         }
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+
+        # [TPU HACK 26] Make the XLA/libtpu compiler flags reach the processes that
+        # compile the model. Nothing else does: this actor's runtime_env is built
+        # from a fixed list, and vLLM's Ray executor then copies only VLLM_/NCCL_/HF_
+        # prefixed names into the RayWorkerWrapper pool, which is where compilation
+        # happens. VLLM_RAY_EXTRA_ENV_VARS_TO_COPY is vLLM's supported hook for that
+        # second hop. Each value is logged so that a future regression shows up in
+        # the job log instead of silently testing nothing.
+        flags_to_copy = set()
+        for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
+            # VERL_TPU_EXTRA_* appends rather than replaces, because the launch
+            # scripts export LIBTPU_INIT_ARGS themselves; and appending must not
+            # discard the value already forwarded off the worker.
+            base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
+            extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
+            resolved = " ".join(v for v in (base_value, extra_value) if v)
+            _tpu_preflight_log(
+                f"{flag_var}: base={base_value!r} extra={extra_value!r} -> engine={resolved or None!r}",
+                tag="TPU HACK 26",
+            )
+            if resolved:
+                env_vars[flag_var] = resolved
+                flags_to_copy.add(flag_var)
+
+        if flags_to_copy:
+            copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
+            existing = env_vars.get(copy_var) or os.environ.get(copy_var) or ""
+            names = {tok.strip() for tok in existing.split(",") if tok.strip()}
+            env_vars[copy_var] = ",".join(sorted(names | flags_to_copy))
+            _tpu_preflight_log(f"{copy_var}={env_vars[copy_var]}", tag="TPU HACK 26")
 
         server = self.server_class.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
