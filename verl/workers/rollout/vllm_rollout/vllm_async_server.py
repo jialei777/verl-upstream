@@ -73,6 +73,7 @@ if get_resource_name() == "TPU":
         override_vllm_configs_for_tpu,
         patch_vllm_for_tpu,
         prepare_tpu_server_args,
+        report_stale_tpu_engines,
     )
 else:
 
@@ -1294,6 +1295,13 @@ class vLLMReplica(RolloutReplica):
 
     async def _launch_tpu_servers(self):
         """Launch vLLM server actor for TPU platform."""
+        # [TPU HACK 25] Count leaked vLLM engine processes on each host before we
+        # touch the chips. Report-only unless VERL_TPU_MAX_STALE_ENGINES is set.
+        # Runs first so that a worn-out pod is named here rather than surfacing as
+        # an ActorUnavailableError from the query below, or as a bare
+        # "local device count is 0" some 8k log lines later.
+        await report_stale_tpu_engines(self.workers)
+
         node_id, visible_chips, tpu_env_vars = await get_tpu_server_launch_config(self.workers)
 
         prefix = "vllm_"
