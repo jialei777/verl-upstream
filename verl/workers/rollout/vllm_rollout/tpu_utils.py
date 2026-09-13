@@ -391,6 +391,14 @@ def patch_vllm_for_tpu() -> None:
 
             if lock_fd is not None:
                 os.close(lock_fd)
+                # The lock file must be removed on the success path too. It is
+                # created with O_CREAT|O_EXCL and /tmp survives across Ray jobs
+                # on the same pod, so leaking it makes every subsequent job fail
+                # master election and silently reload a stale cached state dict.
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
 
             # Stagger ranks before loading to serialize memory traffic
             time.sleep((rank_val % 4) * 0.4)
@@ -1180,6 +1188,12 @@ async def get_tpu_server_launch_config(workers):
                         "TORCH_DYNAMO_RECOMPILE_LIMIT",
                         "SKIP_JAX_PRECOMPILE",
                         "VLLM_ENABLE_V1_MULTIPROCESSING",
+                        # Keep the vLLM AOT compile cache disabled in the server
+                        # process too: a reloaded artifact degrades the model to
+                        # eager execution and reintroduces the unaligned-DUS
+                        # crash (b/501165531). See apply_tpu_vllm_patches().
+                        "VLLM_DISABLE_COMPILE_CACHE",
+                        "VERL_PLATFORM",
                         "XLA_FLAGS",
                     )
                 }

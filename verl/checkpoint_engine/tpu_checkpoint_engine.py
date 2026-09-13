@@ -14,6 +14,7 @@
 
 import asyncio
 import logging
+import os
 import re
 import time
 from typing import Any, Generator
@@ -34,6 +35,11 @@ logger = logging.getLogger(__name__)
 # --- GLOBAL CONFIGURATION / CONSTANTS FOR WEIGHT TRANSFER ---
 SYNC_LAYER_BY_LAYER = False  # Qwen3-0.6B is small, whole-model sync is fast and safe
 TPU_COPY_CHUNK_SIZE_PARAMETERS = 30
+
+# Must stay in sync with verl/workers/rollout/vllm_rollout/tpu_utils.py, which
+# looks the same detached actor up from the rollout side.
+TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
+TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
 
 # =====================================================================
 # Namespace & Formatting Utilities
@@ -259,6 +265,15 @@ class TPUCheckpointEngine(CheckpointEngine):
             except Exception:
                 self.registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
 
+        # The registry is a detached actor, so it survives the job that created
+        # it and can still hold entries published by a previous run. Reset it
+        # once, from the master, before anything is published.
+        if self.is_master:
+            try:
+                ray.get(self.registry.clear.remote())
+            except Exception as e:
+                logger.warning(f"Could not reset TPUWeightRegistry left over from a previous job: {e}")
+
     def prepare(self) -> dict[str, Any]:
         return {}
 
@@ -372,18 +387,44 @@ async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
     # 1. Extract and upload weights on trainer side (Rank 0 sends to Ray Plasma)
     actor_refs = manager.actor_wg.update_weights(global_steps=global_steps, mode=manager.backend)
     if isinstance(actor_refs, list):
-        await asyncio.gather(*actor_refs)
+        ray.get(actor_refs)
     elif actor_refs is not None:
-        await actor_refs
+        ray.get(actor_refs)
 
     # 2. Call collective_rpc on all rollout replicas to load weights from the registry
     step_key = global_steps if global_steps is not None else 0
+
+    # Fail loudly if the trainer side did not actually publish anything. Without
+    # this check an empty registry degrades into the rollout silently reusing its
+    # initial weights, so training "succeeds" while nothing is ever learned.
+    registry = ray.get_actor(TPU_WEIGHT_REGISTRY_ACTOR_NAME, namespace=TPU_WEIGHT_REGISTRY_NAMESPACE)
+    published = ray.get(registry.get_weights.remote(step_key))
+    if published is None:
+        raise RuntimeError(
+            f"TPU weight sync failed: no weights published under step_key={step_key}. "
+            "The trainer-side send_weights never reached the registry. Re-run with "
+            "debug logging enabled on verl.checkpoint_engine to confirm which rank "
+            "was elected is_master."
+        )
+
     futures = [
         replica.server_handle.collective_rpc.remote(method="load_weights_from_ray_registry", args=(step_key,))
         for replica in manager.replicas
     ]
-    await asyncio.gather(*futures)
+    results = await asyncio.gather(*futures)
     t_total = time.perf_counter() - t_total_start
+
+    flat_counts: list = []
+    for replica_result in results:
+        if isinstance(replica_result, (list, tuple)):
+            flat_counts.extend(replica_result)
+        elif replica_result is not None:
+            flat_counts.append(replica_result)
+    if flat_counts and not any(isinstance(n, int) and n > 0 for n in flat_counts):
+        raise RuntimeError(
+            f"TPU weight sync failed: no rollout worker loaded any tensor for "
+            f"step_key={step_key} (per-worker key counts: {results})."
+        )
 
     logger.info(f"TPU weight sync for step {global_steps} completed in {t_total + t_abort:.3f}s")
 

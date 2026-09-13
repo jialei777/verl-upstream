@@ -13,30 +13,31 @@
 # limitations under the License.
 """TPU-specific vLLM patches for rotary positional embeddings."""
 
+import importlib.util
 import logging
 import os
+
 import torch
 
 logger = logging.getLogger(__name__)
 
-_TPU_SIGN_CACHE: dict = {}
+def _tpu_sign(x: torch.Tensor) -> torch.Tensor:
+    """Builds [[-1], [1]] with the dtype/device of ``x``.
 
-
-def _tpu_sign(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """Cached [[-1], [1]] used to negate the first half of a split tensor."""
-    key = (dtype, device)
-    sign = _TPU_SIGN_CACHE.get(key)
-    if sign is None:
-        sign = torch.tensor([[-1.0], [1.0]], dtype=dtype, device=device)
-        _TPU_SIGN_CACHE[key] = sign
-    return sign
+    This is deliberately built from tensor ops on every call instead of being
+    memoized in a module-level dict. torch.compile specializes reads of Python
+    globals into the serialized AOT prologue, so a cached constant resurfaces as
+    a ``KeyError`` when the compiled artifact is replayed in a fresh process.
+    XLA constant-folds this away, so there is no runtime cost.
+    """
+    return (torch.arange(2, dtype=x.dtype, device=x.device) * 2.0 - 1.0).unsqueeze(-1)
 
 
 def _tpu_rotate_neox(x: torch.Tensor) -> torch.Tensor:
     """cat((-x2, x1), -1) without a concat. Bitwise identical under IEEE754."""
     half = x.shape[-1] // 2
     swapped = x.unflatten(-1, (2, half)).flip(-2)
-    return (swapped * _tpu_sign(x.dtype, x.device)).flatten(-2)
+    return (swapped * _tpu_sign(x)).flatten(-2)
 
 
 def _tpu_widen(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -70,6 +71,7 @@ def patch_tpu_rotary_emb():
         from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
         if getattr(ApplyRotaryEmb, "_verl_tpu_rotary_patched", False):
+            print("[ROPEPATCH] already patched", flush=True)
             return
 
         def patched_forward_static(
@@ -104,11 +106,43 @@ def patch_tpu_rotary_emb():
         rotary_common.rotate_neox = _tpu_rotate_neox
         ApplyRotaryEmb._verl_tpu_rotary_patched = True
         logger.info("Successfully applied TPU concat-free RoPE patch to vLLM.")
+        print(f"[ROPEPATCH] applied pid={os.getpid()}", flush=True)
     except Exception as e:
         logger.warning(f"Failed to apply TPU rotary embedding patch to vLLM: {e}")
+        print(f"[ROPEPATCH] FAILED pid={os.getpid()} err={e!r}", flush=True)
+
+
+def _tpu_runtime_present() -> bool:
+    """True when this process runs against the TPU backend.
+
+    ``VERL_PLATFORM`` is the cheap signal, but it does not reach every process
+    that matters. The vLLM TPU executor reuses *pooled* Ray workers —
+    ``tpu_inference/executors/ray_distributed_executor.py`` creates
+    ``RayWorkerWrapper`` with no ``runtime_env`` — so those workers were started
+    before the job existed and see ``VERL_PLATFORM`` unset, even though they are
+    precisely the processes that compile and execute the model.
+
+    Fall back to detecting the TPU backend package, which is absent on
+    GPU/CPU installs.
+    """
+    if os.environ.get("VERL_PLATFORM") == "tpu":
+        return True
+    return importlib.util.find_spec("torch_tpu") is not None
 
 
 def apply_tpu_vllm_patches() -> None:
     """Apply TPU-specific vLLM patches."""
-    if os.environ.get("VERL_PLATFORM") == "tpu":
-        patch_tpu_rotary_emb()
+    if not _tpu_runtime_present():
+        return
+
+    # Disable vLLM's AOT compile cache. The artifact this stack writes reloads as
+    # "num_artifacts=0 num_submods=0", a degenerate callable that silently drops
+    # the model back to eager execution, and the eager torch.cat below then trips
+    # the unaligned-DUS CHECK in the XLA:TPU fusion emitter (b/501165531).
+    # Measured on Qwen3-0.6B / v6e TP=8: ~85 failures warm, zero cold. Salting the
+    # cache key would not help, since the bad artifact comes from a healthy run.
+    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+
+    patch_tpu_rotary_emb()
+
+
