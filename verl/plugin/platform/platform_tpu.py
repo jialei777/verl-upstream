@@ -471,5 +471,6 @@ class PlatformTPU(PlatformCUDA):
         return {
             "runtime_env": {
                 "worker_process_setup_hook": patch_ray_worker,
+                "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }

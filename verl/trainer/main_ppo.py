@@ -78,7 +78,10 @@ def run_ppo(config, task_runner_class) -> None:
         platform_ray_kwargs = get_platform().get_ray_init_kwargs()
         if platform_ray_kwargs and "runtime_env" in platform_ray_kwargs:
             for k, v in platform_ray_kwargs["runtime_env"].items():
-                ray_init_dict["runtime_env"][k] = v
+                if k == "env_vars" and "env_vars" in ray_init_dict.get("runtime_env", {}):
+                    ray_init_dict["runtime_env"]["env_vars"].update(v)
+                else:
+                    ray_init_dict["runtime_env"][k] = v
         ray.init(**ray_init_dict)
 
     # Create a remote instance of the TaskRunner class, and
@@ -103,7 +106,9 @@ def run_ppo(config, task_runner_class) -> None:
         )
 
         runner = task_runner_class.options(
-            num_cpus=DEFAULT_TASK_RUNNER_CPUS, max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY
+            num_cpus=DEFAULT_TASK_RUNNER_CPUS,
+            max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY,
+            runtime_env={"env_vars": {"VERL_PLATFORM": "tpu"}},
         ).remote()
     else:
         runner = task_runner_class.remote()
