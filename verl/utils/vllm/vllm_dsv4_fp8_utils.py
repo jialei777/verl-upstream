@@ -16,8 +16,21 @@
 from types import MethodType
 
 import torch
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-from vllm.model_executor.layers.linear import LinearBase
+
+# These helpers are DeepSeek-V4 specific, but this module is imported
+# transitively by every vLLM rollout via ``vllm_fp8_utils``. vLLM builds without
+# MoE support, and vLLM versions past the MoE refactor that renamed ``FusedMoE``
+# to ``FusedMoEFactory``, must therefore not break the import -- the functions
+# below already resolve their other vLLM dependencies lazily for the same reason.
+try:
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    FusedMoE = None
+
+try:
+    from vllm.model_executor.layers.linear import LinearBase
+except ImportError:
+    LinearBase = None
 
 
 def is_deepseek_v4_model(model):
@@ -48,6 +61,8 @@ def _is_mega_moe_module(module):
 def _is_mxfp4_fused_moe_module(module):
     from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
+    if FusedMoE is None:
+        return False
     return isinstance(module, FusedMoE) and isinstance(module.quant_method, Mxfp4MoEMethod)
 
 
@@ -169,6 +184,9 @@ def _attach_weight_loaders(param):
 
 def _prepare_linear_params_for_loading(model, copy_param_subclass_attrs):
     from vllm.model_executor.parameter import BlockQuantScaleParameter, ModelWeightParameter
+
+    if LinearBase is None:
+        return
 
     for layer in model.modules():
         if not isinstance(layer, LinearBase):

@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import importlib
 import json
 import logging
 import multiprocessing
@@ -30,15 +31,31 @@ import numpy as np
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from verl.plugin.platform.tpu_topology import (
+    detect_slice_chip_mesh,
+    detect_tpu_generation,
+    get_chips_per_host_bounds,
+    get_devices_per_chip,
+    get_devices_per_host,
+    get_known_device_counts,
+    get_torch_tpu_topology,
+)
 from verl.utils.device import get_resource_name
 
 # --- Google TPU specific global constants ---
 TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
 TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
 TPU_ROLLOUT_BASE_PORT = 8070
-TPU_HOST_BOUNDS_VAL = "2,4,1"
-TPU_CHIPS_PER_HOST_BOUNDS_VAL = "1,1,1"
-CHIPS_PER_HOST_VAL = "4"
+
+# Environment variables that name the *one* device a single process owns.
+# They are meaningful only inside the process they were computed for, so they
+# must never be copied from one process's environment into another's.
+TPU_PER_PROCESS_DEVICE_ENV_VARS = frozenset(
+    {
+        "TPU_VISIBLE_DEVICES",
+        "TPU_VISIBLE_CHIPS",
+    }
+)
 # -------------------------------------------
 
 try:
@@ -51,109 +68,143 @@ try:
 except ImportError:
     load_weights_on_worker = None
 
-# Fallback imports for TPU vLLM platforms
-try:
-    try:
-        from vllm_torchtpu.executors import ray_distributed_executor
-    except ImportError:
-        from tpu_inference.executors import ray_distributed_executor
-except ImportError:
-    ray_distributed_executor = None
+# NOTE: deliberately no ``setLevel`` here. The TPU patches emit their resolved
+# topology and per-worker environment at INFO, and those lines are the only
+# record of what the rollout was actually configured with. Pinning the level
+# to WARN hides them; let the process-wide logging configuration decide.
+logger = logging.getLogger(__name__)
 
-try:
-    try:
-        import vllm_torchtpu.platforms.tpu_platform as tpu_platform
-    except ImportError:
-        import tpu_inference.platforms.tpu_platform as tpu_platform
-except ImportError:
-    tpu_platform = None
-
-try:
-    from vllm.config import AttentionConfig
-except ImportError:
-    AttentionConfig = None
-
-try:
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-except ImportError:
-    AttentionBackendEnum = None
-
-try:
-    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-except ImportError:
-    EngineArgs = None
-    AsyncEngineArgs = None
-
-try:
-    import vllm.envs as vllm_envs
-except ImportError:
-    vllm_envs = None
-
-try:
-    try:
-        import vllm_torchtpu.envs as tpu_envs
-    except ImportError:
-        import tpu_inference.envs as tpu_envs
-except ImportError:
-    tpu_envs = None
-
-try:
-    try:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-    except ImportError:
-        from tpu_inference.worker.tpu_worker import TPUWorker
-except ImportError:
-    TPUWorker = None
-
-try:
-    from vllm.utils import get_ip
-except ImportError:
-    try:
-        from vllm.utils.network_utils import get_ip
-    except ImportError:
-        get_ip = None
-
-try:
-    from vllm.v1.executor.ray_executor import RayWorkerMetaData
-except ImportError:
-    try:
-        from vllm.v1.executor.ray_utils import RayWorkerMetaData
-    except ImportError:
-
-        class RayWorkerMetaData:
-            def __init__(self, worker, created_rank):
-                self.worker = worker
-                self.created_rank = created_rank
-                self.adjusted_rank = None
-                self.ip = None
+# --- Optional TPU vLLM backend resolution ------------------------------------
+#
+# Two mutually exclusive backends can supply the symbols below:
+#   * ``vllm_torchtpu`` -- the torch_tpu / PyTorch backend, which is what verl
+#     drives on TPU.
+#   * ``tpu_inference`` -- the JAX backend.
+#
+# Both are optional, and crucially either can be *installed but broken*.
+# Probing must therefore catch ``Exception``, not just ``ImportError``: in the
+# current TPU image, importing ``tpu_inference`` pulls in ``torchax``, which
+# raises ``AttributeError: The underlying op of 'aten.prod' has no overload
+# name 'dim_Dimname'`` against torch 2.12. An ``ImportError``-only guard lets
+# that escape and makes this whole module unimportable -- even though the
+# backend actually in use (``vllm_torchtpu``) is perfectly healthy.
 
 
-try:
-    from vllm.utils import get_open_port
-except ImportError:
-    try:
-        from vllm_torchtpu.utils import get_open_port
-    except ImportError:
+def _optional_import(candidates: tuple[tuple[str, str | None], ...], what: str) -> Any:
+    """Return the first resolvable candidate, or ``None`` if none resolve.
+
+    Args:
+        candidates: ``(module_path, attribute)`` pairs, tried in order. An
+            attribute of ``None`` means "import the module itself".
+        what: Human-readable name of the symbol, used in the debug logs.
+
+    Returns:
+        The first successfully resolved module or attribute, else ``None``.
+    """
+    for module_path, attribute in candidates:
+        target = f"{module_path}.{attribute}" if attribute else module_path
         try:
-            from vllm.utils.network_utils import get_open_port
-        except ImportError:
-            get_open_port = None
+            module = importlib.import_module(module_path)
+            return getattr(module, attribute) if attribute else module
+        except Exception as e:
+            logger.debug(f"[TPU] {what}: {target} unavailable ({type(e).__name__}: {e})")
+    return None
 
-try:
-    from vllm_torchtpu.platforms.tpu_platform import get_distributed_init_method
-except ImportError:
-    try:
-        from tpu_inference.platforms.tpu_platform import get_distributed_init_method
-    except ImportError:
-        try:
-            from vllm.utils.network_utils import get_distributed_init_method
-        except ImportError:
-            get_distributed_init_method = None
 
-try:
-    from vllm.platforms import current_platform
-except ImportError:
-    current_platform = None
+ray_distributed_executor = _optional_import(
+    (
+        ("vllm_torchtpu.executors.ray_distributed_executor", None),
+        ("tpu_inference.executors.ray_distributed_executor", None),
+    ),
+    "ray_distributed_executor",
+)
+
+tpu_platform = _optional_import(
+    (
+        ("vllm_torchtpu.platforms.tpu_platform", None),
+        ("tpu_inference.platforms.tpu_platform", None),
+    ),
+    "tpu_platform",
+)
+
+tpu_envs = _optional_import(
+    (("vllm_torchtpu.envs", None), ("tpu_inference.envs", None)),
+    "tpu_envs",
+)
+
+TPUWorker = _optional_import(
+    (
+        ("vllm_torchtpu.worker.tpu_worker", "TPUWorker"),
+        ("tpu_inference.worker.tpu_worker", "TPUWorker"),
+    ),
+    "TPUWorker",
+)
+
+if tpu_platform is None and ray_distributed_executor is None:
+    logger.warning(
+        "[TPU] Neither 'vllm_torchtpu' nor 'tpu_inference' could be imported. "
+        "TPU rollout patches will be skipped; run with VERL_LOGGING_LEVEL=DEBUG "
+        "to see why each candidate was rejected."
+    )
+
+AttentionConfig = _optional_import((("vllm.config", "AttentionConfig"),), "AttentionConfig")
+
+AttentionBackendEnum = _optional_import(
+    (("vllm.v1.attention.backends.registry", "AttentionBackendEnum"),),
+    "AttentionBackendEnum",
+)
+
+EngineArgs = _optional_import((("vllm.engine.arg_utils", "EngineArgs"),), "EngineArgs")
+AsyncEngineArgs = _optional_import((("vllm.engine.arg_utils", "AsyncEngineArgs"),), "AsyncEngineArgs")
+
+vllm_envs = _optional_import((("vllm.envs", None),), "vllm_envs")
+
+get_ip = _optional_import(
+    (("vllm.utils", "get_ip"), ("vllm.utils.network_utils", "get_ip")),
+    "get_ip",
+)
+
+get_open_port = _optional_import(
+    (
+        ("vllm.utils", "get_open_port"),
+        ("vllm_torchtpu.utils", "get_open_port"),
+        ("vllm.utils.network_utils", "get_open_port"),
+    ),
+    "get_open_port",
+)
+
+# NOTE: vLLM's own generic helper is preferred over the JAX backend here. This
+# is only a "build a tcp://host:port string" utility, so when the active
+# backend simply stopped exporting it, reaching for a whole different platform
+# module is both unnecessary and (see above) actively dangerous.
+get_distributed_init_method = _optional_import(
+    (
+        ("vllm_torchtpu.platforms.tpu_platform", "get_distributed_init_method"),
+        ("vllm.utils.network_utils", "get_distributed_init_method"),
+        ("vllm.utils", "get_distributed_init_method"),
+        ("tpu_inference.platforms.tpu_platform", "get_distributed_init_method"),
+    ),
+    "get_distributed_init_method",
+)
+
+current_platform = _optional_import((("vllm.platforms", "current_platform"),), "current_platform")
+
+RayWorkerMetaData = _optional_import(
+    (
+        ("vllm.v1.executor.ray_executor", "RayWorkerMetaData"),
+        ("vllm.v1.executor.ray_utils", "RayWorkerMetaData"),
+    ),
+    "RayWorkerMetaData",
+)
+
+if RayWorkerMetaData is None:
+
+    class RayWorkerMetaData:  # type: ignore[no-redef]
+        def __init__(self, worker, created_rank):
+            self.worker = worker
+            self.created_rank = created_rank
+            self.adjusted_rank = None
+            self.ip = None
 
 
 class PickleableProcessWrapper:
@@ -222,6 +273,56 @@ def _patched_run_engine_core(*args, **kwargs):
     if _orig_run_engine_core is not None:
         return _orig_run_engine_core(*args, **kwargs)
     raise RuntimeError("[TPU ERROR] _orig_run_engine_core could not be resolved in _patched_run_engine_core")
+
+
+def _seed_vllm_tpu_topology_map() -> None:
+    """Seed vLLM's TPU topology lookup table for the TPU generation in use.
+
+    vLLM's TPU backend keeps a ``{num_devices: topology}`` dict that it consults
+    when it has to synthesize ``TORCH_TPU_TOPOLOGY`` on its own. Upstream only
+    ships the entries it needs for its own launch paths, and the module owning
+    the dict has moved between releases (``TPU_TOPOLOGY_MAP`` in
+    ``executors.ray_distributed_executor`` on older torchtpu-vLLM builds,
+    ``TPU_MULTIHOST_TOPOLOGY_MAP`` in ``platforms.tpu_platform`` on newer ones),
+    so probe for every known location rather than assuming one.
+
+    The values are generation-aware, which matters because the same device count
+    means different things per generation: 8 devices is *two* v6e hosts
+    (``"2,4,1"``) but a *single* tpu7x host (``"2,2,1,2"``, 4 dual-core chips).
+    """
+    logger = logging.getLogger(__name__)
+
+    generation = detect_tpu_generation()
+    chip_mesh = detect_slice_chip_mesh()
+
+    tables = []
+    for module, attr in (
+        (ray_distributed_executor, "TPU_TOPOLOGY_MAP"),
+        (ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP"),
+        (tpu_platform, "TPU_TOPOLOGY_MAP"),
+        (tpu_platform, "TPU_MULTIHOST_TOPOLOGY_MAP"),
+    ):
+        if module is None:
+            continue
+        table = getattr(module, attr, None)
+        if isinstance(table, dict):
+            tables.append((f"{getattr(module, '__name__', module)}.{attr}", table))
+
+    if not tables:
+        # Not fatal: verl computes the topology itself in patched_init_workers_ray
+        # and exports it before the workers import vLLM, so the map is only a
+        # backstop for code paths verl does not drive.
+        logger.warning("[TPU] No vLLM TPU topology map found to seed; relying on verl-computed topology.")
+        return
+
+    # One entry per plausible rollout size, from a single chip up to a few hosts.
+    device_counts = get_known_device_counts(generation)
+    overrides = {
+        num_devices: get_torch_tpu_topology(num_devices, generation, chip_mesh) for num_devices in device_counts
+    }
+    for name, table in tables:
+        table.update(overrides)
+        logger.info(f"[TPU HACK 21] Seeded {name} for TPU '{generation}': {overrides}")
 
 
 def patch_vllm_for_tpu() -> None:
@@ -436,7 +537,19 @@ def patch_vllm_for_tpu() -> None:
 
         num_keys = 0
         if load_weights_on_worker is not None:
-            res_loader = load_weights_on_worker(vllm_model, state_dict_data, rank_val)
+            # The loader reshards by rank, so it needs to know how many shards
+            # the incoming global tensors are expected to split into. Without
+            # this it cannot tell a correctly-gathered weight from a trainer
+            # shard, and a mismatch only surfaces much later as a confusing
+            # view() error (or, on low ranks, as silently wrong weights).
+            world_size_val = getattr(self, "world_size", None)
+            if not world_size_val:
+                try:
+                    world_size_val = int(os.environ.get("WORLD_SIZE", "0")) or None
+                except ValueError:
+                    world_size_val = None
+
+            res_loader = load_weights_on_worker(vllm_model, state_dict_data, rank_val, world_size_val)
             if isinstance(res_loader, tuple):
                 num_keys = res_loader[0]
             else:
@@ -499,8 +612,11 @@ def patch_vllm_for_tpu() -> None:
 
                 def patched_create_engine_config(self, *args, **kwargs):
                     is_tpu = get_resource_name() == "TPU" or os.environ.get("VLLM_USE_V1") == "0"
+                    # A rollout spans multiple hosts only once it needs more
+                    # devices than one VM exposes. That is 4 on v6e but 8 on
+                    # TPU7x, whose 4 chips each present two chiplets.
                     is_multi_host = (
-                        self.tensor_parallel_size > 4
+                        self.tensor_parallel_size > get_devices_per_host()
                         or int(os.environ.get("NNODES_ROLLOUT", "1")) > 1
                         or os.environ.get("TPU_MULTIHOST_BACKEND") == "ray"
                     )
@@ -583,8 +699,7 @@ def patch_vllm_for_tpu() -> None:
         except Exception as e:
             logger.warning(f"Failed to patch TPUWorker class directly: {e}")
 
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
-        ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
+        _seed_vllm_tpu_topology_map()
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -609,10 +724,16 @@ def patch_vllm_for_tpu() -> None:
 
             orig_avail_res = v1_ray_utils.available_resources_per_node
 
+            # Ray can report 0 free TPUs for a node whose devices verl has already
+            # reserved through its own placement group, which makes vLLM refuse to
+            # schedule. Floor the count at one full host: 4 devices on v6e, 8 on
+            # tpu7x (4 chips x 2 addressable cores).
+            devices_per_host = float(get_devices_per_host())
+
             def patched_avail_res(*args, **kwargs):
                 res_map = orig_avail_res(*args, **kwargs)
                 for node_id, res in res_map.items():
-                    res["TPU"] = max(res.get("TPU", 0.0), 4.0)
+                    res["TPU"] = max(res.get("TPU", 0.0), devices_per_host)
                 return res_map
 
             v1_ray_utils.available_resources_per_node = patched_avail_res
@@ -793,7 +914,6 @@ def patch_vllm_for_tpu() -> None:
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
             RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
-            TPU_TOPOLOGY_MAP_local = ray_distributed_executor.TPU_TOPOLOGY_MAP
 
             self.workers = []
             self.pp_tp_workers = []
@@ -907,27 +1027,43 @@ def patch_vllm_for_tpu() -> None:
             os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
             logger.info(f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {sb_addresses_str}")
 
-            total_chips = len(self.workers)
-            if total_chips == 32:
-                topology = "4,8,1"
-                host_bounds = "4,8,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 8:
-                topology = "2,4,1"
-                host_bounds = "2,4,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 4:
-                topology = "2,2,1"
+            # NOTE: there is one worker per *addressable device*, not per chip.
+            # The distinction only bites on TPU7x, where every chip exposes two
+            # independent cores: a single 4-chip tpu7x host produces 8 workers,
+            # the same count as a *two-host* v6e slice. Deriving the geometry
+            # from the detected generation keeps both readings correct.
+            total_devices = len(self.workers)
+            generation = detect_tpu_generation()
+            devices_per_chip = get_devices_per_chip(generation)
+            devices_per_host = get_devices_per_host(generation)
+            topology = get_torch_tpu_topology(total_devices, generation, detect_slice_chip_mesh())
+            chips_per_host = str(devices_per_host)
+
+            if devices_per_chip > 1:
+                # TPU7x. torch_tpu itself overwrites TPU_HOST_BOUNDS with the
+                # topology verbatim and TPU_CHIPS_PER_HOST_BOUNDS with an
+                # all-ones string of matching arity ("1,1,1,1" for a 4D
+                # topology), so mirror that for the executor paths that read
+                # these variables before torch_tpu initializes.
+                host_bounds = topology
+                chips_per_host_bounds = get_chips_per_host_bounds(topology)
+            elif total_devices == 4:
+                # One device per chip: a 2x2 slice fits in a single host, so the
+                # whole mesh is described by the per-host bounds instead.
                 host_bounds = "1,1,1"
                 chips_per_host_bounds = "2,2,1" if num_nodes == 1 else "1,1,1"
-                chips_per_host = "4"
+            elif total_devices in (8, 32):
+                host_bounds = topology
+                chips_per_host_bounds = "1,1,1"
             else:
-                topology = TPU_TOPOLOGY_MAP_local.get(total_chips, "1,1,1")
                 host_bounds = "1,1,1"
                 chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
+
+            logger.info(
+                f"RayDistributedExecutor | TPU '{generation}': {total_devices} devices across {num_nodes} node(s) -> "
+                f"TORCH_TPU_TOPOLOGY={topology}, TPU_HOST_BOUNDS={host_bounds}, "
+                f"TPU_CHIPS_PER_HOST_BOUNDS={chips_per_host_bounds}, CHIPS_PER_HOST={chips_per_host}"
+            )
 
             rank_0_node_id = unique_node_ids[0]
             rank_0_worker_index = node_workers[rank_0_node_id][0]
@@ -935,7 +1071,7 @@ def patch_vllm_for_tpu() -> None:
             master_port = str(get_open_port()) if get_open_port is not None else ""
 
             all_args_to_update_environment_variables = []
-            for i in range(total_chips):
+            for i in range(total_devices):
                 node_id = worker_node_and_tpu_ids[i][0]
                 node_rank = unique_node_ids.index(node_id)
                 args = {
@@ -981,6 +1117,7 @@ def patch_vllm_for_tpu() -> None:
                     args["RANK"] = str(i)
                     args["LOCAL_RANK"] = str(local_chip_id)
                     args["TPU_VISIBLE_CHIPS"] = str(local_chip_id)
+                    args["TPU_VISIBLE_DEVICES"] = str(local_chip_id)
                     args["TPU_PROCESS_PORT"] = str(base_port + local_chip_id)
                     args["CLOUD_TPU_TASK_ID"] = str(host_idx)
                     args["TPU_WORKER_HOSTNAMES"] = host_names_str
@@ -990,7 +1127,7 @@ def patch_vllm_for_tpu() -> None:
                     args["TORCH_TPU_TOPOLOGY"] = topology
                     args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
                     args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
-                    if total_chips > 4 or num_nodes > 1:
+                    if total_devices > devices_per_host or num_nodes > 1:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
                     logger.info(
@@ -1098,14 +1235,31 @@ def patch_vllm_for_tpu() -> None:
         logger.warning(f"Failed to apply TPU patches: {e}")
 
 
-# Helper helpers to import from torchtpu-vllm and other places inside vllm_async_server
-try:
-    from vllm_torchtpu.platforms.tpu_platform import get_env_vars_to_copy
-except ImportError:
-    try:
-        from tpu_inference.platforms.tpu_platform import get_env_vars_to_copy
-    except ImportError:
-        get_env_vars_to_copy = None
+# Helper imports from torchtpu-vllm and other places used inside vllm_async_server.
+# Same probing rules as the block at the top of this module: catch Exception, and
+# never let an unhealthy optional backend break the healthy one.
+#
+# ``vllm.ray.ray_env`` is upstream vLLM's canonical home for this helper (same
+# signature); the TPU forks used to re-export it from their platform module and
+# newer builds no longer do. Resolving it matters beyond avoiding a crash: this
+# is what copies driver env vars (LIBTPU_INIT_ARGS, HF_TOKEN, VLLM_*) onto the
+# rollout workers, so silently losing it would surface much later as a
+# misconfigured worker rather than an import error.
+get_env_vars_to_copy = _optional_import(
+    (
+        ("vllm_torchtpu.platforms.tpu_platform", "get_env_vars_to_copy"),
+        ("vllm.ray.ray_env", "get_env_vars_to_copy"),
+        ("tpu_inference.platforms.tpu_platform", "get_env_vars_to_copy"),
+    ),
+    "get_env_vars_to_copy",
+)
+
+if get_env_vars_to_copy is None:
+    logger.warning(
+        "[TPU] Could not resolve get_env_vars_to_copy; driver environment variables "
+        "will NOT be propagated to rollout workers. Anything the rollout needs "
+        "(e.g. LIBTPU_INIT_ARGS) must be set on the workers by other means."
+    )
 
 
 def is_tpu_vllm_run() -> bool:
@@ -1190,7 +1344,27 @@ async def get_tpu_server_launch_config(workers):
 
     node_id = worker_infos[0][0]
     visible_chips = ",".join([info[1] for info in worker_infos])
-    tpu_env_vars = worker_tpu_envs[0] if worker_tpu_envs else {}
+    sampled_env = worker_tpu_envs[0] if worker_tpu_envs else {}
+
+    # This snapshot is taken from worker 0 but applied to the vLLM server
+    # actor's runtime_env, which Ray then hands down to every engine worker on
+    # the host. Host-level settings (topology, slicebuilder addresses, XLA
+    # flags) are exactly what we want to share; a device pin is not.
+    #
+    # torch_tpu treats a single-valued TPU_VISIBLE_DEVICES as authoritative and
+    # only falls back to the process's LOCAL_RANK when it is absent or names
+    # more than one device (see IsSingleDeviceSpecified in
+    # torch_tpu/csrc/common/device_utils.h). Leaking worker 0's "0" therefore
+    # makes every engine worker open the same /dev/vfio node and the second one
+    # to get there dies with FAILED_PRECONDITION.
+    tpu_env_vars = {k: v for k, v in sampled_env.items() if k not in TPU_PER_PROCESS_DEVICE_ENV_VARS}
+
+    dropped = sorted(k for k in sampled_env if k in TPU_PER_PROCESS_DEVICE_ENV_VARS)
+    if dropped:
+        logger.info(
+            f"[TPU] Withheld per-process device variables {dropped} from the vLLM server environment; "
+            "each engine worker selects its device from LOCAL_RANK."
+        )
 
     return node_id, visible_chips, tpu_env_vars
 
@@ -1204,14 +1378,16 @@ def prepare_tpu_server_args(args: dict):
     args["distributed_executor_backend"] = "external_launcher"
     os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
 
-    try:
-        try:
-            import vllm_torchtpu.envs as tpu_envs
-        except ImportError:
-            import tpu_inference.envs as tpu_envs
+    # ``tpu_envs`` was already resolved against both backends at import time; do
+    # not retry the import here, or a broken optional backend gets re-imported
+    # (slowly, and noisily) on every call.
+    if tpu_envs is None:
+        logger.warning("Cannot force TPU_MULTIHOST_BACKEND to ray: no TPU vLLM envs module was resolved.")
+        return
 
+    try:
         tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
         if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
             tpu_envs.__getattr__.cache_clear()
     except Exception as env_err:
-        logging.getLogger(__name__).warning(f"Failed to force TPU_MULTIHOST_BACKEND to ray: {env_err}")
+        logger.warning(f"Failed to force TPU_MULTIHOST_BACKEND to ray: {env_err}")

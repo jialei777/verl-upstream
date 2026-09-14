@@ -1,0 +1,151 @@
+---
+# RayCluster for 2 x TPU7x (Ironwood) 2x2x1 slices.
+#
+# Each 2x2x1 slice is 4 chips on a single tpu7x-standard-4t host, and each chip
+# exposes 2 TensorCores, so Ray advertises `TPU: 8.0` per node even though the
+# Kubernetes request is `google.com/tpu: "4"` (Kubernetes counts chips, Ray
+# counts addressable devices). verl launches one worker per device: 8 per slice.
+#
+# Requirements:
+#   * ray >= 2.58 -- earlier releases do not know the "v7x" pod type and will
+#     mis-report the per-node TPU resource count.
+#   * GKE >= 1.34.1-gke.1829001 -- earlier versions advertised 8 allocatable
+#     chips for a tpu7x 2x2x1 node, which makes the pod unschedulable or the
+#     slice mis-sized.
+#   * Ironwood is not available through `gcloud compute tpus tpu-vm create`;
+#     provision it via GKE, Vertex AI, or a GCE MIG.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ray-ksa
+  namespace: default # Change this if your Ray cluster is in a different namespace
+  annotations:
+      iam.gke.io/gcp-service-account: ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ray-ksa-admin-binding
+subjects:
+- kind: ServiceAccount
+  name: ray-ksa
+  namespace: default # Must match the namespace of the ServiceAccount above
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin # Only for testing, should use a more restrictive role in prod
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ray-tpu7x-cluster
+spec:
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      metadata:
+        annotations:
+          gke-gcsfuse/volumes: "true"
+      spec:
+        serviceAccountName: ray-ksa
+        containers:
+          - name: ray-head
+            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260630-159c2e3e
+            imagePullPolicy: Always
+            env:
+            - name: RAY_TRAIN_V2_ENABLED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf_token
+                  optional: true
+            ports:
+              - containerPort: 8265  # Dashboard
+              - containerPort: 10001 # Client
+              - containerPort: 8888  # gRPC
+              - containerPort: 8000  # OpenAI API
+            resources:
+              limits:
+                cpu: "12"
+                memory: "48Gi"
+              requests:
+                cpu: "12"
+                memory: "48Gi"
+            volumeMounts:
+            - name: gcs-volume
+              mountPath: /data
+            - name: host-tmp
+              mountPath: /tmp
+        volumes:
+        - name: gcs-volume
+          csi:
+            driver: gcsfuse.csi.storage.gke.io
+            volumeAttributes:
+              bucketName: torchprime
+              mountOptions: "implicit-dirs"
+        - name: host-tmp
+          hostPath:
+            path: /tmp
+  workerGroupSpecs:
+    - replicas: 2 # 2 slices: one for the trainer, one for the rollout
+      numOfHosts: 1 # a tpu7x 2x2x1 slice is a single host
+      groupName: tpu-group
+      rayStartParams: {}
+      template:
+        metadata:
+          annotations:
+            gke-gcsfuse/volumes: "true"
+        spec:
+          serviceAccountName: ray-ksa
+          containers:
+            - name: ray-worker
+              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260630-159c2e3e
+              imagePullPolicy: Always
+              resources:
+                limits:
+                  memory: "400Gi"
+                  # Each worker node has 4 TPU chips (== 8 addressable devices).
+                  # Kubernetes always counts chips here, and a tpu7x-standard-4t
+                  # pod must request all of them.
+                  google.com/tpu: "4"
+                requests:
+                  # tpu7x-standard-4t provides 224 vCPU / 960 GB; leave plenty of
+                  # headroom for the kubelet and the gcsfuse sidecar.
+                  cpu: "96"
+                  memory: "400Gi"
+                  google.com/tpu: "4"
+              env:
+                - name: RAY_TRAIN_V2_ENABLED
+                  value: "1"
+                # Skip TPU generation autodetection in the worker containers.
+                - name: VERL_TPU_GENERATION
+                  value: "v7x"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: hf_token
+                      optional: true
+              volumeMounts:
+              - name: gcs-volume
+                mountPath: /data
+              - name: host-tmp
+                mountPath: /tmp
+          volumes:
+          - name: gcs-volume
+            csi:
+              driver: gcsfuse.csi.storage.gke.io
+              volumeAttributes:
+                bucketName: torchprime
+                mountOptions: "implicit-dirs"
+          - name: host-tmp
+            hostPath:
+              path: /tmp
+          nodeSelector:
+            # Change this according to the TPU slice topology.
+            # NOTE: unlike v6e ("tpu-v6e-slice"), the tpu7x accelerator label is
+            # the bare machine family name.
+            cloud.google.com/gke-tpu-accelerator: tpu7x
+            cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips == 8 devices, 1 host

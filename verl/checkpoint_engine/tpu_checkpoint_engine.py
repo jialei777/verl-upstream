@@ -61,10 +61,128 @@ def get_layer_group(key: str) -> str:
 # TPU Worker Weight Injection & Slicing
 # =====================================================================
 
+# Set by vllm_torchtpu's linear methods once they have transposed a dense
+# weight out of vLLM's [n_out, n_in] layout into the (k, n) layout its matmuls
+# want. The flip is not recoverable from the shape alone -- most projections
+# are square -- so this attribute is the only reliable signal.
+TPU_WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
-def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
+# Keys the rollout model has no parameter for are skipped. That is legitimate
+# for aliases we speculatively emit (``lm_head`` on a tied-embedding model),
+# and a silent correctness bug for anything else, so each distinct shape of
+# name is reported once.
+_UNRESOLVED_LOGGED: set[str] = set()
+
+
+def _resolve_in_state_dict(key: str, model_sd: dict) -> str | None:
+    """Match a trainer key against the rollout state dict, modulo a 'model.' prefix."""
+    if key in model_sd:
+        return key
+    if key.startswith("model.") and key[6:] in model_sd:
+        return key[6:]
+    if f"model.{key}" in model_sd:
+        return f"model.{key}"
+    return None
+
+
+class VllmParameterLayout:
+    """Describes how the live vLLM model stores parameters, versus HF.
+
+    The trainer publishes tensors in HF's namespace and HF's layout. Neither
+    survives into the rollout model unchanged, and both differences are
+    invisible in the key alone:
+
+    * **Fusion.** vLLM packs ``q/k/v_proj`` into a single ``qkv_proj`` and
+      ``gate/up_proj`` into ``gate_up_proj``, concatenated along the output
+      dimension *after* each part has been sharded across TP ranks. The HF
+      names do not exist in the model at all, so an unaware loader drops those
+      weights on the floor and the rollout policy silently stops tracking the
+      trainer.
+    * **Transposition.** ``vllm_torchtpu`` transposes every dense linear weight
+      to ``[n_in, n_out]`` in ``process_weights_after_loading``, because
+      ``(m, k) @ (k, n)`` is much cheaper on TPU than the ``(m, k) @ (n, k).T``
+      that vLLM's stock layout forces. An unaware loader compares dimensions
+      positionally, picks the wrong axis to shard, and produces a tensor of the
+      wrong size.
+    """
+
+    def __init__(self, vllm_model, root: torch.nn.Module) -> None:
+        # Names are collected against both roots because the state dict this
+        # is queried with mixes the two: most parameters come from the inner
+        # model, but anything hanging off the wrapper (``lm_head``) keeps its
+        # unprefixed top-level name.
+        self.flipped: set[str] = set()
+        for scope, strip in ((root, False), (vllm_model, True)):
+            named_modules = getattr(scope, "named_modules", None)
+            if named_modules is None:
+                continue
+            for mod_name, mod in named_modules():
+                if not getattr(mod, TPU_WEIGHT_FLIPPED_ATTR, False):
+                    continue
+                if strip and mod_name.startswith("model."):
+                    mod_name = mod_name[6:]
+                self.flipped.add(f"{mod_name}.weight" if mod_name else "weight")
+
+        # {"q_proj": ("qkv_proj", 0, 3), "k_proj": ("qkv_proj", 1, 3), ...}
+        self.packed: dict[str, tuple[str, int, int]] = {}
+        mapping = getattr(vllm_model, "packed_modules_mapping", None)
+        if not mapping:
+            mapping = getattr(root, "packed_modules_mapping", None)
+        for fused, parts in (mapping or {}).items():
+            if not isinstance(parts, (list, tuple)):
+                continue
+            for index, part in enumerate(parts):
+                self.packed[part] = (fused, index, len(parts))
+
+    def is_flipped(self, target_key: str) -> bool:
+        return target_key in self.flipped
+
+    def resolve(self, key: str, model_sd: dict) -> tuple[str | None, int, int]:
+        """Map a trainer key onto ``(target_key, part_index, num_parts)``.
+
+        ``num_parts`` is 1 for an ordinary parameter and >1 when ``key`` is one
+        constituent of a fused vLLM parameter.
+        """
+        direct = _resolve_in_state_dict(key, model_sd)
+        if direct is not None:
+            return direct, 0, 1
+
+        parts = key.split(".")
+        if len(parts) >= 2 and parts[-2] in self.packed:
+            fused, index, num_parts = self.packed[parts[-2]]
+            candidate = ".".join(parts[:-2] + [fused, parts[-1]])
+            resolved = _resolve_in_state_dict(candidate, model_sd)
+            if resolved is not None:
+                return resolved, index, num_parts
+
+        return None, 0, 1
+
+
+def _log_unresolved(keys: list[str], rank: int) -> None:
+    if rank != 0:
+        return
+    for key in keys:
+        pattern = re.sub(r"\.\d+\.", ".*.", key)
+        if pattern in _UNRESOLVED_LOGGED:
+            continue
+        _UNRESOLVED_LOGGED.add(pattern)
+        logger.warning(
+            "Weight sync: no rollout parameter matches '%s' (pattern '%s'), so it will not be "
+            "updated. Unless this is a known alias, the rollout policy is now drifting from the "
+            "trainer.",
+            key,
+            pattern,
+        )
+
+
+def load_weights_on_worker(vllm_model, state_dict: dict, rank: int, world_size: int | None = None) -> int:
     """Worker-side weight loader. Performs host-side CPU sharding (slicing)
     and chunked, memory-safe, JIT-partitioned PCIe copying to TPU.
+
+    ``world_size`` is the rollout tensor-parallel degree. When supplied, the
+    loader can verify that each incoming tensor really is the *global* weight
+    rather than a shard the trainer forgot to gather; see
+    ``_validate_incoming_shape``.
     """
     # HACK: Guard against state_dict=None when shared memory weight cache is skipped on multi-host vLLM workers.
     # TODO: remove HACK once shared memory state dict caching is synchronized across all secondary TPU worker nodes.
@@ -81,11 +199,19 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     total_keys = 0
     from concurrent.futures import ThreadPoolExecutor
 
+    layout = VllmParameterLayout(vllm_model, vllm_model.model)
+
     temp_tpu_tensors = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         for group_name, group_sd in grouped_dict.items():
             keys_loaded = _load_single_group_on_worker(
-                vllm_model, group_sd, rank, executor=executor, temp_tpu_tensors=temp_tpu_tensors
+                vllm_model,
+                group_sd,
+                rank,
+                executor=executor,
+                temp_tpu_tensors=temp_tpu_tensors,
+                world_size=world_size,
+                layout=layout,
             )
             total_keys += keys_loaded
 
@@ -103,9 +229,152 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     return total_keys
 
 
-def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor=None, temp_tpu_tensors=None) -> int:
+def _validate_incoming_shape(key, incoming_shape, logical_shape, dim, rank, world_size, flipped) -> None:
+    """Checks that an incoming tensor is the global weight, not a trainer shard.
+
+    The loader reshards by cutting ``logical_shape[dim]`` entries out of the
+    incoming tensor at ``logical_shape[dim] * rank``. That is only valid if the
+    incoming tensor spans all ``world_size`` rollout shards along ``dim``.
+
+    If it does not, the arithmetic degrades in two ways, neither of which
+    reports itself honestly:
+
+    * High ranks index past the end. Python clamps the slice instead of
+      raising, the shortfall desynchronises every subsequent offset in the flat
+      buffer, and the first visible symptom is a ``view()`` size error against
+      some unrelated parameter much later in the group.
+    * Low ranks stay in bounds and load *silently wrong* weights, because the
+      entries they read are no longer the ones they own globally.
+
+    ``logical_shape`` is the local parameter's shape in HF orientation, so the
+    message stays readable even for the weights ``vllm_torchtpu`` stores
+    transposed.
+    """
+    if world_size in (None, 0):
+        return
+    expected = logical_shape[dim] * world_size
+    if incoming_shape[dim] == expected:
+        return
+    orientation = " (stored transposed by vllm_torchtpu)" if flipped else ""
+    raise ValueError(
+        f"Weight sync reshard mismatch for '{key}': received shape {tuple(incoming_shape)} but rollout "
+        f"tensor parallelism of {world_size} over dim {dim} requires a global size of {expected} "
+        f"(local shard {tuple(logical_shape)} in HF orientation{orientation}). "
+        f"Rank {rank} would have read out-of-range or incorrect entries."
+    )
+
+
+def _shard_along(tensor: torch.Tensor, dim: int, shard_size: int, rank: int) -> torch.Tensor:
+    indices = [slice(None)] * tensor.dim()
+    indices[dim] = slice(shard_size * rank, shard_size * (rank + 1))
+    # COMMENT: no .clone() -- the slice stays a zero-copy view until reshape(-1).
+    return tensor[tuple(indices)]
+
+
+def _build_local_tensor(target_key, target_local, entries, flat_cpu, rank, world_size, flipped) -> torch.Tensor:
+    """Reshard one target parameter and return it flattened in storage order.
+
+    ``entries`` are ``(part_index, num_parts, shape, numel, offset)`` tuples,
+    sorted by ``part_index``: one entry for an ordinary parameter, several when
+    the rollout model fuses them.
+    """
+    local_shape = tuple(target_local.shape)
+    # The shape the parameter *would* have in HF orientation. Everything below
+    # reasons in this space and transposes back once, at the end.
+    logical_shape = local_shape[::-1] if flipped else local_shape
+
+    if len(entries) == 1 and entries[0][1] == 1:
+        _, _, shape, numel, offset = entries[0]
+        shape = tuple(shape)
+        global_tensor = flat_cpu[offset : offset + numel].view(shape)
+
+        if shape == logical_shape:
+            local = global_tensor
+        else:
+            mismatched = [d for d in range(len(shape)) if shape[d] != logical_shape[d]]
+            if len(mismatched) != 1:
+                raise ValueError(
+                    f"Weight sync cannot reshard '{target_key}': incoming shape {shape} and local "
+                    f"shape {logical_shape} (HF orientation) differ in {len(mismatched)} dimensions, "
+                    "so there is no single axis to shard along."
+                )
+            dim = mismatched[0]
+            _validate_incoming_shape(target_key, shape, logical_shape, dim, rank, world_size, flipped)
+            local = _shard_along(global_tensor, dim, logical_shape[dim], rank)
+    else:
+        # Fused parameter. vLLM concatenates the parts along the output
+        # dimension *after* sharding each one, so rank r owns
+        # concat(part[0][r], part[1][r], ...) -- not a contiguous slice of the
+        # concatenation. Rebuild it in that order.
+        num_parts = entries[0][1]
+        if len(entries) != num_parts:
+            present = [int(e[0]) for e in entries]
+            raise ValueError(
+                f"Weight sync received {len(entries)} of {num_parts} parts for fused parameter "
+                f"'{target_key}' (part indices {present}). A fused parameter can only be rebuilt "
+                "from all of its parts."
+            )
+
+        total_out = sum(int(e[2][0]) for e in entries)
+        local_out = logical_shape[0]
+        if local_out <= 0 or total_out % local_out != 0:
+            raise ValueError(
+                f"Weight sync cannot reshard fused parameter '{target_key}': its parts total "
+                f"{total_out} output rows, which is not a multiple of the {local_out} rows this "
+                f"rank holds. (Uneven KV-head replication across TP ranks is not supported.)"
+            )
+        shards = total_out // local_out
+        if world_size and shards != world_size:
+            raise ValueError(
+                f"Weight sync cannot reshard fused parameter '{target_key}': its parts imply "
+                f"{shards} shards but rollout tensor parallelism is {world_size}."
+            )
+
+        pieces = []
+        for _, _, shape, numel, offset in entries:
+            shape = tuple(shape)
+            if shape[1:] != logical_shape[1:]:
+                raise ValueError(
+                    f"Weight sync cannot reshard fused parameter '{target_key}': a part of shape "
+                    f"{shape} does not agree with the local shape {logical_shape} (HF orientation) "
+                    "outside the fused dimension."
+                )
+            if shape[0] % shards != 0:
+                raise ValueError(
+                    f"Weight sync cannot reshard fused parameter '{target_key}': a part of shape "
+                    f"{shape} does not split evenly across {shards} shards."
+                )
+            global_tensor = flat_cpu[offset : offset + numel].view(shape)
+            pieces.append(_shard_along(global_tensor, 0, shape[0] // shards, rank))
+        local = torch.cat(pieces, dim=0)
+
+    if tuple(local.shape) != logical_shape:
+        raise ValueError(
+            f"Weight sync produced shape {tuple(local.shape)} for '{target_key}' but the local "
+            f"parameter needs {logical_shape} in HF orientation (stored as {local_shape}, rank {rank})."
+        )
+
+    if flipped:
+        local = local.transpose(0, 1)
+    # reshape() materialises the transposed/sliced view in the parameter's own
+    # storage order, which is what the flat copy buffer downstream assumes.
+    return local.reshape(-1)
+
+
+def _load_single_group_on_worker(
+    vllm_model,
+    group_sd: dict,
+    rank: int,
+    executor=None,
+    temp_tpu_tensors=None,
+    world_size: int | None = None,
+    layout: "VllmParameterLayout | None" = None,
+) -> int:
     flat_tensors = group_sd["flat_tensors"]
     metadata = group_sd["metadata"]
+
+    if layout is None:
+        layout = VllmParameterLayout(vllm_model, vllm_model.model)
 
     clean_metadata = {}
     num_keys = 0
@@ -125,16 +394,18 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
             offset += numel
         clean_metadata[dtype] = clean_items
 
-    model_sd = vllm_model.model.state_dict()
-
-    def resolve_key(k):
-        if k in model_sd:
-            return k
-        if k.startswith("model.") and k[6:] in model_sd:
-            return k[6:]
-        if f"model.{k}" in model_sd:
-            return f"model.{k}"
-        return k
+    model_sd = dict(vllm_model.model.state_dict())
+    # `lm_head` hangs off the wrapper, not off `model`, so it is absent from the
+    # dict above. On a tied-embedding model that is harmless (it aliases
+    # `embed_tokens`), but on an untied one the output head would never be
+    # updated. Add the wrapper's own parameters, skipping the `model.`-prefixed
+    # duplicates that would otherwise be written twice under two names.
+    try:
+        for wrapper_key, wrapper_value in vllm_model.state_dict().items():
+            if not wrapper_key.startswith("model."):
+                model_sd.setdefault(wrapper_key, wrapper_value)
+    except Exception as e:  # pragma: no cover - defensive, model_sd is still usable
+        logger.debug(f"Could not enumerate wrapper-level parameters for weight sync: {e}")
 
     for dtype, flat_data in flat_tensors.items():
         items = clean_metadata.get(dtype, [])
@@ -148,46 +419,57 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
             # TODO: remove HACK once PyTorch CPU native bfloat16 to numpy conversion is universally stable.
             flat_cpu = flat_cpu.view(torch.bfloat16)
 
+        # Group incoming keys by the rollout parameter they land in. Several
+        # keys share a target whenever vLLM fuses projections, so resolution
+        # has to happen before any slicing.
+        targets: dict[str, list] = {}
+        unresolved: list[str] = []
+        for k, shape, numel, offset in items:
+            target_key, part_index, num_parts = layout.resolve(k, model_sd)
+            if target_key is None:
+                unresolved.append(k)
+                continue
+            targets.setdefault(target_key, []).append((part_index, num_parts, shape, numel, offset))
+        if unresolved:
+            _log_unresolved(unresolved, rank)
+
         local_items = []
         local_tensors_to_cat = []
         local_offset = 0
 
-        def process_item_parallel(item, flat_cpu=flat_cpu):
-            k, shape, numel, offset = item
-            target_key = resolve_key(k)
-            if target_key not in model_sd:
-                return None
+        def process_target(entry, flat_cpu=flat_cpu):
+            target_key, entries = entry
+            entries = sorted(entries, key=lambda e: e[0])
 
             target_v = model_sd[target_key]
             target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
+            flipped = target_local.dim() == 2 and layout.is_flipped(target_key)
 
-            param_cpu_global = flat_cpu[offset : offset + numel].view(shape)
-            if target_local.shape == shape:
-                param_cpu_local = param_cpu_global
-            else:
-                sharded = False
-                for dim in range(len(shape)):
-                    if shape[dim] != target_local.shape[dim]:
-                        shard_size = target_local.shape[dim]
-                        rank_offset = shard_size * rank
-                        indices = [slice(None)] * len(shape)
-                        indices[dim] = slice(rank_offset, rank_offset + shard_size)
-                        # COMMENT: Removed .clone() to enable zero-copy views during slicing.
-                        param_cpu_local = param_cpu_global[tuple(indices)]
-                        sharded = True
-                        break
-                if not sharded:
-                    param_cpu_local = param_cpu_global
+            param_cpu_local_flat = _build_local_tensor(
+                target_key, target_local, entries, flat_cpu, rank, world_size, flipped
+            )
 
-            return (target_key, target_local.shape, target_local.numel(), param_cpu_local.reshape(-1))
+            # The flat buffer below is indexed using target_local.numel(). A slice
+            # that came out a different size would silently shift every later
+            # parameter's offset, so refuse to enter it into the buffer at all.
+            if param_cpu_local_flat.numel() != target_local.numel():
+                raise ValueError(
+                    f"Weight sync produced a {param_cpu_local_flat.numel()}-element shard for "
+                    f"'{target_key}' but the local parameter needs {target_local.numel()} "
+                    f"(local {tuple(target_local.shape)}, rank {rank}). Refusing to continue: the "
+                    "flat copy buffer would desynchronise and fail later against an unrelated parameter."
+                )
 
+            return (target_key, target_local.shape, target_local.numel(), param_cpu_local_flat)
+
+        target_entries = list(targets.items())
         if executor is None:
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=8) as local_exec:
-                sliced_results = list(local_exec.map(process_item_parallel, items))
+                sliced_results = list(local_exec.map(process_target, target_entries))
         else:
-            sliced_results = list(executor.map(process_item_parallel, items))
+            sliced_results = list(executor.map(process_target, target_entries))
 
         for res in sliced_results:
             if res is None:
