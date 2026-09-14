@@ -61,24 +61,6 @@ except ImportError:
     ray_distributed_executor = None
 
 try:
-    try:
-        import vllm_torchtpu.platforms.tpu_platform as tpu_platform
-    except ImportError:
-        import tpu_inference.platforms.tpu_platform as tpu_platform
-except ImportError:
-    tpu_platform = None
-
-try:
-    from vllm.config import AttentionConfig
-except ImportError:
-    AttentionConfig = None
-
-try:
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-except ImportError:
-    AttentionBackendEnum = None
-
-try:
     from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 except ImportError:
     EngineArgs = None
@@ -489,19 +471,6 @@ def patch_vllm_for_tpu() -> None:
             return
 
         try:
-            if tpu_platform is not None and AttentionBackendEnum is not None:
-                orig_wrap = tpu_platform.TpuPlatform.wrap_engine_kwargs
-
-                def patched_wrap(self, engine_kwargs):
-                    orig_wrap(self, engine_kwargs)
-                    if "attention_config" in engine_kwargs:
-                        engine_kwargs["attention_config"].backend = AttentionBackendEnum.MATH
-
-                tpu_platform.TpuPlatform.wrap_engine_kwargs = patched_wrap
-        except Exception as e:
-            logger.warning(f"Failed to patch TPUPlatform.wrap_engine_kwargs: {e}")
-
-        try:
             if EngineArgs is not None:
                 orig_create_engine_config = EngineArgs.create_engine_config
 
@@ -514,8 +483,6 @@ def patch_vllm_for_tpu() -> None:
                     )
                     if is_tpu:
                         os.environ["VLLM_USE_V1"] = "0"
-                        if hasattr(self, "use_v1"):
-                            self.use_v1 = False
 
                     if getattr(self, "data_parallel_size", 1) <= 1:
                         if hasattr(self, "data_parallel_external_lb"):
@@ -538,8 +505,6 @@ def patch_vllm_for_tpu() -> None:
                             tpu_envs.TPU_MULTIHOST_BACKEND = None
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
-                        if is_tpu and hasattr(vllm_config, "use_v1"):
-                            vllm_config.use_v1 = False
 
                         logger.info(
                             "[TPU HACK 16] Single-host rollout detected. "
@@ -558,8 +523,6 @@ def patch_vllm_for_tpu() -> None:
                             tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
-                        if is_tpu and hasattr(vllm_config, "use_v1"):
-                            vllm_config.use_v1 = False
                         vllm_config.parallel_config.distributed_executor_backend = "ray"
                         logger.info(
                             "[TPU HACK 16] Directly forced 'ray' distributed executor backend on TPU for multi-host."
