@@ -23,10 +23,26 @@ import torch
 from packaging import version
 
 try:
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
     from vllm.model_executor.layers.linear import LinearBase
-except ImportError as e:
-    raise ImportError("FP8 quantization not available") from e
+except ImportError:
+    LinearBase = None
+
+# ``FusedMoE`` has been reshaped repeatedly by vLLM's MoE refactors:
+#   < 0.24  ``fused_moe.layer.FusedMoE`` is the ``nn.Module`` owning the fused
+#           expert weights.
+#   0.24    (vllm-project/vllm#41184) ``FusedMoE`` becomes a factory *function*
+#           returning a ``MoERunner``; the weights move to ``RoutedExperts``.
+#   > 0.24  the factory is renamed ``FusedMoEFactory`` and the ``FusedMoE`` name
+#           disappears entirely.
+# Inference-only builds without MoE support (e.g. the TPU vLLM fork) export none
+# of them. None of this may be fatal at import time: this module is imported
+# unconditionally by the vLLM rollout, while every FP8 code path below is
+# reached only when FP8 rollout is explicitly requested. Raising here would
+# break plain bf16 rollouts that have no interest in quantization at all.
+try:
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    FusedMoE = None
 
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 from verl.utils.vllm.vllm_dsv4_fp8_utils import (
@@ -89,13 +105,14 @@ def is_fp8_model(vllm_config):
 
 
 # vLLM 0.24.0 (MoE refactor, vllm-project/vllm#41184) removed the ``FusedMoE``
-# ``nn.Module`` class. ``FusedMoE`` is now a factory *function* that builds a
-# ``MoERunner``, and the fused expert weight tensors (``w13_weight`` /
-# ``w2_weight``) moved onto a ``RoutedExperts`` submodule owned by the runner
-# (i.e. ``experts`` -> ``experts.routed_experts``). Resolve the concrete module
-# classes once so ``isinstance`` checks keep working across vLLM versions --
-# calling ``isinstance(x, FusedMoE)`` when ``FusedMoE`` is a function raises
-# ``TypeError: isinstance() arg 2 must be a type``.
+# ``nn.Module`` class. ``FusedMoE`` became a factory *function* that builds a
+# ``MoERunner`` (and was later renamed ``FusedMoEFactory``, leaving ``FusedMoE``
+# resolved to ``None`` above), and the fused expert weight tensors
+# (``w13_weight`` / ``w2_weight``) moved onto a ``RoutedExperts`` submodule owned
+# by the runner (i.e. ``experts`` -> ``experts.routed_experts``). Resolve the
+# concrete module classes once so ``isinstance`` checks keep working across vLLM
+# versions -- calling ``isinstance(x, FusedMoE)`` when ``FusedMoE`` is a function
+# or ``None`` raises ``TypeError: isinstance() arg 2 must be a type``.
 if isinstance(FusedMoE, type):
     # vLLM < 0.24: ``FusedMoE`` is itself the expert-weight-holding module.
     _MOE_STOP_CLASSES = (FusedMoE,)
@@ -195,7 +212,9 @@ def is_fp8_weight(name, model):
         if name.endswith("weight"):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear and fused-MoE expert layers.
-            is_fp8_linear = isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn
+            is_fp8_linear = (
+                LinearBase is not None and isinstance(module, LinearBase) and module.weight.dtype == torch.float8_e4m3fn
+            )
             is_fp8_moe = (
                 _is_expert_weight_module(module)
                 and module.w13_weight.dtype == torch.float8_e4m3fn

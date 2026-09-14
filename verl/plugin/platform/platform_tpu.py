@@ -20,6 +20,7 @@ device-specific environment configuration, resource options, and memory manageme
 
 import logging
 import os
+import sys
 from typing import Any, Optional
 
 import ray
@@ -27,7 +28,17 @@ import torch
 
 from .platform_cuda import PlatformCUDA
 from .platform_manager import PlatformRegistry, get_platform
-from .platform_tpu_workarounds import convert_tensors_to_scalars, patch_ray_worker
+from .platform_tpu_workarounds import convert_tensors_to_scalars, ensure_absl_flags_parsed, patch_ray_worker
+from .tpu_topology import (
+    DEFAULT_HBM_BYTES_PER_DEVICE,
+    detect_slice_chip_mesh,
+    detect_tpu_generation,
+    get_chips_per_host_bounds,
+    get_devices_per_host,
+    get_hbm_bytes_per_device,
+    get_torch_tpu_topology,
+    normalize_tpu_generation,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -36,30 +47,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 ROLLOUT_BASE_PORT = 8070
 TRAINER_BASE_PORT = 8471
 
-# TPU Chip HBM capacities in bytes
-HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
-HBM_BYTES_TPU_V6E = 32 * 1024 * 1024 * 1024  # 32 GB
-HBM_BYTES_TPU_V7X = 192 * 1024 * 1024 * 1024  # 192 GB
-
-TPU_HBM_BYTES_MAP = {
-    "v5p": HBM_BYTES_TPU_V5P,
-    "v6e": HBM_BYTES_TPU_V6E,
-    "v7x": HBM_BYTES_TPU_V7X,
-}
-
-# TPU default 3D mesh topology mappings by pod type or total chips
-TPU_TOPOLOGY_MAP = {
-    "v6e-32": "4,8,1",
-    "v6e-8": "2,4,1",
-    "v6e-4": "2,2,1",
-    32: "4,8,1",
-    8: "2,4,1",
-    4: "2,2,1",
-}
+# Fallback HBM capacity used before the TPU generation can be resolved.
+DEFAULT_HBM_BYTES = DEFAULT_HBM_BYTES_PER_DEVICE
 
 
-def get_tpu_chip_hbm_bytes() -> int:
-    """Detects the TPU chip generation from Ray node labels or environment variables and returns its HBM capacity."""
+def get_tpu_accelerator_type() -> str:
+    """Return the raw accelerator string advertised by Ray or the Cloud TPU environment.
+
+    Examples: ``"TPU-V7X"`` / ``"v7x-8"`` (Ray labels), ``"tpu7x-8"`` or
+    ``"v6e-8"`` (``TPU_ACCELERATOR_TYPE``). Returns ``""`` when unavailable.
+    """
     tpu_type = ""
 
     # Query Ray cluster node labels for TPU resource type
@@ -81,11 +78,29 @@ def get_tpu_chip_hbm_bytes() -> int:
             or ""
         ).lower()
 
-    for chip_gen, hbm_bytes in TPU_HBM_BYTES_MAP.items():
-        if chip_gen in tpu_type:
-            return hbm_bytes
+    return tpu_type
 
-    logger.warning(f"Unable to determine TPU chip HBM bytes for tpu_type='{tpu_type}'. Returning -1.")
+
+def get_tpu_chip_hbm_bytes() -> int:
+    """Returns the HBM capacity addressable by a single TPU device, in bytes.
+
+    NOTE: this is deliberately *per device*, not per physical chip. Every verl
+    worker drives exactly one addressable device, and on TPU7x a chip's 192 GiB
+    is split into two independent 96 GiB chiplet memory spaces. Reporting the
+    per-chip figure here would make ``torch.tpu.get_device_properties()`` and
+    ``mem_get_info()`` overstate available memory by 2x and cause vLLM to
+    over-allocate its KV cache.
+
+    Returns:
+        HBM bytes per device, or -1 if the TPU generation could not be resolved.
+    """
+    tpu_type = get_tpu_accelerator_type()
+
+    generation = normalize_tpu_generation(tpu_type)
+    if generation is not None:
+        return get_hbm_bytes_per_device(generation)
+
+    logger.warning(f"Unable to determine TPU device HBM bytes for tpu_type='{tpu_type}'. Returning -1.")
     return -1
 
 
@@ -163,18 +178,18 @@ class TPUDeviceModuleProxy:
         elif name == "get_device_properties":
 
             class DummyDeviceProperties:
-                def __init__(self, total_memory=32 * 1024 * 1024 * 1024):
+                def __init__(self, total_memory=DEFAULT_HBM_BYTES):
                     self.total_memory = total_memory
                     self.name = "Google TPU"
                     self.major = 1
                     self.minor = 0
 
             hbm_bytes = get_tpu_chip_hbm_bytes()
-            total_mem = hbm_bytes if hbm_bytes > 0 else 32 * 1024 * 1024 * 1024
+            total_mem = hbm_bytes if hbm_bytes > 0 else DEFAULT_HBM_BYTES
             return lambda *args, **kwargs: DummyDeviceProperties(total_memory=total_mem)
         elif name == "mem_get_info":
             hbm_bytes = get_tpu_chip_hbm_bytes()
-            total_mem = hbm_bytes if hbm_bytes > 0 else 32 * 1024 * 1024 * 1024
+            total_mem = hbm_bytes if hbm_bytes > 0 else DEFAULT_HBM_BYTES
             return lambda *args, **kwargs: (total_mem, total_mem)
 
         raise AttributeError(f"'TPUDeviceModuleProxy' object has no attribute '{name}'")
@@ -358,21 +373,40 @@ class PlatformTPU(PlatformCUDA):
             "TPU_PROCESS_PORT": str(base_port + local_rank),
             "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
+            # One worker process drives exactly one addressable device. On TPU7x
+            # that is a single chiplet, so these index devices (0..7 on a 4-chip
+            # host), not chips. TPU_VISIBLE_DEVICES is torch_tpu's source of
+            # truth; TPU_VISIBLE_CHIPS is kept in sync because libtpu gives it
+            # priority when non-empty.
             "TPU_VISIBLE_CHIPS": str(local_rank),
+            "TPU_VISIBLE_DEVICES": str(local_rank),
         }
 
-        # Apply TPU topology and host bounds based on TPU pod type or world size
+        # Apply TPU topology and host bounds based on the detected TPU generation.
+        #
+        # ``world_size`` counts worker processes, i.e. addressable devices. The
+        # generation decides how those map onto physical chips: a v6e slice with
+        # 8 devices is 8 chips across 2 hosts ("2,4,1"), whereas a TPU7x slice
+        # with 8 devices is 4 chips on a single host ("2,2,1,2").
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
-        topo = TPU_TOPOLOGY_MAP.get(tpu_type, TPU_TOPOLOGY_MAP.get(world_size, "1,1,1"))
+        generation = detect_tpu_generation(tpu_type)
+        topo = get_torch_tpu_topology(
+            num_devices=world_size,
+            generation=generation,
+            chip_mesh=detect_slice_chip_mesh(),
+        )
 
         env_vars.update(
             {
                 "TORCH_TPU_TOPOLOGY": topo,
                 "TPU_HOST_BOUNDS": topo,
-                "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
-                "CHIPS_PER_HOST": "4",
+                # Arity must match the topology string: "1,1,1,1" for the 4D
+                # TPU7x mesh, "1,1,1" otherwise. Every dimension is 1 because
+                # each process owns a single device.
+                "TPU_CHIPS_PER_HOST_BOUNDS": get_chips_per_host_bounds(topo),
+                "CHIPS_PER_HOST": str(get_devices_per_host(generation)),
             }
         )
 
@@ -434,8 +468,18 @@ class PlatformTPU(PlatformCUDA):
     ) -> dict[str, str]:
         """Return platform-specific TPU environment variables for worker nodes."""
         env_vars = {}
-        if "VERL_PLATFORM" in os.environ:
-            env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+        # Driver-side settings that must reach the worker actors. A launch
+        # script's `export` happens in the driver process, i.e. after the Ray
+        # job's runtime_env is already fixed, so without copying them here the
+        # workers silently run with none of the XLA tuning flags the script set.
+        for var in (
+            "VERL_PLATFORM",
+            "VERL_TPU_GENERATION",
+            "LIBTPU_INIT_ARGS",
+            "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+        ):
+            if var in os.environ:
+                env_vars[var] = os.environ[var]
         for var in self.ray_noset_envvars():
             env_vars[var] = "1"
         pgs = resource_pool.get_placement_groups(device_name=device_name)
@@ -461,3 +505,13 @@ class PlatformTPU(PlatformCUDA):
                 "worker_process_setup_hook": patch_ray_worker,
             }
         }
+
+
+# ``platform_manager`` imports this module unconditionally, and every process
+# that touches ``get_platform()`` -- including the vLLM engine workers Ray
+# starts for the rollout -- executes it. That makes this the one place we know
+# runs inside those workers, so it is where we guarantee torch_tpu's absl flags
+# are readable before anything reaches torch.compile. The guard keeps the call
+# off non-TPU deployments, which import this module too.
+if os.environ.get("VERL_PLATFORM", "").strip().lower() == "tpu" or "torch_tpu" in sys.modules:
+    ensure_absl_flags_parsed()

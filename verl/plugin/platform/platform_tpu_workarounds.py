@@ -15,6 +15,7 @@
 
 import logging
 import os
+import sys
 
 import ray
 import ray._private.worker
@@ -58,12 +59,57 @@ def convert_tensors_to_scalars(val):
     return val
 
 
+def ensure_absl_flags_parsed():
+    """Marks absl's flag registry as parsed so torch_tpu can read its own flags.
+
+    torch_tpu declares several tuning knobs as absl flags and reads them lazily,
+    deep inside torch.compile -- ``reassociate_norm_weights.apply`` reading
+    ``--torch_tpu_internal_enable_reassociate_norm_weights`` is one example.
+    absl refuses to serve a flag value until the registry has been parsed, which
+    normally happens inside ``absl.app.run``. Processes that never go through an
+    absl main -- Ray actors, and the vLLM engine workers the multiproc executor
+    spawns underneath them -- therefore raise ``UnparsedFlagAccessError`` the
+    first time a graph is compiled, long after startup looked healthy.
+
+    This mirrors ``torch_tpu._internal.distributed.multiprocessing.parse_absl_flags``,
+    torch_tpu's own fix for the same problem in spawned subprocesses.
+    ``known_only=True`` stops absl from rejecting the launcher arguments (Ray,
+    torchrun, pytest) that happen to share ``sys.argv``.
+
+    Idempotent, and safe to call from any process.
+    """
+    try:
+        from absl import flags
+    except ImportError:
+        # absl is a torch_tpu dependency; without it there are no flags to parse.
+        return
+
+    if flags.FLAGS.is_parsed():
+        return
+
+    try:
+        flags.FLAGS(sys.argv, known_only=True)
+    except Exception as e:
+        # Never let this be fatal: every affected flag is an optional tuning
+        # knob, so falling back to defaults is strictly better than crashing a
+        # worker. mark_as_parsed() flips the registry bit without consuming argv.
+        logger.warning(f"Could not parse absl flags ({e}); falling back to flag defaults.")
+        try:
+            flags.FLAGS.mark_as_parsed()
+        except Exception as mark_err:
+            logger.warning(f"Could not mark absl flags as parsed: {mark_err}")
+
+
 def patch_ray_worker():
     """Patches Ray worker resource lookup to handle containerized TPU device index bounds in GKE.
 
     In containerized GKE environments where TPU chips are isolated per pod, Raylet physical accelerator
     lookups can raise an `IndexError` when querying host-level accelerator indices.
     """
+    # Ray worker processes are started outside any absl main, so do this while
+    # we already have a hook running in every one of them.
+    ensure_absl_flags_parsed()
+
     try:
         original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
 
