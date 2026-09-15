@@ -73,15 +73,23 @@ def compute_model_checksum(model) -> Dict[str, any]:
     total_l1 = 0.0
     total_l2_sq = 0.0
     total_numel = 0
+    layer_details = {}
 
     for name, p in sorted(model.named_parameters(), key=lambda x: x[0]):
         p_data = p.data
         if hasattr(p_data, "to_local"):
             p_data = p_data.to_local()
         p_cpu = p_data.detach().cpu().contiguous()
+        layer_hash = hashlib.sha256(p_cpu.flatten().view(torch.uint8).numpy().tobytes()).hexdigest()
+        layer_l1 = float(p_cpu.float().abs().sum().item())
+        layer_details[name] = {
+            "shape": list(p.shape),
+            "sha256": layer_hash,
+            "l1": layer_l1,
+        }
         hasher.update(p_cpu.flatten().view(torch.uint8).numpy().tobytes())
         total_numel += p_cpu.numel()
-        total_l1 += float(p_cpu.float().abs().sum().item())
+        total_l1 += layer_l1
         total_l2_sq += float(p_cpu.float().pow(2).sum().item())
 
     return {
@@ -89,6 +97,7 @@ def compute_model_checksum(model) -> Dict[str, any]:
         "total_numel": total_numel,
         "l1_norm": total_l1,
         "l2_norm": float(total_l2_sq**0.5),
+        "layers": layer_details,
     }
 
 
@@ -100,12 +109,14 @@ def create_model():
         def __init__(self, in_dim: int = 512, hidden_dim: int = 1024, out_dim: int = 512):
             super().__init__()
             self.fc1 = nn.Linear(in_dim, hidden_dim)
+            self.norm1 = nn.LayerNorm(hidden_dim)  # 1D weight [1024] and 1D bias [1024]
             self.relu = nn.ReLU()
             self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+            self.norm2 = nn.LayerNorm(hidden_dim)  # 1D weight [1024] and 1D bias [1024]
             self.fc3 = nn.Linear(hidden_dim, out_dim)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.fc3(self.relu(self.fc2(self.relu(self.fc1(x)))))
+            return self.fc3(self.norm2(self.relu(self.fc2(self.norm1(self.relu(self.fc1(x)))))))
 
     return MiniModel()
 
@@ -143,6 +154,10 @@ class SamplerActor:
         except Exception:
             if hasattr(torch, "tpu") and hasattr(torch.tpu, "synchronize"):
                 torch.tpu.synchronize()
+
+    def get_node_ip(self) -> str:
+        """Returns the IP of the node this actor was scheduled on."""
+        return self.node_ip
 
     def register_with_controller(self, controller_address: str, parallelism: int = 4):
         """Initializes WeightSynchronizer listener and registers with RaidenController."""
@@ -182,7 +197,7 @@ class SamplerActor:
                 raiden_service_pb2.VariableMetadataProto(
                     name=name,
                     shape=list(p.shape),
-                    mesh_shape=[1, 1],
+                    mesh_shape=[1] * len(p.shape),
                     layout=list(range(len(p.shape) - 1, -1, -1)),
                     item_size=p.element_size(),
                     layer_idx=idx,
@@ -208,10 +223,29 @@ class SamplerActor:
         self._synchronize_tpu()
         return compute_model_checksum(self.model)
 
-    def verify_against_checksum(self, expected_checksum: str, timeout_sec: float = 30.0) -> bool:
+    def trigger_h2d(self, uuid: int = 9999):
+        """Triggers H2D DMA copy from Host buffer to TPU HBM on Sampler."""
+        if self.ws is not None:
+            self._synchronize_tpu()
+            try:
+                self.ws.h2d(uuid)
+                logger.info(f"[Sampler {self.actor_id}] Completed explicit H2D copy with uuid={uuid}.")
+            except TypeError:
+                self.ws.h2d()
+                logger.info(f"[Sampler {self.actor_id}] Completed explicit H2D copy (no uuid argument).")
+            self._synchronize_tpu()
+
+    def verify_against_checksum(self, expected_checksum: str, timeout_sec: float = 30.0, uuid: int = 9999) -> bool:
         """Polls until weights are updated in HBM matching the expected checksum."""
         t_start = time.time()
         while time.time() - t_start < timeout_sec:
+            if self.ws is not None:
+                try:
+                    self.ws.h2d(uuid)
+                except TypeError:
+                    self.ws.h2d()
+                except Exception as e:
+                    logger.debug(f"[Sampler {self.actor_id}] H2D attempt note: {e}")
             self._synchronize_tpu()
             curr = compute_model_checksum(self.model)
             if curr["sha256"] == expected_checksum:
@@ -220,7 +254,7 @@ class SamplerActor:
                     f"in {time.time() - t_start:.3f}s"
                 )
                 return True
-            time.sleep(0.1)
+            time.sleep(0.2)
 
         curr = compute_model_checksum(self.model)
         logger.error(
@@ -228,6 +262,7 @@ class SamplerActor:
             f"Expected {expected_checksum[:16]}, Current {curr['sha256'][:16]}"
         )
         return False
+
 
 
 @ray.remote(resources={"TPU": 1})
@@ -260,6 +295,10 @@ class TrainerActor:
         except Exception:
             if hasattr(torch, "tpu") and hasattr(torch.tpu, "synchronize"):
                 torch.tpu.synchronize()
+
+    def get_node_ip(self) -> str:
+        """Returns the IP of the node this actor was scheduled on."""
+        return self.node_ip
 
     def step_training(self, num_steps: int = 3) -> Dict[str, any]:
         """Runs a minimal forward/backward/optimizer step to update model parameters."""
@@ -307,6 +346,7 @@ class TrainerActor:
         self.ws = WeightSynchronizer(
             device_tensors=device_tensors,
             local_port=0,
+            listener_port=0,
             parallelism=parallelism,
             bind_ip=self.node_ip,
             unsafe_skip_buffer_lock=True,
@@ -320,7 +360,7 @@ class TrainerActor:
                 raiden_service_pb2.VariableMetadataProto(
                     name=name,
                     shape=list(p.shape),
-                    mesh_shape=[1, 1],
+                    mesh_shape=[1] * len(p.shape),
                     layout=list(range(len(p.shape) - 1, -1, -1)),
                     item_size=p.element_size(),
                     layer_idx=idx,
@@ -333,7 +373,7 @@ class TrainerActor:
         ctrl_client.register_work_unit(
             unit_id,
             [f"{self.node_ip}:{self.ws.local_port}"],
-            f"{self.node_ip}:{self.ws.local_port}",
+            f"{self.node_ip}:{self.ws.listener_port}",
             mesh_shape=[1, 1],
             variables=variable_protos,
             mesh_axes=[],
@@ -341,11 +381,17 @@ class TrainerActor:
         logger.info(f"[Trainer {self.actor_id}] Registered work unit {unit_id} successfully with controller at {controller_address}")
         return unit_id
 
-    def trigger_d2h(self):
+    def trigger_d2h(self, uuid: int = 9999):
         """Triggers D2H DMA copy on Trainer."""
         if self.ws is not None:
             self._synchronize_tpu()
-            self.ws.d2h()
+            try:
+                self.ws.d2h(uuid)
+                logger.info(f"[Trainer {self.actor_id}] Completed explicit D2H copy with uuid={uuid}.")
+            except TypeError:
+                self.ws.d2h()
+                logger.info(f"[Trainer {self.actor_id}] Completed explicit D2H copy (no uuid argument).")
+            self._synchronize_tpu()
 
 
 def main():
@@ -370,6 +416,7 @@ def main():
     if tpu_count < 2:
         print(f"[WARNING] Cluster reports {tpu_count} TPUs. Need at least 2 TPUs for 1-Trainer + 1-Sampler test.")
 
+    pg = None
     try:
         # Step 1: Start Centralized RaidenController in Orchestrator (Driver)
         print("\n--- Step 1: Starting Centralized RaidenController Server on Orchestrator ---")
@@ -377,26 +424,77 @@ def main():
         from tpu_sync.rpc import raiden_controller
 
         driver_ip = resolve_local_ip()
-        controller_port = 10019
-        controller_address = f"{driver_ip}:{controller_port}"
-        print(f"Starting RaidenController at {controller_address}...")
-
         worker_rpc_client = raiden_controller.WeightSyncWorkerRpcClient()
         controller = raiden_controller.RaidenController(
-            port=controller_port,
+            port=0,
             worker_rpc_client=worker_rpc_client,
         )
         controller_server = raiden_controller.RaidenControllerServer(controller)
-        controller_server.start()
+        controller_port = controller_server.start()
+        controller_address = f"{driver_ip}:{controller_port}"
         print(f"RaidenControllerServer started and listening on {controller_address}.")
 
-        # Step 2: Instantiating Actors
-        print("\n--- Step 2: Instantiating Trainer and Sampler Actors on 1 TPU Chip each ---")
-        sampler = SamplerActor.remote(actor_id=0)
-        trainer = TrainerActor.remote(actor_id=0)
+        # Step 2: Instantiating Actors on SEPARATE nodes.
+        #
+        # STRICT_SPREAD guarantees every bundle lands on a *different* node.
+        # Plain scheduling_strategy="SPREAD" is only a best-effort hint and can
+        # still co-locate both actors -- which is exactly what happened before:
+        # Sampler (pid 423) and Trainer (pid 424) both landed on 10.36.6.62 and
+        # shared that one node's 200 GB memory budget.
+        #
+        # Each bundle must cover the actor's full resource request. Ray reports
+        # these actors as requiring {CPU: 1, TPU: 1}.
+        from ray.util.placement_group import placement_group, remove_placement_group
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        # Step 3: Register Actors with RaidenController
-        print("\n--- Step 3: Registering Trainer & Sampler Work Units with RaidenController ---")
+        print("\n--- Step 2: Instantiating Trainer and Sampler Actors on 1 TPU Chip each (separate nodes) ---")
+        pg = placement_group(
+            name="mini_rl_strict_spread",
+            bundles=[{"CPU": 1, "TPU": 1}, {"CPU": 1, "TPU": 1}],
+            strategy="STRICT_SPREAD",
+        )
+        print("Waiting for STRICT_SPREAD placement group (2 bundles on 2 distinct nodes)...")
+        ray.get(pg.ready(), timeout=180)
+        print("Placement group ready.")
+
+        sampler = SamplerActor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=0,
+            )
+        ).remote(actor_id=0)
+        trainer = TrainerActor.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=1,
+            )
+        ).remote(actor_id=0)
+
+        # Verify the spread actually happened. The actors' logger.info() calls are
+        # swallowed by Ray's worker logging config, so assert it here on the
+        # driver, where print() is visible in the job log.
+        sampler_node, trainer_node = ray.get(
+            [sampler.get_node_ip.remote(), trainer.get_node_ip.remote()]
+        )
+        print(f"Sampler node: {sampler_node}")
+        print(f"Trainer node: {trainer_node}")
+        assert sampler_node != trainer_node, (
+            f"Expected Sampler and Trainer on different nodes, but both are on {sampler_node}"
+        )
+        print("[OK] Sampler and Trainer are on different nodes.")
+
+        initial_sampler_checksum = ray.get(sampler.get_current_checksum.remote())
+        print(f"Sampler Initial Checksum: {initial_sampler_checksum['sha256'][:16]} (L1={initial_sampler_checksum['l1_norm']:.4f})")
+
+        # Step 3: Step Training on Trainer
+        print("\n--- Step 3: Executing Mini Training Steps on Trainer ---")
+        trainer_checksum = ray.get(trainer.step_training.remote(num_steps=3))
+        print(f"Trainer Trained Checksum: {trainer_checksum['sha256'][:16]} (L1={trainer_checksum['l1_norm']:.4f})")
+
+        assert initial_sampler_checksum["sha256"] != trainer_checksum["sha256"], "Initial weights should differ!"
+
+        # Step 4: Register Actors with RaidenController (after training so WeightSynchronizer binds trained buffers)
+        print("\n--- Step 4: Registering Trainer & Sampler Work Units with RaidenController ---")
         sampler_unit_id = ray.get(sampler.register_with_controller.remote(controller_address=controller_address, parallelism=4))
         trainer_unit_id = ray.get(trainer.register_with_controller.remote(controller_address=controller_address, parallelism=4))
 
@@ -418,19 +516,12 @@ def main():
                 raise TimeoutError("Timeout waiting for workers to register with RaidenController!")
             time.sleep(0.5)
 
-        initial_sampler_checksum = ray.get(sampler.get_current_checksum.remote())
-        print(f"Sampler Initial Checksum: {initial_sampler_checksum['sha256'][:16]} (L1={initial_sampler_checksum['l1_norm']:.4f})")
-
-        # Step 4: Step Training on Trainer
-        print("\n--- Step 4: Executing Mini Training Steps on Trainer ---")
-        trainer_checksum = ray.get(trainer.step_training.remote(num_steps=3))
-        print(f"Trainer Trained Checksum: {trainer_checksum['sha256'][:16]} (L1={trainer_checksum['l1_norm']:.4f})")
-
-        assert initial_sampler_checksum["sha256"] != trainer_checksum["sha256"], "Initial weights should differ!"
+        import inspect
+        print(f"controller.start_transfer signature: {inspect.signature(controller.start_transfer)}")
 
         # Trigger D2H on Trainer
-        print("\n--- Step 5: Triggering Trainer D2H DMA Copy ---")
-        ray.get(trainer.trigger_d2h.remote())
+        print("\n--- Step 5: Triggering Trainer D2H DMA Copy (uuid=9999) ---")
+        ray.get(trainer.trigger_d2h.remote(uuid=9999))
 
         # Step 6: Orchestrator calls controller.start_transfer()
         print("\n--- Step 6: Orchestrator Invoking controller.start_transfer() ---")
@@ -456,18 +547,40 @@ def main():
         t_transfer_elapsed = time.perf_counter() - t_transfer_start
         print(f"controller.start_transfer() completed in {t_transfer_elapsed * 1000:.2f} ms")
 
+        # Step 6.5: Ingest transferred weights from Host buffer to TPU HBM on Sampler
+        print("\n--- Step 6.5: Triggering Sampler H2D DMA Ingestion (uuid=9999) ---")
+        ray.get(sampler.trigger_h2d.remote(uuid=9999))
+
         # Step 7: Verifying Checksum on Sampler
         print("\n--- Step 7: Verifying Weight Synchronization on Sampler ---")
-        success = ray.get(sampler.verify_against_checksum.remote(expected_checksum=trainer_checksum["sha256"], timeout_sec=15.0))
+        success = ray.get(sampler.verify_against_checksum.remote(expected_checksum=trainer_checksum["sha256"], timeout_sec=15.0, uuid=9999))
 
         final_sampler_checksum = ray.get(sampler.get_current_checksum.remote())
         print(f"Sampler Final Checksum: {final_sampler_checksum['sha256'][:16]} (L1={final_sampler_checksum['l1_norm']:.4f})")
+
+        print("\n--- Layer-by-Layer Verification ---")
+        t_layers = trainer_checksum.get("layers", {})
+        s_layers = final_sampler_checksum.get("layers", {})
+        all_match = True
+        for name in sorted(t_layers.keys()):
+            t_info = t_layers[name]
+            s_info = s_layers.get(name, {})
+            matched = (t_info["sha256"] == s_info.get("sha256"))
+            l1_diff = abs(t_info["l1"] - s_info.get("l1", 0.0))
+            if not matched:
+                all_match = False
+            print(f"Layer '{name}' (shape {t_info['shape']}): matched={matched}, "
+                  f"Trainer sha={t_info['sha256'][:10]} L1={t_info['l1']:.4f}, "
+                  f"Sampler sha={s_info.get('sha256', '')[:10]} L1={s_info.get('l1', 0.0):.4f}, "
+                  f"L1 diff={l1_diff:.6f}")
 
         print("\n" + "=" * 80)
         if success and final_sampler_checksum["sha256"] == trainer_checksum["sha256"]:
             print(">>> [SUCCESS] Mini RL Weight Synchronization with RaidenController PASSED!")
         else:
             print(">>> [FAILURE] Mini RL Weight Synchronization FAILED! Checksums do not match.")
+            print("=" * 80)
+            sys.exit(1)
         print("=" * 80)
 
     except Exception as e:
@@ -476,6 +589,13 @@ def main():
         print(f">>> [REPRODUCED ERROR / EXCEPTION CAUGHT]:\n{traceback.format_exc()}")
         print("!" * 80)
         sys.exit(1)
+
+    finally:
+        # Always release the placement group. A leaked PG keeps its TPU/CPU
+        # bundles reserved and will block the next run from scheduling.
+        if pg is not None:
+            remove_placement_group(pg)
+            print("Placement group released.")
 
 
 if __name__ == "__main__":
