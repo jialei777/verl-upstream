@@ -770,7 +770,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 return metrics or {}
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-            metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            metrics = await self.checkpoint_engine.send_weights(
+                per_tensor_param, global_steps=global_steps, mode=effective_mode
+            )
             return metrics or {}
 
         set_expandable_segments(False)

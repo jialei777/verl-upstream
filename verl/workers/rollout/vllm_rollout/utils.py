@@ -32,7 +32,7 @@ from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model,
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
 VLLM_LORA_INT_ID = 123

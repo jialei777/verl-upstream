@@ -230,7 +230,7 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
@@ -468,13 +468,15 @@ class vLLMHttpServer:
         await engine_client.reset_mm_cache()
         # A sampled <|image_pad|>/<|video_pad|> has no image behind it, and every consumer of the
         # sequence assumes it does. Mask them out with the OOV tail, so the policy cannot pick one.
-        await engine_client.collective_rpc(
-            method="monkey_patch_model",
-            kwargs={
-                "vocab_size": len(self.model_config.tokenizer),
-                "banned_token_ids": get_vision_placeholder_token_ids(self.model_config.processor),
-            },
-        )
+        banned_token_ids = get_vision_placeholder_token_ids(self.model_config.processor)
+        if banned_token_ids:
+            await engine_client.collective_rpc(
+                method="monkey_patch_model",
+                kwargs={
+                    "vocab_size": len(self.model_config.tokenizer),
+                    "banned_token_ids": banned_token_ids,
+                },
+            )
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()
@@ -1077,6 +1079,8 @@ class vLLMHttpServer:
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""
+        if get_resource_name() == "TPU":
+            return "verl.workers.rollout.vllm_rollout.tpu_utils.vLLMColocateWorkerExtension"
         return "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
 
     def _get_cli_modules(self) -> list:

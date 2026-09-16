@@ -63,10 +63,14 @@ def get_layer_group(key: str) -> str:
 
 
 def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
-    """
-    Worker-side weight loader. Performs host-side CPU sharding (slicing)
+    """Worker-side weight loader. Performs host-side CPU sharding (slicing)
     and chunked, memory-safe, JIT-partitioned PCIe copying to TPU.
     """
+    # HACK: Guard against state_dict=None when shared memory weight cache is skipped on multi-host vLLM workers.
+    # TODO: remove HACK once shared memory state dict caching is synchronized across all secondary TPU worker nodes.
+    if state_dict is None:
+        return 0
+
     t_start = time.perf_counter()
 
     if isinstance(state_dict, dict) and "grouped" in state_dict:

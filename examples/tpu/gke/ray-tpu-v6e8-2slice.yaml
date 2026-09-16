@@ -35,7 +35,7 @@ spec:
         serviceAccountName: ray-ksa
         containers:
           - name: ray-head
-            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260630-159c2e3e
+            image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v-raiden-20260914201943
             imagePullPolicy: Always
             env:
             - name: RAY_TRAIN_V2_ENABLED
@@ -86,16 +86,18 @@ spec:
           serviceAccountName: ray-ksa
           containers:
             - name: ray-worker
-              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260630-159c2e3e
+              image: us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v-raiden-20260914201943
               imagePullPolicy: Always
               resources:
                 limits:
-                  memory: "200Gi"
+                  # Doubled 200Gi -> 400Gi. Node (ct6e-standard-4t) allocatable
+                  # is ~687Gi with one worker pod per node, so this fits.
+                  memory: "500Gi"
                   # Each Worker node has 4 TPU chips.
                   google.com/tpu: "4"
                 requests:
                   cpu: "48"
-                  memory: "200Gi"
+                  memory: "500Gi"
                   # Each Worker node has 4 TPU chips.
                   google.com/tpu: "4"
               env:

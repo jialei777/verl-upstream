@@ -23,6 +23,31 @@ class TPUWeightRegistry:
 
     def __init__(self):
         self.weights = {}
+        self.peers = []
+        self.checksums = {}
+        self.controller_address = None
+
+    def set_controller_address(self, address: str):
+        self.controller_address = address
+
+    def get_controller_address(self) -> str:
+        return self.controller_address
+
+    def set_peers(self, peers):
+        self.peers = peers
+
+    def get_peers(self):
+        return self.peers
+
+    def set_checksum(self, step, checksum):
+        self.checksums[step] = checksum
+        steps_to_keep = sorted(self.checksums.keys())
+        if len(steps_to_keep) > 5:
+            for old_step in steps_to_keep[:-5]:
+                del self.checksums[old_step]
+
+    def get_checksum(self, step):
+        return self.checksums.get(step, None)
 
     def set_weights(self, step, ref):
         self.weights[step] = ref
@@ -43,3 +68,17 @@ class TPUWeightRegistry:
 
     def get_weights(self, step):
         return self.weights.get(step, None)
+
+
+def get_tpu_weight_registry():
+    """Gets or creates the singleton detached TPUWeightRegistry actor in the 'verl' namespace."""
+    try:
+        return ray.get_actor("TPUWeightRegistry", namespace="verl")
+    except Exception:
+        try:
+            return TPUWeightRegistry.options(
+                name="TPUWeightRegistry", namespace="verl", lifetime="detached"
+            ).remote()
+        except Exception:
+            return ray.get_actor("TPUWeightRegistry", namespace="verl")
+
