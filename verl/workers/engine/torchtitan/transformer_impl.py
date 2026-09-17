@@ -166,7 +166,8 @@ class TorchTitanEngine(BaseEngine):
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
-        if self.engine_config.offload_policy or self.engine_config.forward_only:
+        # Do not implicitly enable FSDP CPU offload for TPU reference models.
+        if self.engine_config.offload_policy or (self.engine_config.forward_only and device_name != "tpu"):
             training = TrainingConfig(enable_cpu_offload=True, **training_kwargs)
         else:
             training = TrainingConfig(**training_kwargs)

@@ -78,6 +78,7 @@ RUN pip install --no-cache-dir \
     latex2sympy2_extended \
     math_verify \
     tensorboard \
+    "debugpy>=1.8" \
     TransferQueue==0.1.8
 
 WORKDIR /app
