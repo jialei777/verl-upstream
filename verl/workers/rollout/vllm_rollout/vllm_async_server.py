@@ -68,11 +68,13 @@ _VLLM_VERSION = version.parse(vllm.__version__)
 
 if get_resource_name() == "TPU":
     from verl.workers.rollout.vllm_rollout.tpu_utils import (
+        _tpu_preflight_log,
         get_tpu_server_launch_config,
         is_tpu_vllm_run,
         override_vllm_configs_for_tpu,
         patch_vllm_for_tpu,
         prepare_tpu_server_args,
+        report_stale_tpu_engines,
     )
 else:
 
@@ -1141,6 +1143,25 @@ class vLLMReplica(RolloutReplica):
         )
 
         if is_tpu_vllm_run():
+            # [TPU HACK 23] Engine-internal data parallelism cannot work on TPU.
+            # torch_tpu builds a single global mesh per server actor, so every
+            # compiled program must satisfy partition_count == mesh size. With
+            # DP > 1 a replica owns TP * DP chips while each program is only TP
+            # wide, and the workers outside the program's device assignment abort
+            # in profile_run. It also buys nothing: data_parallel_size == 1
+            # already yields one TP-sized replica per TP chips. Fail fast rather
+            # than dying deep inside libtpu.
+            if self.config.data_parallel_size > 1:
+                raise NotImplementedError(
+                    "actor_rollout_ref.rollout.data_parallel_size="
+                    f"{self.config.data_parallel_size} is not supported on TPU. The TPU "
+                    "distributed runtime requires each compiled program to span the whole "
+                    "TPU mesh, but a single DP group only spans "
+                    f"tensor_model_parallel_size={self.config.tensor_model_parallel_size} "
+                    "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
+                    "then creates one rollout replica per tensor_model_parallel_size chips, "
+                    "which is equivalent to engine-internal data parallelism."
+                )
             await self._launch_tpu_servers()
             return
 
@@ -1275,6 +1296,13 @@ class vLLMReplica(RolloutReplica):
 
     async def _launch_tpu_servers(self):
         """Launch vLLM server actor for TPU platform."""
+        # [TPU HACK 25] Count leaked vLLM engine processes on each host before we
+        # touch the chips. Report-only unless VERL_TPU_MAX_STALE_ENGINES is set.
+        # Runs first so that a worn-out pod is named here rather than surfacing as
+        # an ActorUnavailableError from the query below, or as a bare
+        # "local device count is 0" some 8k log lines later.
+        await report_stale_tpu_engines(self.workers)
+
         node_id, visible_chips, tpu_env_vars = await get_tpu_server_launch_config(self.workers)
 
         prefix = "vllm_"
@@ -1285,13 +1313,44 @@ class vLLMReplica(RolloutReplica):
         else:
             name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
 
+        platform_env_vars = get_platform().rollout_env_vars()
         env_vars = {
             **{var: "1" for var in get_platform().ray_noset_envvars()},
-            **get_platform().rollout_env_vars(),
+            **platform_env_vars,
             **tpu_env_vars,
         }
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+
+        # [TPU HACK 26] Make the XLA/libtpu compiler flags reach the processes that
+        # compile the model. Nothing else does: this actor's runtime_env is built
+        # from a fixed list, and vLLM's Ray executor then copies only VLLM_/NCCL_/HF_
+        # prefixed names into the RayWorkerWrapper pool, which is where compilation
+        # happens. VLLM_RAY_EXTRA_ENV_VARS_TO_COPY is vLLM's supported hook for that
+        # second hop. Each value is logged so that a future regression shows up in
+        # the job log instead of silently testing nothing.
+        flags_to_copy = set()
+        for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
+            # VERL_TPU_EXTRA_* appends rather than replaces, because the launch
+            # scripts export LIBTPU_INIT_ARGS themselves; and appending must not
+            # discard the value already forwarded off the worker.
+            base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
+            extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
+            resolved = " ".join(v for v in (base_value, extra_value) if v)
+            _tpu_preflight_log(
+                f"{flag_var}: base={base_value!r} extra={extra_value!r} -> engine={resolved or None!r}",
+                tag="TPU HACK 26",
+            )
+            if resolved:
+                env_vars[flag_var] = resolved
+                flags_to_copy.add(flag_var)
+
+        if flags_to_copy:
+            copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
+            existing = env_vars.get(copy_var) or os.environ.get(copy_var) or ""
+            names = {tok.strip() for tok in existing.split(",") if tok.strip()}
+            env_vars[copy_var] = ",".join(sorted(names | flags_to_copy))
+            _tpu_preflight_log(f"{copy_var}={env_vars[copy_var]}", tag="TPU HACK 26")
 
         server = self.server_class.options(
             scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

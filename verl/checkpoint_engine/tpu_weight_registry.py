@@ -26,20 +26,27 @@ class TPUWeightRegistry:
 
     def set_weights(self, step, ref):
         self.weights[step] = ref
-        # Keep only the last 1 step to prevent memory leaks and disk spilling.
-        steps_to_keep = sorted(self.weights.keys())
-        if len(steps_to_keep) > 1:
-            for old_step in steps_to_keep[:-1]:
-                old_ref = self.weights[old_step]
-                if isinstance(old_ref, str):
-                    try:
-                        import os
+        # Keep only the entry just written, to bound memory and disk.
+        #
+        # Evict by write, not by step order. This actor is detached, so a step
+        # left by a previous job (say 5) outranks the step 0 a fresh job just
+        # published, and an ordering-based policy would delete the new entry.
+        for old_step in [s for s in self.weights if s != step]:
+            old_ref = self.weights[old_step]
+            if isinstance(old_ref, str):
+                try:
+                    import os
 
-                        if os.path.exists(old_ref):
-                            os.remove(old_ref)
-                    except Exception:
-                        pass
-                del self.weights[old_step]
+                    if os.path.exists(old_ref):
+                        os.remove(old_ref)
+                except Exception:
+                    pass
+            del self.weights[old_step]
 
     def get_weights(self, step):
         return self.weights.get(step, None)
+
+    def clear(self):
+        """Drops every cached entry. Used to reset state left by a previous job."""
+        self.weights.clear()
+

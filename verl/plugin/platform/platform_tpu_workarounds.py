@@ -64,6 +64,8 @@ def patch_ray_worker():
     In containerized GKE environments where TPU chips are isolated per pod, Raylet physical accelerator
     lookups can raise an `IndexError` when querying host-level accelerator indices.
     """
+    os.environ["VERL_PLATFORM"] = "tpu"
+
     try:
         original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
 

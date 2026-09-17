@@ -61,24 +61,6 @@ except ImportError:
     ray_distributed_executor = None
 
 try:
-    try:
-        import vllm_torchtpu.platforms.tpu_platform as tpu_platform
-    except ImportError:
-        import tpu_inference.platforms.tpu_platform as tpu_platform
-except ImportError:
-    tpu_platform = None
-
-try:
-    from vllm.config import AttentionConfig
-except ImportError:
-    AttentionConfig = None
-
-try:
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-except ImportError:
-    AttentionBackendEnum = None
-
-try:
     from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 except ImportError:
     EngineArgs = None
@@ -391,6 +373,14 @@ def patch_vllm_for_tpu() -> None:
 
             if lock_fd is not None:
                 os.close(lock_fd)
+                # The lock file must be removed on the success path too. It is
+                # created with O_CREAT|O_EXCL and /tmp survives across Ray jobs
+                # on the same pod, so leaking it makes every subsequent job fail
+                # master election and silently reload a stale cached state dict.
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
 
             # Stagger ranks before loading to serialize memory traffic
             time.sleep((rank_val % 4) * 0.4)
@@ -481,19 +471,6 @@ def patch_vllm_for_tpu() -> None:
             return
 
         try:
-            if tpu_platform is not None and AttentionBackendEnum is not None:
-                orig_wrap = tpu_platform.TpuPlatform.wrap_engine_kwargs
-
-                def patched_wrap(self, engine_kwargs):
-                    orig_wrap(self, engine_kwargs)
-                    if "attention_config" in engine_kwargs:
-                        engine_kwargs["attention_config"].backend = AttentionBackendEnum.MATH
-
-                tpu_platform.TpuPlatform.wrap_engine_kwargs = patched_wrap
-        except Exception as e:
-            logger.warning(f"Failed to patch TPUPlatform.wrap_engine_kwargs: {e}")
-
-        try:
             if EngineArgs is not None:
                 orig_create_engine_config = EngineArgs.create_engine_config
 
@@ -506,8 +483,6 @@ def patch_vllm_for_tpu() -> None:
                     )
                     if is_tpu:
                         os.environ["VLLM_USE_V1"] = "0"
-                        if hasattr(self, "use_v1"):
-                            self.use_v1 = False
 
                     if getattr(self, "data_parallel_size", 1) <= 1:
                         if hasattr(self, "data_parallel_external_lb"):
@@ -530,8 +505,6 @@ def patch_vllm_for_tpu() -> None:
                             tpu_envs.TPU_MULTIHOST_BACKEND = None
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
-                        if is_tpu and hasattr(vllm_config, "use_v1"):
-                            vllm_config.use_v1 = False
 
                         logger.info(
                             "[TPU HACK 16] Single-host rollout detected. "
@@ -550,8 +523,6 @@ def patch_vllm_for_tpu() -> None:
                             tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
-                        if is_tpu and hasattr(vllm_config, "use_v1"):
-                            vllm_config.use_v1 = False
                         vllm_config.parallel_config.distributed_executor_backend = "ray"
                         logger.info(
                             "[TPU HACK 16] Directly forced 'ray' distributed executor backend on TPU for multi-host."
@@ -1180,6 +1151,12 @@ async def get_tpu_server_launch_config(workers):
                         "TORCH_DYNAMO_RECOMPILE_LIMIT",
                         "SKIP_JAX_PRECOMPILE",
                         "VLLM_ENABLE_V1_MULTIPROCESSING",
+                        # Keep the vLLM AOT compile cache disabled in the server
+                        # process too: a reloaded artifact degrades the model to
+                        # eager execution and reintroduces the unaligned-DUS
+                        # crash (b/501165531). See apply_tpu_vllm_patches().
+                        "VLLM_DISABLE_COMPILE_CACHE",
+                        "VERL_PLATFORM",
                         "XLA_FLAGS",
                     )
                 }
@@ -1193,6 +1170,184 @@ async def get_tpu_server_launch_config(workers):
     tpu_env_vars = worker_tpu_envs[0] if worker_tpu_envs else {}
 
     return node_id, visible_chips, tpu_env_vars
+
+
+# =============================================================================
+# [TPU HACK 25] Preflight census of leaked vLLM engine processes.
+#
+# Every rollout engine that shuts down leaves processes in state Z, reparented
+# to PID 1, one of them VLLM::EngineCore. Nothing reaps them, so the count grows
+# for the lifetime of the pod. Past some point the host stops handing out TPU
+# devices and the next job dies ~8k log lines into engine init with an opaque
+# "local device count is 0". Naming the host up front turns that into a lead.
+#
+# Enforcement is off by default. The count correlates with failures (0, 1 and 4
+# passed; 5 and ~10 failed) but the threshold rests on too little data to fail a
+# good run over, so the census reports unless asked otherwise:
+#
+#   VERL_TPU_MAX_STALE_ENGINES unset, or -1   (default) report only, never fail
+#   VERL_TPU_MAX_STALE_ENGINES=0              fail if any host leaked even one
+#   VERL_TPU_MAX_STALE_ENGINES=4              fail if a host leaked more than 4
+#
+# Negative is the "off" sentinel rather than 0, so 0 stays usable as a real
+# threshold. There is deliberately no wait loop: zombies never clear on their
+# own, so waiting could only delay the failure.
+#
+# NOTE: do not name the libtpu fusion CHECK in any message emitted from here. An
+# earlier revision did, and log scrapers searching for the crash matched this
+# check's output instead.
+# =============================================================================
+
+
+def probe_stale_tpu_engines(self=None):
+    """Return a zombie-process census for this host.
+
+    Executed remotely on each TPU worker actor via ``__ray_call__``, hence the
+    unused ``self`` parameter and the function-local imports: the callable is
+    pickled and must not depend on the caller's module state.
+
+    Returns a dict with ``hostname``, ``zombies`` (every process in state ``Z``)
+    and ``engines`` (those whose command name looks like a vLLM EngineCore).
+
+    ``/proc/<pid>/cmdline`` is empty for a zombie -- that is why ``ps`` renders
+    them as ``<defunct>`` -- so the name has to come from the ``comm`` field of
+    ``/proc/<pid>/stat`` instead.
+    """
+    import os as _os
+    import socket as _socket
+
+    # /proc/<pid>/stat truncates comm to 15 characters, so "VLLM::EngineCore"
+    # arrives as "VLLM::EngineCor". Match on the truncated form.
+    engine_marker = "EngineCor"
+
+    census = {"hostname": _socket.gethostname(), "zombies": 0, "engines": 0}
+
+    try:
+        entries = _os.listdir("/proc")
+    except OSError:
+        return census
+
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                stat_line = handle.read().decode(errors="replace")
+        except OSError:
+            # Process exited mid-scan, or /proc is not readable. Not actionable.
+            continue
+
+        # comm sits between the first '(' and the last ')' and may itself
+        # contain spaces or parentheses, so anchor on the LAST ')'.
+        close = stat_line.rfind(")")
+        if close == -1:
+            continue
+
+        fields = stat_line[close + 1 :].split()
+        if not fields or fields[0] != "Z":
+            continue
+
+        census["zombies"] += 1
+
+        opened = stat_line.find("(")
+        comm = stat_line[opened + 1 : close] if opened != -1 else ""
+        if engine_marker in comm:
+            census["engines"] += 1
+
+    return census
+
+
+async def report_stale_tpu_engines(workers) -> None:
+    """Log a per-host census of leaked vLLM engine processes before launching servers.
+
+    Reports only, unless ``VERL_TPU_MAX_STALE_ENGINES`` is set to a non-negative
+    value, in which case a host holding more than that many leaked engines
+    raises before any TPU work starts. Unset or negative disables enforcement;
+    ``0`` means "fail if any host has leaked even one". Negative is the off
+    sentinel rather than ``0`` so that ``0`` stays usable as a real threshold.
+
+    This never blocks, and deliberately does not wait for the count to come
+    down. Waiting would assume the stragglers eventually clear; these are
+    zombies, so nothing short of recycling the pod removes them and a wait could
+    only delay the failure.
+
+    Args:
+        workers: TPU worker actor handles. There is one per chip, so several of
+            them report the same host; the census is deduplicated by hostname.
+
+    Raises:
+        RuntimeError: Only when enforcement is enabled and a host is over the limit.
+    """
+    if not is_tpu_vllm_run() or not workers:
+        return
+
+    raw_limit = os.environ.get("VERL_TPU_MAX_STALE_ENGINES", "-1")
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        _tpu_preflight_log(
+            f"ignoring malformed VERL_TPU_MAX_STALE_ENGINES={raw_limit!r}, staying report-only"
+        )
+        limit = -1
+
+    try:
+        per_actor = await asyncio.gather(
+            *[worker.__ray_call__.remote(probe_stale_tpu_engines) for worker in workers]
+        )
+    except Exception as probe_err:
+        # The census is a diagnostic aid; never let it be the thing that breaks
+        # a run that would otherwise have worked.
+        _tpu_preflight_log(f"census failed, continuing without preflight check: {probe_err}")
+        return
+
+    by_host = {}
+    for census in per_actor:
+        if isinstance(census, dict) and census.get("hostname"):
+            by_host[census["hostname"]] = census
+
+    if not by_host:
+        return
+
+    summary = ", ".join(
+        f"{host}: {by_host[host]['engines']} engine(s) / {by_host[host]['zombies']} zombie(s)"
+        for host in sorted(by_host)
+    )
+    _tpu_preflight_log(f"leaked rollout engines across {len(by_host)} host(s) -- {summary}")
+
+    if limit < 0:
+        return
+
+    over = sorted(host for host, census in by_host.items() if census["engines"] > limit)
+    if not over:
+        return
+
+    raise RuntimeError(
+        f"[TPU HACK 25] {len(over)}/{len(by_host)} TPU host(s) exceed "
+        f"VERL_TPU_MAX_STALE_ENGINES={limit}: {', '.join(over)}. Leaked engine processes "
+        "accumulate for the lifetime of the pod and are never reaped. Past some point the "
+        "host stops handing out TPU devices and vLLM engine init dies with 'local device "
+        "count is 0' about 8k log lines in. Recycle the workers and resubmit:\n"
+        "    kubectl delete pod -l ray.io/cluster=<your-cluster>,ray.io/node-type=worker\n"
+        f"Census: {summary}"
+    )
+
+
+def _tpu_preflight_log(message: str, tag: str = "TPU HACK 25") -> None:
+    """Emit a preflight message via both logging and stdout.
+
+    verl's ``logger`` output is swallowed inside some rollout actors, so the
+    ``print`` is what actually reaches the driver log where we need to read it.
+
+    Args:
+        message: The text to emit.
+        tag: Bracketed prefix identifying the caller. This is a parameter because
+            the helper is shared -- [TPU HACK 26] also uses it, and when the tag
+            was hardcoded its messages came out labelled "[TPU HACK 25]
+            [TPU HACK 26] ...", which misattributes them to this check.
+    """
+    logging.getLogger(__name__).warning("[%s] %s", tag, message)
+    print(f"[{tag}] {message}", flush=True)
 
 
 def prepare_tpu_server_args(args: dict):
