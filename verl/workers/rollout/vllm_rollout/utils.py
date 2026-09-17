@@ -28,7 +28,6 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_updates, split_buffer_updates
 
 logger = logging.getLogger(__file__)
@@ -40,6 +39,16 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def is_fp8_model(vllm_config):
+    """Avoid loading optional FP8 dependencies for unquantized rollout workers."""
+    if getattr(vllm_config, "quant_config", None) is None:
+        return False
+
+    from verl.utils.vllm.vllm_fp8_utils import is_fp8_model as _is_fp8_model
+
+    return _is_fp8_model(vllm_config)
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
@@ -160,6 +169,8 @@ class vLLMColocateWorkerExtension:
         # 2. patch online fp8 quant. Some models, including DeepSeek-V4, get
         # fp8 from the HF config rather than an explicit rollout quantization arg.
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1" or is_fp8_model(vllm_config):
+            from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+
             apply_vllm_fp8_patches()
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
@@ -347,6 +358,8 @@ class vLLMColocateWorkerExtension:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(self.model_runner.vllm_config):
+                from verl.utils.vllm.vllm_fp8_utils import load_quanted_weights
+
                 logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(param_updates, self.model_runner) if param_updates else []
