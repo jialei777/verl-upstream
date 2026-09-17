@@ -21,6 +21,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 def _tpu_sign(x: torch.Tensor) -> torch.Tensor:
     """Builds [[-1], [1]] with the dtype/device of ``x``.
 
@@ -44,13 +45,7 @@ def _tpu_widen(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """[..., half] -> [..., 1, 2 * half], i.e. cat((t, t), -1).unsqueeze(-2)."""
     lead = t.shape[:-1]
     half = t.shape[-1]
-    return (
-        t.unsqueeze(-2)
-        .expand(*lead, 2, half)
-        .reshape(*lead, 2 * half)
-        .unsqueeze(-2)
-        .to(dtype)
-    )
+    return t.unsqueeze(-2).expand(*lead, 2, half).reshape(*lead, 2 * half).unsqueeze(-2).to(dtype)
 
 
 # TODO: Remove this workaround once upstream vLLM PR #56879 is merged and released.
@@ -144,5 +139,3 @@ def apply_tpu_vllm_patches() -> None:
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
 
     patch_tpu_rotary_emb()
-
-
