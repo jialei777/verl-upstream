@@ -38,6 +38,7 @@ from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.train import Trainer
 
 import verl.utils.torch_functional as verl_F
+from verl.plugin.platform import get_platform
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -52,6 +53,12 @@ from verl.utils.fsdp_utils import (
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
+from verl.workers.engine.torchtitan.tpu_utils import (
+    compute_global_batch_num_tokens,
+    monkey_patch_varlen_attention_tpu,
+    synchronize_tpu_loss,
+    unwrap_metadata,
+)
 from verl.workers.engine.torchtitan.utils import (
     NoOpDataLoader,
     derive_torchtitan_name_and_flavor,
@@ -91,6 +98,9 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+if device_name == "tpu":
+    monkey_patch_varlen_attention_tpu()
 
 
 class TorchTitanEngine(BaseEngine):
@@ -133,7 +143,11 @@ class TorchTitanEngine(BaseEngine):
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
 
+        # Use foreach optimizer implementation on TPU.
+        impl = "foreach" if get_platform().device_name == "tpu" else "fused"
+
         optimizer = OptimizersContainer.Config(
+            implementation=impl,
             param_groups=[
                 ParamGroupConfig(
                     pattern=r".*",
@@ -166,7 +180,7 @@ class TorchTitanEngine(BaseEngine):
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend=self.engine_config.spmd_backend,
+            spmd_backend="default" if device_name == "tpu" else self.engine_config.spmd_backend,
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -174,7 +188,12 @@ class TorchTitanEngine(BaseEngine):
             initial_load_model_only=True,
             initial_load_path=model_config.path,
         )
-        compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
+        # Set compile backend to 'tpu' when running on TPU.
+        compile_config = CompileConfig(
+            enable=self.engine_config.use_torch_compile,
+            backend="tpu" if device_name == "tpu" else "inductor",
+        )
+
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
@@ -214,6 +233,9 @@ class TorchTitanEngine(BaseEngine):
         self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
+
+        if get_device_name() == "tpu" and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         # Re-enable FSDP's gradient division for verl's loss scaling.
         # TorchTitan disables gradient division by default (for global token normalization),
@@ -360,13 +382,17 @@ class TorchTitanEngine(BaseEngine):
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False):
         """Perform forward and optionally backward pass on a batch."""
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
-
-        # Compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
         dp_group = self.get_data_parallel_group()
-        if dp_group is not None:
-            torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        is_tpu = get_device_name() == "tpu"
+
+        if is_tpu:
+            batch_num_tokens = compute_global_batch_num_tokens(data, dp_group, self.engine_config.tensor_parallel_size)
+        else:
+            batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+            if dp_group is not None:
+                torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            batch_num_tokens = batch_num_tokens if batch_num_tokens.device.type == "tpu" else batch_num_tokens.item()
+        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
@@ -387,6 +413,8 @@ class TorchTitanEngine(BaseEngine):
             with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 if not forward_only:
+                    if get_device_name() == "tpu":
+                        synchronize_tpu_loss(loss)
                     loss.backward()
             output_lst.append(output)
 
@@ -712,7 +740,7 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
-@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu"])
+@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu", "tpu"])
 class TorchTitanEngineWithLMHead(TorchTitanEngine):
     """TorchTitan engine implementation for language models with LM head."""
 
@@ -786,15 +814,29 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
         output_args["labels"] = labels
+
+        # Ensure all model inputs and kwargs are contiguous on TPU.
+        if input_ids.device.type == "tpu":
+            input_ids = input_ids.contiguous()
+            extra_inputs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()}
+            extra_kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()}
+
         return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+        use_remove_padding = unwrap_metadata(use_remove_padding)
+
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        pad_mode = unwrap_metadata(pad_mode)
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
         temperature = micro_batch["temperature"]
+        temperature = unwrap_metadata(temperature)
+
         calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+        calculate_entropy = unwrap_metadata(calculate_entropy)
+
         labels = output_args["labels"]
         model_output = {}
 
@@ -831,7 +873,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             if calculate_entropy:
                 entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
         else:
-            logits.div_(temperature)
+            logits = logits / temperature
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
                     entropy = verl_F.entropy_from_logits(logits)
@@ -858,6 +900,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         micro_batch = micro_batch.to(get_device_id())
+
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):

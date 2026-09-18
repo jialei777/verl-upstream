@@ -73,6 +73,22 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
+if get_resource_name() == "TPU":
+    from verl.workers.rollout.vllm_rollout.tpu_utils import (
+        _tpu_preflight_log,
+        get_tpu_server_launch_config,
+        is_tpu_vllm_run,
+        override_vllm_configs_for_tpu,
+        patch_vllm_for_tpu,
+        prepare_tpu_server_args,
+        report_stale_tpu_engines,
+    )
+else:
+
+    def is_tpu_vllm_run():
+        return False
+
+
 # Max wait for admissions already past the submission gate to reach the engine.
 _GATE_BARRIER_TIMEOUT_S = 60.0
 
@@ -448,10 +464,11 @@ class vLLMHttpServer:
                     f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
-            args.update({"enable_return_routed_experts": True})
-
         if self._disaggregation_role != "null":
             args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
+
+        prepare_tpu_server_args(args)
+        override_vllm_configs_for_tpu(args)
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
@@ -469,6 +486,7 @@ class vLLMHttpServer:
                 cmds[cmd.name] = cmd
         server_args = parser.parse_args(args=server_args)
         server_args.model = server_args.model_tag
+        override_vllm_configs_for_tpu(server_args)
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
 
@@ -479,7 +497,9 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        override_vllm_configs_for_tpu(args)
         engine_args = AsyncEngineArgs.from_cli_args(args)
+        override_vllm_configs_for_tpu(engine_args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
@@ -1339,6 +1359,29 @@ class vLLMReplica(RolloutReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
 
+        if is_tpu_vllm_run():
+            # [TPU HACK 23] Engine-internal data parallelism cannot work on TPU.
+            # torch_tpu builds a single global mesh per server actor, so every
+            # compiled program must satisfy partition_count == mesh size. With
+            # DP > 1 a replica owns TP * DP chips while each program is only TP
+            # wide, and the workers outside the program's device assignment abort
+            # in profile_run. It also buys nothing: data_parallel_size == 1
+            # already yields one TP-sized replica per TP chips. Fail fast rather
+            # than dying deep inside libtpu.
+            if self.config.data_parallel_size > 1:
+                raise NotImplementedError(
+                    "actor_rollout_ref.rollout.data_parallel_size="
+                    f"{self.config.data_parallel_size} is not supported on TPU. The TPU "
+                    "distributed runtime requires each compiled program to span the whole "
+                    "TPU mesh, but a single DP group only spans "
+                    f"tensor_model_parallel_size={self.config.tensor_model_parallel_size} "
+                    "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
+                    "then creates one rollout replica per tensor_model_parallel_size chips, "
+                    "which is equivalent to engine-internal data parallelism."
+                )
+            await self._launch_tpu_servers()
+            return
+
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
             *[
@@ -1478,10 +1521,98 @@ class vLLMReplica(RolloutReplica):
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
-    # -----------------------------------------------------------------------
-    # Hook methods for subclass overrides
-    # -----------------------------------------------------------------------
+    async def _launch_tpu_servers(self):
+        """Launch vLLM server actor for TPU platform."""
+        # [TPU HACK 25] Count leaked vLLM engine processes on each host before we
+        # touch the chips. Report-only unless VERL_TPU_MAX_STALE_ENGINES is set.
+        # Runs first so that a worn-out pod is named here rather than surfacing as
+        # an ActorUnavailableError from the query below, or as a bare
+        # "local device count is 0" some 8k log lines later.
+        await report_stale_tpu_engines(self.workers)
 
-    def _get_server_name_prefix(self) -> str:
-        """Return the Ray actor name prefix (e.g. 'vllm_')."""
-        return "vllm_"
+        node_id, visible_chips, tpu_env_vars = await get_tpu_server_launch_config(self.workers)
+
+        prefix = "vllm_"
+        if self.is_reward_model:
+            name = f"{prefix}server_reward_{self.replica_rank}_0{self.name_suffix}"
+        elif self.is_teacher_model:
+            name = f"{prefix}server_teacher_{self.replica_rank}_0{self.name_suffix}"
+        else:
+            name = f"{prefix}server_{self.replica_rank}_0{self.name_suffix}"
+
+        platform_env_vars = get_platform().rollout_env_vars()
+        env_vars = {
+            **{var: "1" for var in get_platform().ray_noset_envvars()},
+            **platform_env_vars,
+            **tpu_env_vars,
+        }
+        if "VERL_PLATFORM" in os.environ:
+            env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+
+        # [TPU HACK 26] Make the XLA/libtpu compiler flags reach the processes that
+        # compile the model. Nothing else does: this actor's runtime_env is built
+        # from a fixed list, and vLLM's Ray executor then copies only VLLM_/NCCL_/HF_
+        # prefixed names into the RayWorkerWrapper pool, which is where compilation
+        # happens. VLLM_RAY_EXTRA_ENV_VARS_TO_COPY is vLLM's supported hook for that
+        # second hop. Each value is logged so that a future regression shows up in
+        # the job log instead of silently testing nothing.
+        flags_to_copy = set()
+        for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
+            # VERL_TPU_EXTRA_* appends rather than replaces, because the launch
+            # scripts export LIBTPU_INIT_ARGS themselves; and appending must not
+            # discard the value already forwarded off the worker.
+            base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
+            extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
+            resolved = " ".join(v for v in (base_value, extra_value) if v)
+            _tpu_preflight_log(
+                f"{flag_var}: base={base_value!r} extra={extra_value!r} -> engine={resolved or None!r}",
+                tag="TPU HACK 26",
+            )
+            if resolved:
+                env_vars[flag_var] = resolved
+                flags_to_copy.add(flag_var)
+
+        if flags_to_copy:
+            copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
+            existing = env_vars.get(copy_var) or os.environ.get(copy_var) or ""
+            names = {tok.strip() for tok in existing.split(",") if tok.strip()}
+            env_vars[copy_var] = ",".join(sorted(names | flags_to_copy))
+            _tpu_preflight_log(f"{copy_var}={env_vars[copy_var]}", tag="TPU HACK 26")
+
+        server = self.server_class.options(
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node_id,
+                soft=False,
+            ),
+            runtime_env={"env_vars": env_vars},
+            name=name,
+            max_concurrency=self.max_concurrency,
+        ).remote(
+            config=self.config,
+            model_config=self.model_config,
+            rollout_mode=self.rollout_mode,
+            workers=self.workers,
+            replica_rank=self.replica_rank,
+            node_rank=0,
+            gpus_per_node=self.gpus_per_replica_node,
+            nnodes=self.nnodes,
+            cuda_visible_devices=visible_chips,
+        )
+        self.servers.append(server)
+
+        master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()
+        await self.servers[0].launch_server.remote(
+            master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
+        )
+
+        server_address, server_port = await self.servers[0].get_server_address.remote()
+        self._server_handle = self.servers[0]
+        self._server_address = (
+            f"[{server_address}]:{server_port}"
+            if is_valid_ipv6_address(server_address)
+            else f"{server_address}:{server_port}"
+        )
+
+
+if is_tpu_vllm_run():
+    patch_vllm_for_tpu()

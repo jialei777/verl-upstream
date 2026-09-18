@@ -1,0 +1,116 @@
+# Use Ray 2.56.0 Python 3.12 as base.
+FROM rayproject/ray:2.56.0-py312
+
+RUN sudo apt-get update && sudo apt-get install -y \
+    gcc-12 \
+    g++-12 \
+    build-essential \
+    cmake \
+    ninja-build \
+    libgoogle-perftools4 \
+    libopenblas-base \
+    libopenmpi-dev \
+    libomp-dev \
+    && sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
+    && sudo rm -rf /var/lib/apt/lists/*
+
+RUN pip uninstall -y torch torchvision || true
+RUN pip install --upgrade pip uv keyrings.google-artifactregistry-auth pandas==2.3.3
+
+ARG AUTH_TOKEN
+# Use PIP_EXTRA_INDEX_URL so PyPI remains the primary index for standard packages like JAX
+ENV PIP_EXTRA_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+
+# --- Add torchtitan & torch_tpu setup ---
+USER root
+WORKDIR /
+
+RUN pip install "jax[tpu]==0.10.2" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+RUN pip install "tokamax==0.0.14"
+RUN pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
+RUN pip install libtpu==0.0.47 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+RUN pip install --pre --no-deps \
+    "torch-tpu==0.1.1.dev20260912075415" \
+    "tpu-sync-torch==0.0.1.dev20260917080754" \
+    --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+
+RUN pip install 'typeguard==2.13.3'
+RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale tamm "spmd_types==0.2.1" "tyro>=1.0.5"
+
+# --- Install torchtitan (latest main @ f880cc73725de77d892ecab888244e7718e5ad65) ---
+ARG GITHUB_USER
+ARG GITHUB_TOKEN
+RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtitan.git /torchtitan
+WORKDIR /torchtitan
+RUN git checkout f880cc73725de77d892ecab888244e7718e5ad65
+RUN pip install -r requirements.txt
+WORKDIR /
+
+# --- Install vLLM v0.29.0 and vllm-project/vllm-torchtpu (latest main @ b669274dcc5e6e1f2d998986fd900f2e4e23092c) ---
+ENV VLLM_TARGET_DEVICE="tpu"
+RUN git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git /vllm
+RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/vllm-project/vllm-torchtpu.git /vllm-torchtpu && \
+    ln -sfnT /vllm-torchtpu /torchtpu-vllm
+
+WORKDIR /vllm-torchtpu
+RUN git checkout b669274dcc5e6e1f2d998986fd900f2e4e23092c
+WORKDIR /
+
+# Patch vLLM's TPU requirements to avoid pulling upstream tpu-inference (JAX/torchax) over vllm-torchtpu
+RUN sed -i '/tpu-inference/d' /vllm/requirements/tpu.txt
+
+WORKDIR /vllm-torchtpu
+
+RUN pip install --upgrade pip && \
+    pip install cmake ninja setuptools-scm setuptools-rust "pyzmq>=27" && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 SETUPTOOLS_SCM_PRETEND_VERSION=0.29.0 VLLM_TARGET_DEVICE="empty" pip install --no-build-isolation -e ../vllm
+RUN pip install tpu-info pathwaysutils "numba==0.65.0" "transformers>=5.10.4,<5.11" "fastapi<0.137" && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 pip install --no-build-isolation --pre --no-deps -e .
+
+# --- Install verl Dependencies ---
+RUN pip install --no-cache-dir \
+    accelerate \
+    codetiming \
+    datasets \
+    dill \
+    hydra-core \
+    peft \
+    "pyarrow>=19.0.0" \
+    pybind11 \
+    pylatexenc \
+    "tensordict>=0.10.0" \
+    torchdata \
+    "transformers>=5.10.4,<5.11" \
+    wandb \
+    "packaging>=20.0" \
+    uvicorn \
+    "fastapi<0.137" \
+    latex2sympy2_extended \
+    math_verify \
+    tensorboard \
+    TransferQueue==0.1.8
+
+# Re-verify and lock exact PyTorch / TorchTPU / JAX / libtpu / Transformers versions after all dependency resolvers run
+RUN pip install --no-deps torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --pre --no-deps \
+    "torch-tpu==0.1.1.dev20260912075415" \
+    "tpu-sync-torch==0.0.1.dev20260917080754" \
+    --index-url "https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" && \
+    pip install --no-deps \
+    "jax==0.10.2" \
+    "jaxlib==0.10.2" \
+    "libtpu==0.0.47" \
+    "numba==0.65.0" \
+    "transformers>=5.10.4,<5.11" \
+    "fastapi<0.137" \
+    -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+WORKDIR /app
+
+ENV PIP_EXTRA_INDEX_URL=""
+ENV PIP_INDEX_URL=""
+
+# Add /app, /vllm-torchtpu, and /torchtitan to PYTHONPATH.
+ENV PYTHONPATH="/vllm-torchtpu/src:/vllm-torchtpu:/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan${PYTHONPATH:+:$PYTHONPATH}"

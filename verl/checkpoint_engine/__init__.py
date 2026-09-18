@@ -82,3 +82,10 @@ try:
 except ImportError as e:
     CheckpointEngineRegistry.record_import_error("delta_checkpoint_engine", e)
     DeltaShardedCheckpointEngine = None
+
+try:
+    from .tpu_checkpoint_engine import TPUCheckpointEngine
+
+    __all__ += ["TPUCheckpointEngine"]
+except ImportError:
+    TPUCheckpointEngine = None
