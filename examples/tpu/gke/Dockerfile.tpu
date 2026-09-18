@@ -84,3 +84,46 @@ WORKDIR /app
 
 # Add /app to PYTHONPATH to allow standard fully qualified 'import verl.*' imports.
 ENV PYTHONPATH="${PYTHONPATH}:/app:/torchtitan:/torchtitan/torchtitan"
+
+# --- Upgrade to vLLM 0.22.1 / torchtpu-vllm @ 88f359b3 ---
+# The v0.19.0 editable install above is kept solely to provision vLLM's full
+# dependency tree; the wheel below is installed with --no-deps on top of it.
+
+# 1. Drop the 0.19.0 install (editable .pth + source tree).
+RUN pip uninstall -y vllm tpu_inference >/dev/null 2>&1 || true && \
+    rm -rf /home/ray/anaconda3/lib/python3.12/site-packages/*tpu_inference* \
+           /home/ray/anaconda3/lib/python3.12/site-packages/*vllm* \
+           /vllm
+
+# 2. Move torchtpu-vllm to the 0.22.1-compatible commit and reinstall editable.
+RUN cd /torchtpu-vllm && \
+    git fetch origin main && \
+    git checkout -f 88f359b38179a5345514358b7c9738c475e26ea0 && \
+    git clean -fdx && \
+    pip install --no-build-isolation --no-deps -e /torchtpu-vllm
+
+# 3. Install vLLM 0.22.1 as a wheel with pinned extras (no dep resolution).
+#    jax/jaxlib are pinned here rather than at the `jax[tpu]` install above,
+#    because that early pin gets silently upgraded by a later transitive
+#    dependency. The version matters: jax >= 0.11 makes Pallas TPU require
+#    libtpu >= 0.0.44, but torch_tpu is built against libtpu 0.0.42.x. vLLM's
+#    ragged paged attention lowers through Pallas, so the mismatch fails the
+#    attention graph compile and the engine never starts.
+RUN pip install --no-cache-dir --no-deps \
+    --extra-index-url https://pypi.org/simple \
+    "vllm==0.22.1" \
+    "libtpu==0.0.42.1" \
+    "jax==0.10.2" \
+    "jaxlib==0.10.2" \
+    "numba==0.65.0" \
+    "llvmlite==0.47.0" \
+    "compressed-tensors==0.15.0.1" \
+    "outlines_core==0.2.14" \
+    "llguidance==1.7.6" \
+    "fastsafetensors==0.4.0" \
+    "fastapi<0.137" \
+    "pydantic>=2.12.0" \
+    "pydantic-core"
+
+# torchtpu-vllm ships as a src-layout package; both paths are required.
+ENV PYTHONPATH="/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan"
