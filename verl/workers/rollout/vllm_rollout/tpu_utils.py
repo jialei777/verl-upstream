@@ -53,10 +53,7 @@ except ImportError:
 
 # Fallback imports for TPU vLLM platforms
 try:
-    try:
-        from vllm_torchtpu.executors import ray_distributed_executor
-    except ImportError:
-        from tpu_inference.executors import ray_distributed_executor
+    from vllm_torchtpu.executors import ray_distributed_executor
 except ImportError:
     ray_distributed_executor = None
 
@@ -72,18 +69,12 @@ except ImportError:
     vllm_envs = None
 
 try:
-    try:
-        import vllm_torchtpu.envs as tpu_envs
-    except ImportError:
-        import tpu_inference.envs as tpu_envs
+    import vllm_torchtpu.envs as tpu_envs
 except ImportError:
     tpu_envs = None
 
 try:
-    try:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-    except ImportError:
-        from tpu_inference.worker.tpu_worker import TPUWorker
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
 except ImportError:
     TPUWorker = None
 
@@ -122,15 +113,9 @@ except ImportError:
             get_open_port = None
 
 try:
-    from vllm_torchtpu.platforms.tpu_platform import get_distributed_init_method
+    from vllm.utils.network_utils import get_distributed_init_method
 except ImportError:
-    try:
-        from tpu_inference.platforms.tpu_platform import get_distributed_init_method
-    except ImportError:
-        try:
-            from vllm.utils.network_utils import get_distributed_init_method
-        except ImportError:
-            get_distributed_init_method = None
+    get_distributed_init_method = None
 
 try:
     from vllm.platforms import current_platform
@@ -248,10 +233,7 @@ def patch_vllm_for_tpu() -> None:
         pass
 
     try:
-        try:
-            import vllm_torchtpu.worker.tpu_worker as tw
-        except ImportError:
-            import tpu_inference.worker.tpu_worker as tw
+        import vllm_torchtpu.worker.tpu_worker as tw
 
         if hasattr(tw, "TPUWorker") and not getattr(tw.TPUWorker, "_patched_dynamo", False):
             orig_determine = tw.TPUWorker.determine_available_memory
@@ -266,10 +248,7 @@ def patch_vllm_for_tpu() -> None:
         pass
 
     try:
-        try:
-            import vllm_torchtpu.runner.tpu_runner as tr
-        except ImportError:
-            import tpu_inference.runner.tpu_runner as tr
+        import vllm_torchtpu.runner.tpu_runner as tr
 
         if hasattr(tr, "TPUModelRunner") and not getattr(tr.TPUModelRunner, "_patched_dynamo", False):
             orig_profile = tr.TPUModelRunner.profile_run
@@ -531,11 +510,11 @@ def patch_vllm_for_tpu() -> None:
                             vllm_envs.TPU_MULTIHOST_BACKEND = "ray"
                         if tpu_envs is not None and hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
                             tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
-                        # vllm 0.22.1 added RayExecutorV2 and made it the default target of
-                        # the "ray" backend string. It never sets the TPU topology env vars,
-                        # so workers die in init_device with "PjRtClient is not initialized".
-                        # Opting out makes "ray" resolve to v1 RayDistributedExecutor, the
-                        # same class 0.19.0 used and the one we patch below. No-op on 0.19.0.
+                        # RayExecutorV2 is the default target of the "ray" backend
+                        # string. It never sets the TPU topology env vars, so workers
+                        # die in init_device with "PjRtClient is not initialized".
+                        # Opting out makes "ray" resolve to RayDistributedExecutor,
+                        # the class we patch below.
                         os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
@@ -572,18 +551,11 @@ def patch_vllm_for_tpu() -> None:
             logger.warning(f"Failed to patch TPUWorker class directly: {e}")
 
         # The executors look the topology up by chip count and raise if it is missing.
-        # vllm 0.19.0 calls the table TPU_TOPOLOGY_MAP; 0.22.1 renamed it to
-        # TPU_MULTIHOST_TOPOLOGY_MAP and ships only a 16-chip entry, so TP=4 and TP=8
-        # both have to be injected. Mutate in place: every executor module imports the
-        # same dict object from tpu_platform, so rebinding here would not be seen.
-        _topo_map = getattr(
-            ray_distributed_executor,
-            "TPU_TOPOLOGY_MAP",
-            getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", None),
-        )
-        if _topo_map is not None:
-            _topo_map[4] = "2,2,1"
-            _topo_map[8] = "2,4,1"
+        # TPU_MULTIHOST_TOPOLOGY_MAP ships only a 16-chip entry, so TP=4 and TP=8 both
+        # have to be injected. Mutate in place: every executor module imports the same
+        # dict object from tpu_platform, so rebinding here would not be seen.
+        ray_distributed_executor.TPU_MULTIHOST_TOPOLOGY_MAP[4] = "2,2,1"
+        ray_distributed_executor.TPU_MULTIHOST_TOPOLOGY_MAP[8] = "2,4,1"
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -794,11 +766,7 @@ def patch_vllm_for_tpu() -> None:
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
             RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
-            TPU_TOPOLOGY_MAP_local = getattr(
-                ray_distributed_executor,
-                "TPU_TOPOLOGY_MAP",
-                getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", {}),
-            )
+            TPU_TOPOLOGY_MAP_local = ray_distributed_executor.TPU_MULTIHOST_TOPOLOGY_MAP
 
             self.workers = []
             self.pp_tp_workers = []
@@ -959,27 +927,10 @@ def patch_vllm_for_tpu() -> None:
                 args["TORCH_TPU_XPROF_SESSION_ID"] = os.environ["TORCH_TPU_XPROF_SESSION_ID"]
                 all_args_to_update_environment_variables.append(args)
 
-            env_vars_to_copy_list = []
-            if get_env_vars_to_copy is not None:
-                # 0.22.1 moved this constant off the executor class into
-                # vllm.v1.executor.ray_utils.
-                exclude_vars = getattr(self, "WORKER_SPECIFIC_ENV_VARS", None)
-                if exclude_vars is None:
-                    from vllm.v1.executor import ray_utils as _ray_utils
-
-                    exclude_vars = getattr(_ray_utils, "WORKER_SPECIFIC_ENV_VARS", set())
-                env_vars_to_copy_list = get_env_vars_to_copy(
-                    exclude_vars=exclude_vars,
-                    additional_vars=set(current_platform.additional_env_vars)
-                    if current_platform is not None
-                    else set(),
-                    destination="workers",
-                )
-
+            # No driver->worker env var copy here: the args dict built above already
+            # carries everything a TPU worker needs, and the rollout server actor is
+            # created with an explicit runtime_env anyway.
             for i, args in enumerate(all_args_to_update_environment_variables):
-                for name in env_vars_to_copy_list:
-                    if name in os.environ:
-                        args[name] = os.environ[name]
                 logger.debug(f"RayDistributedExecutor | Worker {i} environment variables before patch: {args}")
 
             self._env_vars_for_all_workers = all_args_to_update_environment_variables
@@ -1072,14 +1023,11 @@ def patch_vllm_for_tpu() -> None:
         def _detach_zero_copy(output):
             """Copy read-only numpy logprobs out of Ray's SHM channel buffers.
 
-            vllm 0.22.1 added this to _execute_dag; holding the buffers alive
-            stalls the channel and eventually trips RAY_CGRAPH_get_timeout.
-            Absent on 0.19.0, where it is a no-op.
+            Upstream _execute_dag does this; holding the buffers alive stalls
+            the channel and eventually trips RAY_CGRAPH_get_timeout.
             """
-            try:
-                from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
-            except ImportError:
-                return
+            from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
+
             detach_zero_copy_from_model_runner_output(output)
 
         def patched_execute_dag(
@@ -1127,16 +1075,6 @@ def patch_vllm_for_tpu() -> None:
         logger.info("Successfully applied all TPU patches and hacks to vLLM & torchtpu-vllm")
     except Exception as e:
         logger.warning(f"Failed to apply TPU patches: {e}")
-
-
-# Helper helpers to import from torchtpu-vllm and other places inside vllm_async_server
-try:
-    from vllm_torchtpu.platforms.tpu_platform import get_env_vars_to_copy
-except ImportError:
-    try:
-        from tpu_inference.platforms.tpu_platform import get_env_vars_to_copy
-    except ImportError:
-        get_env_vars_to_copy = None
 
 
 def is_tpu_vllm_run() -> bool:
@@ -1420,10 +1358,7 @@ def prepare_tpu_server_args(args: dict):
     os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     try:
-        try:
-            import vllm_torchtpu.envs as tpu_envs
-        except ImportError:
-            import tpu_inference.envs as tpu_envs
+        import vllm_torchtpu.envs as tpu_envs
 
         tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
         if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
