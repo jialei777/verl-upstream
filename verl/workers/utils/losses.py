@@ -23,7 +23,7 @@ from verl.utils.device import get_device_name
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
-from verl.workers.engine.torchtitan.tpu_utils import safe_to_padded_tensor
+from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor
 from verl.workers.utils.padding import no_padding_2_padding
 
 
@@ -57,18 +57,7 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
-    """Compute PPO policy gradient loss, entropy bonus, and KL divergence penalty.
-
-    Args:
-        config (ActorConfig): Configuration object for actor training.
-        model_output (dict): Model forward outputs containing 'log_probs' and optional 'entropy'.
-        data (TensorDict): Data batch containing old log probs, advantages, masks, and metadata.
-        dp_group: Data parallel process group (optional).
-
-    Returns:
-        tuple[torch.Tensor, dict]: Total policy loss and metric dictionary containing policy metrics,
-            entropy loss, and KL loss tracking.
-    """
+    """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
@@ -82,7 +71,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
-    # global mini-batch loss normalization
+    # assumes that if any of the global batch info is set, the policy_loss_fn will
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
     # to reflect the mean loss over the global batch
     if (
@@ -103,20 +92,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
-
-    # HACK: PyTorch TPU (torch_tpu) lacks native C++ kernel support for aten::_jagged_to_padded_dense_forward.
-    # We use safe_to_padded_tensor fallback to unbind and slice-assign NestedTensors into padded 2D dense tensors.
-    # TODO: Remove HACK once aten::_jagged_to_padded_dense_forward is supported natively in torch_tpu,
-    # and revert to standard data.select(*fields).to_padded_tensor().
-    if get_device_name() == "tpu":
-        padded_dict = {}
-        for k in fields:
-            if k in data.keys():
-                val = data[k]
-                padded_dict[k] = safe_to_padded_tensor(val) if getattr(val, "is_nested", False) else val
-        data = TensorDict(padded_dict, batch_size=data.batch_size)
-    else:
-        data = data.select(*fields).to_padded_tensor()
+    data = (
+        select_and_to_padded_tensor(data, *fields)
+        if get_device_name() == "tpu"
+        else data.select(*fields).to_padded_tensor()
+    )
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
@@ -167,25 +147,24 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
-        metrics["kl_coef"] = Metric(value=config.kl_loss_coef, aggregation=metric_aggregation)
+        metrics["kl_coef"] = config.kl_loss_coef
 
     return policy_loss, metrics
 
 
 def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=None):
-    """Compute critic value function loss with optional value clipping.
+    """value loss
 
     Args:
-        config (CriticConfig): Configuration object for critic training.
-        model_output (dict): Model forward outputs containing predicted 'values'.
-        data (TensorDict): Data batch containing target returns, old values, and masks.
-        dp_group: Data parallel process group (optional).
+        config: CriticConfig
+        model_output: model output from the model
+        data: the input to the model
+        dp_group: data paralle group
 
     Returns:
-        tuple[torch.Tensor, dict]: Value function loss and metric dictionary containing vf_loss,
-            vf_clipfrac, and mean predicted values.
+        value loss
     """
-    vpreds = no_padding_2_padding(model_output["values"], data)
+    vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
 
     # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
     # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
@@ -206,19 +185,13 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     else:
         metric_aggregation = AggregationType.MEAN
 
-    # HACK: PyTorch TPU (torch_tpu) lacks native C++ kernel support for aten::_jagged_to_padded_dense_forward.
-    # We use safe_to_padded_tensor fallback to unbind and slice-assign NestedTensors into padded 2D dense tensors.
-    # TODO: Remove HACK once aten::_jagged_to_padded_dense_forward is supported natively in torch_tpu.
-    if get_device_name() == "tpu":
-        padded_dict = {}
-        for k in ("values", "returns", "response_mask"):
-            if k in data.keys():
-                val = data[k]
-                padded_dict[k] = safe_to_padded_tensor(val) if getattr(val, "is_nested", False) else val
-        data = TensorDict(padded_dict, batch_size=data.batch_size)
-    else:
-        # select fields and convert to padded tensor
-        data = data.select("values", "returns", "response_mask").to_padded_tensor()
+    # select fields and convert to padded tensor
+    fields = ("values", "returns", "response_mask")
+    data = (
+        select_and_to_padded_tensor(data, *fields)
+        if get_device_name() == "tpu"
+        else data.select(*fields).to_padded_tensor()
+    )
 
     values = data["values"]
     returns = data["returns"]

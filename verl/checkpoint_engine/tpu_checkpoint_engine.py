@@ -79,8 +79,6 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     """Worker-side weight loader. Performs host-side CPU sharding (slicing)
     and chunked, memory-safe, JIT-partitioned PCIe copying to TPU.
     """
-    # HACK: Guard against state_dict=None when shared memory weight cache is skipped on multi-host vLLM workers.
-    # TODO: remove HACK once shared memory state dict caching is synchronized across all secondary TPU worker nodes.
     if state_dict is None:
         return 0
 
@@ -180,9 +178,8 @@ def _load_single_group_on_worker(
 
         flat_cpu = torch.from_numpy(flat_data) if not isinstance(flat_data, torch.Tensor) else flat_data
         if dtype == torch.bfloat16 and flat_cpu.dtype == torch.int16:
-            # COMMENT: On TPU CPU builds (e.g. torch_tpu), converting torch.bfloat16 to numpy raises a TypeError.
-            # Thus, we serialize it as int16 (same bit representation) and view it back to bfloat16 here.
-            # TODO: remove HACK once PyTorch CPU native bfloat16 to numpy conversion is universally stable.
+            # bfloat16 is serialized via int16 numpy buffers (identical 16-bit representation)
+            # and viewed back as bfloat16 here.
             flat_cpu = flat_cpu.view(torch.bfloat16)
 
         raw_tensors = {}
@@ -352,10 +349,6 @@ class TPUCheckpointEngine(CheckpointEngine):
             self.registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
         except ValueError:
             try:
-                # COMMENT: Since TPUWeightRegistry is already a remote class decorated with @ray.remote,
-                # wrapping it with ray.remote(TPUWeightRegistry) throws a TypeError.
-                # Calling TPUWeightRegistry.options directly is the correct way to specify options.
-                # TODO: remove HACK once a unified and clean TPU checkpoint/weight registry engine is standard.
                 self.registry = TPUWeightRegistry.options(
                     name="TPUWeightRegistry", namespace="verl", lifetime="detached"
                 ).remote()
@@ -406,7 +399,7 @@ class TPUCheckpointEngine(CheckpointEngine):
             return
 
         step_key = global_steps if global_steps is not None else 0
-        logger.info(f"@@@ TPUCheckpointEngine: [Step {step_key}] Start send_weights...")
+        logger.info(f"TPUCheckpointEngine: [Step {step_key}] Start send_weights...")
 
         # Time generator consumption and CPU offloading
         t_offload_start = time.perf_counter()

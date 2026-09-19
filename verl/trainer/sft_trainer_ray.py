@@ -351,9 +351,9 @@ class SFTTrainer:
 
                 # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                 metrics["train/loss"] = metrics.pop("loss")
-                metrics["train/grad_norm"] = metrics.pop("grad_norm", 0.0)
-                metrics["train/lr"] = metrics.pop("lr", 0.0)
-                metrics["train/mfu"] = metrics.pop("mfu", 0.0)
+                metrics["train/grad_norm"] = metrics.pop("grad_norm")
+                metrics["train/lr"] = metrics.pop("lr")
+                metrics["train/mfu"] = metrics.pop("mfu")
                 metrics["train/global_tokens"] = sum(batch_seqlens)
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
@@ -363,10 +363,9 @@ class SFTTrainer:
                 is_valid_step = global_step % self.test_freq == 0
                 is_save_step = global_step % self.save_freq == 0
 
-                # HACK: Ensure test_freq > 0 is required for validation pass to bypass validation
-                # loop when test_freq=-1.
-                # TODO: remove HACK once TPU forward_only validation execution is stabilized.
-                if self.test_freq > 0 and (is_last_step or is_valid_step) and self.val_dataloader is not None:
+                if (is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step)) and (
+                    get_platform().device_name != "tpu" or self.test_freq > 0
+                ):
                     # Perform validation
                     val_losses = []
                     for val_data in self.val_dataloader:
@@ -374,8 +373,10 @@ class SFTTrainer:
                         output = self.training_client.infer_batch(val_data)
                         output = output.get()
                         metrics = tu.get(output, "metrics")
-                        val_loss_val = extract_validation_loss(metrics)
-                        val_losses.append(val_loss_val)
+                        val_loss = (
+                            extract_validation_loss(metrics) if get_platform().device_name == "tpu" else metrics["loss"]
+                        )
+                        val_losses.append(val_loss)
 
                     if len(val_losses) > 0:
                         val_loss = torch.mean(torch.tensor(val_losses, dtype=torch.float32))

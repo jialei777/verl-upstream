@@ -40,7 +40,6 @@ from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.teacher_loop import MultiTeacherModelManager
-from verl.plugin.platform import get_platform
 from verl.protocol import DataProto, DataProtoFuture
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -81,7 +80,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
 from verl.utils.debug.metrics import calculate_debug_metrics
-from verl.utils.import_utils import load_class_from_fqn, load_extern_type
+from verl.utils.import_utils import load_extern_type
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -387,7 +386,7 @@ class PPOTrainer(ABC):
         # set ``self._enable_hybrid_replicas = False`` before super()._setup();
         # they get an empty manager here and serve rollout from their
         # standalone replicas only.
-        if getattr(self, "_enable_hybrid_replicas", True) and self.config.actor_rollout_ref.get("hybrid_engine", True):
+        if getattr(self, "_enable_hybrid_replicas", True):
             self.llm_server_manager: LLMServerManager = LLMServerManager.create(
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
@@ -398,21 +397,8 @@ class PPOTrainer(ABC):
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-
-        is_tpu = get_platform().device_name == "tpu" or self.config.trainer.device == "tpu"
-        if is_tpu:
-            if not checkpoint_engine_config.backend or checkpoint_engine_config.backend == "naive":
-                checkpoint_engine_config.backend = "tpu"
-        elif self.trainer_mode in ["sync", "colocate_async"] and not checkpoint_engine_config.backend:
-            checkpoint_engine_config.backend = "naive"
-
-        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
-        if checkpoint_manager_class_fqn:
-            CheckpointEngineManagerCls = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
-        else:
-            CheckpointEngineManagerCls = CheckpointEngineManager
-
-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManagerCls(
+        checkpoint_engine_config.backend = "naive"
+        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
@@ -544,7 +530,6 @@ class PPOTrainer(ABC):
 
             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
             self.logger.log(data=metrics, step=self.global_steps)
-
             if dapo_filtered_reward_counts:
                 self.dapo_filtered_reward_logger.log(
                     self.config.trainer.logger, dapo_filtered_reward_counts, self.global_steps
@@ -835,9 +820,7 @@ class PPOTrainer(ABC):
             or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
         )
 
-        if not getattr(self, "_enable_hybrid_replicas", True) or not config.actor_rollout_ref.get(
-            "hybrid_engine", True
-        ):
+        if not getattr(self, "_enable_hybrid_replicas", True):
             role = Role.Actor
         else:
             role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor else Role.ActorRollout
@@ -1934,20 +1917,12 @@ class PPOTrainer(ABC):
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
-        min_steps_list = [
-            tag.get("min_global_steps", 0) if isinstance(tag, dict) and tag.get("min_global_steps") is not None else 0
-            for tag in (batch.tags or [])
+        min_global_steps = np.array([(tag.get("min_global_steps") or 0) for tag in batch.tags], dtype=int)[
+            non_padding_mask
         ]
-        max_steps_list = [
-            tag.get("max_global_steps", 0) if isinstance(tag, dict) and tag.get("max_global_steps") is not None else 0
-            for tag in (batch.tags or [])
+        max_global_steps = np.array([(tag.get("max_global_steps") or 0) for tag in batch.tags], dtype=int)[
+            non_padding_mask
         ]
-        if len(min_steps_list) == 0:
-            min_steps_list = [0] * len(non_padding_mask)
-        if len(max_steps_list) == 0:
-            max_steps_list = [0] * len(non_padding_mask)
-        min_global_steps = np.array(min_steps_list, dtype=int)[non_padding_mask]
-        max_global_steps = np.array(max_steps_list, dtype=int)[non_padding_mask]
 
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None

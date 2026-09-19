@@ -66,7 +66,6 @@ def patch_tpu_rotary_emb():
         from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
         if getattr(ApplyRotaryEmb, "_verl_tpu_rotary_patched", False):
-            print("[ROPEPATCH] already patched", flush=True)
             return
 
         def patched_forward_static(
@@ -101,10 +100,8 @@ def patch_tpu_rotary_emb():
         rotary_common.rotate_neox = _tpu_rotate_neox
         ApplyRotaryEmb._verl_tpu_rotary_patched = True
         logger.info("Successfully applied TPU concat-free RoPE patch to vLLM.")
-        print(f"[ROPEPATCH] applied pid={os.getpid()}", flush=True)
     except Exception as e:
         logger.warning(f"Failed to apply TPU rotary embedding patch to vLLM: {e}")
-        print(f"[ROPEPATCH] FAILED pid={os.getpid()} err={e!r}", flush=True)
 
 
 def _tpu_runtime_present() -> bool:

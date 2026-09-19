@@ -134,9 +134,9 @@ def synchronize_tpu_loss(loss: torch.Tensor):
 def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) -> torch.Tensor:
     """Safely converts a NestedTensor to a padded dense tensor on TPU.
 
-    HACK: PyTorch TPU currently lacks native C++ kernel support for `aten::_jagged_to_padded_dense_forward`.
-    Falling back to `unbind()` + tensor slice assignment avoids operator runtime errors on TPU.
-    TODO: Remove HACK once `aten::_jagged_to_padded_dense_forward` is natively supported in torch_tpu.
+    PyTorch TPU (`torch_tpu`) currently lacks native C++ kernel support for
+    `aten::_jagged_to_padded_dense_forward`. Falling back to `unbind()` + tensor slice assignment
+    avoids operator runtime errors on TPU.
     """
     if not getattr(nt, "is_nested", False):
         return nt
@@ -156,3 +156,13 @@ def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) ->
             slices = (i,) + tuple(slice(0, s) for s in t.shape)
             out[slices] = t
         return out
+
+
+def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:
+    """Selects fields from a TensorDict and converts NestedTensors to padded dense tensors on TPU."""
+    padded_dict = {}
+    for k in fields:
+        if k in data.keys():
+            val = data[k]
+            padded_dict[k] = safe_to_padded_tensor(val) if getattr(val, "is_nested", False) else val
+    return TensorDict(padded_dict, batch_size=data.batch_size)

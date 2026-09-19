@@ -111,11 +111,6 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 )
             self._init_hybrid_rollout_state()
 
-    @property
-    def use_hybrid_engine(self) -> bool:
-        """Returns True if the hybrid engine (colocated trainer and rollout) is enabled."""
-        return self._enable_hybrid_replicas
-
     def _init_resource_pool_mgr(self):
         super()._init_resource_pool_mgr()
         # Replace ActorRolloutRefWorker with DetachActorWorker to get CPU save/restore
@@ -170,9 +165,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         from verl.plugin.platform import get_platform
 
-        if get_platform().device_name == "tpu" or self.config.trainer.device == "tpu":
-            if not checkpoint_engine_config.backend or checkpoint_engine_config.backend == "naive":
-                checkpoint_engine_config.backend = "tpu"
+        if get_platform().device_name == "tpu" and checkpoint_engine_config.backend in (None, "", "naive"):
+            checkpoint_engine_config.backend = "tpu"
 
         self.standalone_checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
@@ -192,6 +186,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             logger.info(
                 "[V1SepAsync] hybrid replicas disabled (actor_rollout_ref.hybrid_engine=False): "
                 f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only",
+                flush=True,
             )
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
@@ -206,7 +201,7 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         """
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-        if not self.use_hybrid_engine or bypass_recomputing_logprobs:
+        if not self._enable_hybrid_replicas or bypass_recomputing_logprobs:
             return super()._compute_old_log_prob(batch, metrics)
 
         if self.local_trigger_step == 0:

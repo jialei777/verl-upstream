@@ -172,6 +172,23 @@ class TorchTitanEngine(BaseEngine):
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
+        if device_name == "tpu" and self.engine_config.tensor_parallel_size > 1:
+            # Tensor parallelism is not properly tested on TPU. With
+            # tensor_parallel_degree > 1 torchtitan routes the model through
+            # ``model.parallelize()``, which makes the logits a DTensor that has
+            # to be reassembled with ``full_tensor()`` before the loss. That
+            # backward path intermittently poisons the gradients with nan/inf
+            # (observed as a single non-finite element in the tok_embeddings
+            # shard). ``optimizer_step`` skips the update whenever grad_norm is
+            # not finite, so the run still reports success while the policy
+            # never trains. Use pure FSDP (tensor_parallel_size=1) instead.
+            logger.warning(
+                "tensor_parallel_size=%d is not supported on TPU: it produces non-finite "
+                "gradients, which optimizer_step() silently skips, so the policy will not "
+                "train. Set tensor_parallel_size=1 and use data_parallel_shard_size instead.",
+                self.engine_config.tensor_parallel_size,
+            )
+
         parallelism = ParallelismConfig(
             data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
             data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
@@ -456,17 +473,23 @@ class TorchTitanEngine(BaseEngine):
 
     def optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
+        # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
+        # it returns inf even when every gradient is exactly zero. Since a non-finite
+        # grad_norm makes this method skip the update entirely, that silently froze the
+        # policy while the job still reported success. Use the per-tensor path there.
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.module for p in m.parameters()],
             self.config.training.max_norm,
-            foreach=True,
+            foreach=get_device_name() != "tpu",
             pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             ep_enabled=self.parallel_dims.ep_enabled,
         )
 
-        # if grad_norm is not finite, skip the update
+        # If grad_norm is not finite the update is thrown away. This is silent by design,
+        # so say it loudly: a run where this fires on every step reports success while the
+        # policy never changes.
         if not torch.isfinite(grad_norm):
-            logger.warning(f"grad_norm is not finite: {grad_norm}")
+            logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()

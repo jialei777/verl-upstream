@@ -19,6 +19,13 @@
 #                                      was cut off before emitting the `#### <answer>`
 #                                      line and scored zero regardless of correctness.
 #   total_training_steps   5  -> 100   Enough steps for the reward curve to move.
+#
+# Parallelism: the actor runs pure FSDP (tensor_parallel_size=1,
+# data_parallel_shard_size=8). Do not re-enable tensor parallelism without re-testing.
+# Under tensor_parallel_size=2 the actor produced non-finite gradients on most steps, and
+# because optimizer_step() silently skips the update when grad_norm is not finite, the job
+# still reported SUCCEEDED while the policy never changed. The same smoke config gives
+# grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and inf / 8.3e37 / 3.8e24 at tp=2.
 
 set -xeuo pipefail
 
@@ -84,6 +91,24 @@ TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 MAX_PROMPT_LEN=512
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 
+# Actor parallelism. Pure FSDP is the only configuration that has been validated
+# on TPU; see the note at the top of this file before changing these.
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-8}"
+
+if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
+    set +x
+    echo "=============================================================================" >&2
+    echo "WARNING: tensor_parallel_size=${TENSOR_PARALLEL_SIZE} is NOT supported on TPU." >&2
+    echo "  Tensor parallelism has not been properly tested with this stack and is known" >&2
+    echo "  to produce non-finite (nan/inf) actor gradients. Because optimizer_step()" >&2
+    echo "  skips the update whenever grad_norm is not finite, the job will still report" >&2
+    echo "  SUCCEEDED while the policy silently never trains." >&2
+    echo "  Use TENSOR_PARALLEL_SIZE=1 with DATA_PARALLEL_SHARD_SIZE=<num actor chips>." >&2
+    echo "=============================================================================" >&2
+    set -x
+fi
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -122,8 +147,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.actor.torchtitan.tensor_parallel_size=2 \
-    actor_rollout_ref.actor.torchtitan.data_parallel_shard_size=4 \
+    actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
+    actor_rollout_ref.actor.torchtitan.data_parallel_shard_size="${DATA_PARALLEL_SHARD_SIZE}" \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.rollout.name=vllm \
