@@ -165,10 +165,7 @@ class RolloutReplica(ABC):
             resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
         """
         self.rollout_mode = RolloutMode.COLOCATED
-        # On TPU platforms, disable GPU resource allocation for colocated rollout workers
-        use_gpu = self.rollout_worker_use_gpu()
-        if get_resource_name() == "TPU":
-            use_gpu = False
+        self.resource_pool = resource_pool
 
         if self.is_reward_model:
             name_prefix = f"rollout_reward_colocate_{self.replica_rank}{self.name_suffix}"
@@ -182,7 +179,7 @@ class RolloutReplica(ABC):
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=use_gpu,
+            use_gpu=self.rollout_worker_use_gpu(),
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -216,15 +213,12 @@ class RolloutReplica(ABC):
             name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
         else:
             name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
-        from verl.plugin.platform import get_platform
-
-        use_gpu = get_platform().device_name != "tpu"
         worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=use_gpu,
+            use_gpu=self.rollout_worker_use_gpu(),
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -265,7 +259,7 @@ class RolloutReplica(ABC):
         return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
 
     def rollout_worker_use_gpu(self) -> bool:
-        return True
+        return get_resource_name() != "TPU"
 
     async def wake_up(self):
         """Wake up each rollout server."""
