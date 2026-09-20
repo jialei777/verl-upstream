@@ -58,6 +58,7 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     compute_global_batch_num_tokens,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
+    safe_to_padded_tensor,
     synchronize_tpu_loss,
     unwrap_metadata,
     vocab_parallel_logprobs_from_logits,
@@ -815,23 +816,24 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             if get_device_name() == "tpu":
                 max_seq_len = bucket_length(max_seq_len)
 
+            to_padded_fn = safe_to_padded_tensor if get_device_name() == "tpu" else torch.nested.to_padded_tensor
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
-            input_ids = torch.nested.to_padded_tensor(
+            input_ids = to_padded_fn(
                 input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
             )
 
             if position_ids.dim() == 3:
-                position_ids = torch.nested.to_padded_tensor(
+                position_ids = to_padded_fn(
                     position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
                 ).transpose(0, 1)
             else:
-                position_ids = torch.nested.to_padded_tensor(
+                position_ids = to_padded_fn(
                     position_ids, padding=0, output_size=(batch_size, max_seq_len)
                 )
 
             attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
             attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-            attention_mask = torch.nested.to_padded_tensor(
+            attention_mask = to_padded_fn(
                 attention_mask, padding=0, output_size=(batch_size, max_seq_len)
             )
 
