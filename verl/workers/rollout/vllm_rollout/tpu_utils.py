@@ -36,9 +36,40 @@ from verl.utils.device import get_resource_name
 TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
 TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
 TPU_ROLLOUT_BASE_PORT = 8070
-TPU_HOST_BOUNDS_VAL = "2,4,1"
-TPU_CHIPS_PER_HOST_BOUNDS_VAL = "1,1,1"
-CHIPS_PER_HOST_VAL = "4"
+DEFAULT_TPU_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
+    4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
+}
+
+
+def _resolve_tpu_topology_bounds(
+    total_chips: int, num_nodes: int, fallback_map: dict | None = None
+) -> tuple[str, str, str, str]:
+    """Dynamically resolves (topology, host_bounds, chips_per_host_bounds, chips_per_host) for TPU slices."""
+    topo_map = dict(fallback_map) if fallback_map else {}
+    topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
+
+    topology = os.environ.get("TORCH_TPU_TOPOLOGY") or topo_map.get(total_chips, "1,1,1")
+    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+    chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+    if total_chips <= 4:
+        host_bounds = "1,1,1"
+        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+    else:
+        host_bounds = topology
+        chips_per_host_bounds = "1,1,1"
+
+    return topology, host_bounds, chips_per_host_bounds, chips_per_host
+
+
 # -------------------------------------------
 
 try:
@@ -508,8 +539,7 @@ def patch_vllm_for_tpu() -> None:
             getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", None),
         )
         if _topo_map is not None:
-            _topo_map[4] = "2,2,1"
-            _topo_map[8] = "2,4,1"
+            _topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -840,26 +870,11 @@ def patch_vllm_for_tpu() -> None:
             logger.info(f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {sb_addresses_str}")
 
             total_chips = len(self.workers)
-            if total_chips == 32:
-                topology = "4,8,1"
-                host_bounds = "4,8,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 8:
-                topology = "2,4,1"
-                host_bounds = "2,4,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 4:
-                topology = "2,2,1"
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "2,2,1" if num_nodes == 1 else "1,1,1"
-                chips_per_host = "4"
-            else:
-                topology = TPU_TOPOLOGY_MAP_local.get(total_chips, "1,1,1")
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
+            topology, host_bounds, chips_per_host_bounds, chips_per_host = _resolve_tpu_topology_bounds(
+                total_chips=total_chips,
+                num_nodes=num_nodes,
+                fallback_map=TPU_TOPOLOGY_MAP_local,
+            )
 
             rank_0_node_id = unique_node_ids[0]
             rank_0_worker_index = node_workers[rank_0_node_id][0]
