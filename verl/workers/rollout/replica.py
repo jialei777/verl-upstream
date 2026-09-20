@@ -165,7 +165,10 @@ class RolloutReplica(ABC):
             resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
         """
         self.rollout_mode = RolloutMode.COLOCATED
-        self.resource_pool = resource_pool
+        # On TPU platforms, disable GPU resource allocation for colocated rollout workers
+        use_gpu = self.rollout_worker_use_gpu()
+        if get_resource_name() == "TPU":
+            use_gpu = False
 
         if self.is_reward_model:
             name_prefix = f"rollout_reward_colocate_{self.replica_rank}{self.name_suffix}"
@@ -179,7 +182,7 @@ class RolloutReplica(ABC):
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=self.rollout_worker_use_gpu(),
+            use_gpu=use_gpu,
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -213,12 +216,15 @@ class RolloutReplica(ABC):
             name_prefix = f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
         else:
             name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
+        from verl.plugin.platform import get_platform
+
+        use_gpu = get_platform().device_name != "tpu"
         worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool,
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=name_prefix,
-            use_gpu=self.rollout_worker_use_gpu(),
+            use_gpu=use_gpu,
             device_name=get_device_name(),
         )
         self.workers = worker_group.workers
@@ -259,7 +265,7 @@ class RolloutReplica(ABC):
         return max(1000, self.config.max_num_seqs + CONTROL_METHOD_CONCURRENCY)
 
     def rollout_worker_use_gpu(self) -> bool:
-        return get_resource_name() != "TPU"
+        return True
 
     async def wake_up(self):
         """Wake up each rollout server."""
@@ -269,19 +275,9 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self, reject_request: bool = False):
-        """Partial rollout: abort and save all unfinished requests in each rollout server.
-
-        Args:
-            reject_request: Fail requests that arrive while generation is blocked instead
-                of holding them until the next resume_generation(). Pass True when the
-                replica is leaving the load balancer and no resume is coming soon.
-                Backends that cannot intercept their own admission path log a warning
-                and ignore it.
-        """
-        await asyncio.gather(
-            *[server.abort_all_requests.remote(reject_request=reject_request) for server in self.servers]
-        )
+    async def abort_all_requests(self):
+        """Partial rollout: abort and save all unfinished requests in each rollout server."""
+        await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
 
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""

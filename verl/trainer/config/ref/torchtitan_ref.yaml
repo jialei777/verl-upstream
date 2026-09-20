@@ -25,5 +25,4 @@ torchtitan:
   pipeline_parallel_size: ${oc.select:actor_rollout_ref.actor.torchtitan.pipeline_parallel_size,1}
   context_parallel_size: ${oc.select:actor_rollout_ref.actor.torchtitan.context_parallel_size,1}
   attn_type: ${oc.select:actor_rollout_ref.actor.torchtitan.attn_type,flex}
-  use_torch_compile: ${oc.select:actor_rollout_ref.actor.torchtitan.use_torch_compile,True}
   forward_only: True

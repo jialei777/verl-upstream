@@ -312,7 +312,7 @@ def patch_vllm_for_tpu() -> None:
                             try:
                                 old_step_str = parts[2].split(".")[0]
                                 old_step = int(old_step_str)
-                                if old_step != step_key:
+                                if old_step < step_key:
                                     old_path = os.path.join(shm_dir, file_name)
                                     os.remove(old_path)
                             except ValueError:
@@ -345,7 +345,7 @@ def patch_vllm_for_tpu() -> None:
                 return 0
 
             if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
-                state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
+                state_dict_ref = state_dict_ref[0]   # unwrap the nesting from set_weights
             if isinstance(state_dict_ref, str):
                 state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
             elif isinstance(state_dict_ref, ray.ObjectRef):
@@ -387,8 +387,10 @@ def patch_vllm_for_tpu() -> None:
             # Stagger ranks before loading to serialize memory traffic
             time.sleep((rank_val % 4) * 0.4)
 
-            # Load memory-mapped version to share pages across ranks on the same host
+            # Now load memory-mapped version to share pages
             gc.collect()
+            # HACK: Catch FileNotFoundError/Timeout when state_dict_0.pt is absent on secondary TPU nodes, falling back to direct HF loading.
+            # TODO: remove HACK once shared memory weight cache propagation across Ray multi-node TPU VM topology is fully guaranteed.
             try:
                 state_dict_data = torch.load(shm_file_path, map_location="cpu", weights_only=False, mmap=True)
             except Exception as e:
@@ -406,6 +408,8 @@ def patch_vllm_for_tpu() -> None:
             time.sleep((rank_val % 4) * 0.4)
 
             gc.collect()
+            # HACK: Catch FileNotFoundError/Timeout when state_dict_0.pt is absent on secondary TPU nodes, falling back to direct HF loading.
+            # TODO: remove HACK once shared memory weight cache propagation across Ray multi-node TPU VM topology is fully guaranteed.
             try:
                 state_dict_data = torch.load(shm_file_path, map_location="cpu", weights_only=False, mmap=True)
             except Exception as e:
@@ -464,7 +468,6 @@ def patch_vllm_for_tpu() -> None:
         sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
 
         os.environ["VLLM_USE_V1"] = "0"
-        os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
 
         if ray_distributed_executor is None:
             return
@@ -505,12 +508,15 @@ def patch_vllm_for_tpu() -> None:
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
 
-                        logger.info("Single-host TPU rollout detected; using local executor backend.")
+                        logger.info(
+                            "[TPU HACK 16] Single-host rollout detected. "
+                            "Bypassed forcing Ray distributed executor backend."
+                        )
                         if hasattr(vllm_config, "scheduler_config") and hasattr(
                             vllm_config.scheduler_config, "async_scheduling"
                         ):
                             vllm_config.scheduler_config.async_scheduling = True
-                            logger.info("Enabled async_scheduling on TPU for single-host rollout.")
+                            logger.info("[TPU HACK 20] Enabled async_scheduling on TPU for single-host.")
                     else:
                         os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
                         if vllm_envs is not None and hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
@@ -520,12 +526,17 @@ def patch_vllm_for_tpu() -> None:
 
                         vllm_config = orig_create_engine_config(self, *args, **kwargs)
                         vllm_config.parallel_config.distributed_executor_backend = "ray"
-                        logger.info("Multi-host TPU rollout detected; using Ray distributed executor backend.")
+                        logger.info(
+                            "[TPU HACK 16] Directly forced 'ray' distributed executor backend on TPU for multi-host."
+                        )
                         if hasattr(vllm_config, "scheduler_config") and hasattr(
                             vllm_config.scheduler_config, "async_scheduling"
                         ):
                             vllm_config.scheduler_config.async_scheduling = False
-                            logger.info("Disabled async_scheduling on TPU for multi-host Ray rollout.")
+                            logger.info(
+                                "[TPU HACK 20] Disabled async_scheduling on TPU "
+                                "inside patched_create_engine_config because Ray does not support it."
+                            )
                     return vllm_config
 
                 EngineArgs.create_engine_config = patched_create_engine_config
@@ -539,19 +550,14 @@ def patch_vllm_for_tpu() -> None:
                 TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
                 TPUWorker.load_weights_from_ray_registry = load_weights_from_ray_registry
                 logger.info(
-                    "Patched TPUWorker class with dummy_reset_encoder_cache and load_weights_from_ray_registry."
+                    "[TPU HACK 13] Successfully patched TPUWorker class with "
+                    "dummy_reset_encoder_cache and load_weights_from_ray_registry."
                 )
         except Exception as e:
             logger.warning(f"Failed to patch TPUWorker class directly: {e}")
 
-        _topo_map = getattr(
-            ray_distributed_executor,
-            "TPU_TOPOLOGY_MAP",
-            getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", None),
-        )
-        if _topo_map is not None:
-            _topo_map[4] = "2,2,1"
-            _topo_map[8] = "2,4,1"
+        ray_distributed_executor.TPU_TOPOLOGY_MAP[4] = "2,2,1"
+        ray_distributed_executor.TPU_TOPOLOGY_MAP[8] = "2,4,1"
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -586,7 +592,7 @@ def patch_vllm_for_tpu() -> None:
 
             orig_init_ray_cluster = v1_ray_utils.initialize_ray_cluster
 
-            def patched_initialize_ray_cluster(parallel_config, *args, **kwargs):
+            def patched_initialize_ray_cluster(parallel_config):
                 if parallel_config.placement_group is None:
                     curr_pg = ray.util.get_current_placement_group()
                     if curr_pg is None:
@@ -630,10 +636,12 @@ def patch_vllm_for_tpu() -> None:
                                 pass
                     parallel_config.placement_group = curr_pg
                 try:
-                    return orig_init_ray_cluster(parallel_config, *args, **kwargs)
+                    return orig_init_ray_cluster(parallel_config)
                 except ValueError as e:
                     if "exceeds the total number of available" in str(e) or "placement group" in str(e):
-                        logger.warning(f"Bypassed vLLM placement group size validation on multi-node TPU: {e}")
+                        logger.warning(
+                            f"[TPU HACK] Bypassed vLLM placement group size validation on multi-node TPU: {e}"
+                        )
                         return
                     raise
 
@@ -757,14 +765,8 @@ def patch_vllm_for_tpu() -> None:
         OriginalRayWorkerWrapper.init_worker = patched_init_worker
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
-            import inspect
-
             RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
-            TPU_TOPOLOGY_MAP_local = getattr(
-                ray_distributed_executor,
-                "TPU_TOPOLOGY_MAP",
-                getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", {}),
-            )
+            TPU_TOPOLOGY_MAP_local = ray_distributed_executor.TPU_TOPOLOGY_MAP
 
             self.workers = []
             self.pp_tp_workers = []
@@ -837,10 +839,7 @@ def patch_vllm_for_tpu() -> None:
 
             worker_node_and_tpu_ids = []
             for worker in self.workers:
-                if hasattr(worker, "get_node_and_gpu_ids"):
-                    worker_node_and_tpu_ids.append(ray.get(worker.get_node_and_gpu_ids.remote()))
-                else:
-                    worker_node_and_tpu_ids.append(ray.get(worker.get_node_and_physical_gpu_ids.remote()))
+                worker_node_and_tpu_ids.append(ray.get(worker.get_node_and_gpu_ids.remote()))
 
             node_workers = defaultdict(list)
             node_tpus = defaultdict(list)
@@ -919,7 +918,6 @@ def patch_vllm_for_tpu() -> None:
                     "MASTER_PORT": master_port,
                     "TORCH_TPU_TOPOLOGY": topology,
                     "LOCAL_WORLD_SIZE": str(len(node_tpus[node_id])),
-                    "TPU_NUM_HOSTS": str(num_nodes),
                 }
                 if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
                     os.environ["TORCH_TPU_XPROF_SESSION_ID"] = str(time.time_ns())
@@ -929,13 +927,8 @@ def patch_vllm_for_tpu() -> None:
 
             env_vars_to_copy_list = []
             if get_env_vars_to_copy is not None:
-                exclude_vars = getattr(self, "WORKER_SPECIFIC_ENV_VARS", None)
-                if exclude_vars is None:
-                    from vllm.v1.executor import ray_utils as _ray_utils
-
-                    exclude_vars = getattr(_ray_utils, "WORKER_SPECIFIC_ENV_VARS", set())
                 env_vars_to_copy_list = get_env_vars_to_copy(
-                    exclude_vars=exclude_vars,
+                    exclude_vars=self.WORKER_SPECIFIC_ENV_VARS,
                     additional_vars=set(current_platform.additional_env_vars)
                     if current_platform is not None
                     else set(),
@@ -974,12 +967,12 @@ def patch_vllm_for_tpu() -> None:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
                     logger.info(
-                        f"Configured TPU worker {i} (host {host_idx}, chip {local_chip_id}) env vars: "
+                        f"[TPU HACK 11] Patched worker {i} (host {host_idx}, chip {local_chip_id}) env vars: "
                         f"TPU_VISIBLE_CHIPS={local_chip_id}, TPU_PROCESS_PORT={base_port + local_chip_id}, "
                         f"CLOUD_TPU_TASK_ID={host_idx}"
                     )
             except Exception as patch_err:
-                logger.warning(f"Failed to inject TPU worker env vars: {patch_err}")
+                logger.warning(f"Failed to inject TPU HACK 11 env vars: {patch_err}")
 
             self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
 
@@ -990,21 +983,6 @@ def patch_vllm_for_tpu() -> None:
             )
 
             driver_node_id = ray.get_runtime_context().get_node_id()
-
-            accepts_prev_worker_ip = True
-            if TPUWorker is not None:
-                try:
-                    accepts_prev_worker_ip = "prev_worker_ip" in inspect.signature(TPUWorker.__init__).parameters
-                except Exception:
-                    pass
-
-            accepts_assigned_physical_gpu_ids = False
-            try:
-                accepts_assigned_physical_gpu_ids = "assigned_physical_gpu_ids" in inspect.getsource(
-                    original_init_worker
-                )
-            except Exception:
-                pass
 
             all_kwargs = []
             for rank, (node_id, _) in enumerate(worker_node_and_tpu_ids):
@@ -1031,11 +1009,8 @@ def patch_vllm_for_tpu() -> None:
                     is_driver_worker=(not self.parallel_config)
                     or (rank % self.parallel_config.tensor_parallel_size == 0),
                     ip=ip,
+                    prev_worker_ip=prev_ip,
                 )
-                if accepts_prev_worker_ip:
-                    kwargs["prev_worker_ip"] = prev_ip
-                if accepts_assigned_physical_gpu_ids:
-                    kwargs["assigned_physical_gpu_ids"] = sorted(node_tpus[node_id])
                 all_kwargs.append(kwargs)
             self.collective_rpc("init_worker", args=(all_kwargs,))
             self.collective_rpc("init_device")
@@ -1053,13 +1028,6 @@ def patch_vllm_for_tpu() -> None:
                         if rank < len(self.workers):
                             self.pp_tp_workers[pp_rank].append(self.workers[rank])
 
-        def _detach_zero_copy(output):
-            try:
-                from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
-            except ImportError:
-                return
-            detach_zero_copy_from_model_runner_output(output)
-
         def patched_execute_dag(
             self,
             scheduler_output,
@@ -1070,7 +1038,6 @@ def patch_vllm_for_tpu() -> None:
             if not self.has_connector:
                 if not non_block:
                     all_results = ray.get(refs)
-                    _detach_zero_copy(all_results[0])
                     return all_results[0]
                 from vllm.v1.executor.ray_utils import FutureWrapper
 
@@ -1078,10 +1045,7 @@ def patch_vllm_for_tpu() -> None:
 
             assert self.kv_output_aggregator is not None
             if not non_block:
-                outputs = ray.get(refs)
-                for output in outputs:
-                    _detach_zero_copy(output)
-                return self.kv_output_aggregator.aggregate(outputs)
+                return self.kv_output_aggregator.aggregate(ray.get(refs))
             from vllm.v1.executor.ray_utils import FutureWrapper
 
             return FutureWrapper(refs, self.kv_output_aggregator)
@@ -1114,10 +1078,7 @@ except ImportError:
     try:
         from tpu_inference.platforms.tpu_platform import get_env_vars_to_copy
     except ImportError:
-        try:
-            from vllm.ray.ray_env import get_env_vars_to_copy
-        except ImportError:
-            get_env_vars_to_copy = None
+        get_env_vars_to_copy = None
 
 
 def is_tpu_vllm_run() -> bool:
@@ -1214,7 +1175,7 @@ async def get_tpu_server_launch_config(workers):
 
 
 # =============================================================================
-# Preflight census of leaked vLLM engine processes.
+# [TPU HACK 25] Preflight census of leaked vLLM engine processes.
 #
 # Every rollout engine that shuts down leaves processes in state Z, reparented
 # to PID 1, one of them VLLM::EngineCore. Nothing reaps them, so the count grows
@@ -1327,11 +1288,15 @@ async def report_stale_tpu_engines(workers) -> None:
     try:
         limit = int(raw_limit)
     except ValueError:
-        _tpu_preflight_log(f"ignoring malformed VERL_TPU_MAX_STALE_ENGINES={raw_limit!r}, staying report-only")
+        _tpu_preflight_log(
+            f"ignoring malformed VERL_TPU_MAX_STALE_ENGINES={raw_limit!r}, staying report-only"
+        )
         limit = -1
 
     try:
-        per_actor = await asyncio.gather(*[worker.__ray_call__.remote(probe_stale_tpu_engines) for worker in workers])
+        per_actor = await asyncio.gather(
+            *[worker.__ray_call__.remote(probe_stale_tpu_engines) for worker in workers]
+        )
     except Exception as probe_err:
         # The census is a diagnostic aid; never let it be the thing that breaks
         # a run that would otherwise have worked.
@@ -1360,7 +1325,7 @@ async def report_stale_tpu_engines(workers) -> None:
         return
 
     raise RuntimeError(
-        f"[TPU preflight] {len(over)}/{len(by_host)} TPU host(s) exceed "
+        f"[TPU HACK 25] {len(over)}/{len(by_host)} TPU host(s) exceed "
         f"VERL_TPU_MAX_STALE_ENGINES={limit}: {', '.join(over)}. Leaked engine processes "
         "accumulate for the lifetime of the pod and are never reaped. Past some point the "
         "host stops handing out TPU devices and vLLM engine init dies with 'local device "
@@ -1370,8 +1335,19 @@ async def report_stale_tpu_engines(workers) -> None:
     )
 
 
-def _tpu_preflight_log(message: str, tag: str = "TPU preflight") -> None:
-    """Emit a preflight message via both logging and stdout."""
+def _tpu_preflight_log(message: str, tag: str = "TPU HACK 25") -> None:
+    """Emit a preflight message via both logging and stdout.
+
+    verl's ``logger`` output is swallowed inside some rollout actors, so the
+    ``print`` is what actually reaches the driver log where we need to read it.
+
+    Args:
+        message: The text to emit.
+        tag: Bracketed prefix identifying the caller. This is a parameter because
+            the helper is shared -- [TPU HACK 26] also uses it, and when the tag
+            was hardcoded its messages came out labelled "[TPU HACK 25]
+            [TPU HACK 26] ...", which misattributes them to this check.
+    """
     logging.getLogger(__name__).warning("[%s] %s", tag, message)
     print(f"[{tag}] {message}", flush=True)
 
@@ -1384,7 +1360,6 @@ def prepare_tpu_server_args(args: dict):
     args["enable_sleep_mode"] = False
     args["distributed_executor_backend"] = "external_launcher"
     os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
-    os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     try:
         try:
@@ -1397,96 +1372,3 @@ def prepare_tpu_server_args(args: dict):
             tpu_envs.__getattr__.cache_clear()
     except Exception as env_err:
         logging.getLogger(__name__).warning(f"Failed to force TPU_MULTIHOST_BACKEND to ray: {env_err}")
-
-
-async def launch_tpu_vllm_servers(replica) -> None:
-    """Launch vLLM rollout server actor for a TPU replica (`vLLMReplica`)."""
-    from verl.plugin.platform import get_platform
-    from verl.utils.net_utils import is_valid_ipv6_address
-
-    if replica.config.data_parallel_size > 1:
-        raise NotImplementedError(
-            "actor_rollout_ref.rollout.data_parallel_size="
-            f"{replica.config.data_parallel_size} is not supported on TPU. The TPU "
-            "distributed runtime requires each compiled program to span the whole "
-            "TPU mesh, but a single DP group only spans "
-            f"tensor_model_parallel_size={replica.config.tensor_model_parallel_size} "
-            "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
-            "then creates one rollout replica per tensor_model_parallel_size chips, "
-            "which is equivalent to engine-internal data parallelism."
-        )
-
-    await report_stale_tpu_engines(replica.workers)
-
-    node_id, visible_chips, tpu_env_vars = await get_tpu_server_launch_config(replica.workers)
-
-    prefix = replica._get_server_name_prefix() if hasattr(replica, "_get_server_name_prefix") else "vllm_"
-    if replica.is_reward_model:
-        name = f"{prefix}server_reward_{replica.replica_rank}_0{replica.name_suffix}"
-    elif replica.is_teacher_model:
-        name = f"{prefix}server_teacher_{replica.replica_rank}_0{replica.name_suffix}"
-    else:
-        name = f"{prefix}server_{replica.replica_rank}_0{replica.name_suffix}"
-
-    platform_env_vars = get_platform().rollout_env_vars()
-    env_vars = {
-        **{var: "1" for var in get_platform().ray_noset_envvars()},
-        **platform_env_vars,
-        **tpu_env_vars,
-    }
-    if "VERL_PLATFORM" in os.environ:
-        env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-
-    flags_to_copy = set()
-    for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
-        base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
-        extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")
-        resolved = " ".join(v for v in (base_value, extra_value) if v)
-        _tpu_preflight_log(
-            f"{flag_var}: base={base_value!r} extra={extra_value!r} -> engine={resolved or None!r}",
-            tag="TPU env",
-        )
-        if resolved:
-            env_vars[flag_var] = resolved
-            flags_to_copy.add(flag_var)
-
-    if flags_to_copy:
-        copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
-        existing = env_vars.get(copy_var) or os.environ.get(copy_var) or ""
-        names = {tok.strip() for tok in existing.split(",") if tok.strip()}
-        env_vars[copy_var] = ",".join(sorted(names | flags_to_copy))
-        _tpu_preflight_log(f"{copy_var}={env_vars[copy_var]}", tag="TPU env")
-
-    server = replica.server_class.options(
-        scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-            node_id=node_id,
-            soft=False,
-        ),
-        runtime_env={"env_vars": env_vars},
-        name=name,
-        max_concurrency=replica.max_concurrency,
-    ).remote(
-        config=replica.config,
-        model_config=replica.model_config,
-        rollout_mode=replica.rollout_mode,
-        workers=replica.workers,
-        replica_rank=replica.replica_rank,
-        node_rank=0,
-        gpus_per_node=replica.gpus_per_replica_node,
-        nnodes=replica.nnodes,
-        cuda_visible_devices=visible_chips,
-    )
-    replica.servers.append(server)
-
-    master_address, master_port, dp_rpc_port = await replica.servers[0].get_master_address.remote()
-    await replica.servers[0].launch_server.remote(
-        master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
-    )
-
-    server_address, server_port = await replica.servers[0].get_server_address.remote()
-    replica._server_handle = replica.servers[0]
-    replica._server_address = (
-        f"[{server_address}]:{server_port}"
-        if is_valid_ipv6_address(server_address)
-        else f"{server_address}:{server_port}"
-    )

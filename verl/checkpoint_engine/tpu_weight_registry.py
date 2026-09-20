@@ -49,3 +49,4 @@ class TPUWeightRegistry:
     def clear(self):
         """Drops every cached entry. Used to reset state left by a previous job."""
         self.weights.clear()
+

@@ -270,3 +270,4 @@ class PlatformBase(abc.ABC):
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Return kwargs to pass to ray.init() for this platform."""
         return {}
+

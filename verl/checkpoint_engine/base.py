@@ -52,12 +52,6 @@ class CheckpointEngineRegistry:
 
     _registry: dict[str, type["CheckpointEngine"]] = {}
 
-    # Engine modules whose import failed, keyed by module name. Each engine pulls
-    # its own transport dependency (cupy for nccl/nixl, nixl, torch_npu for hccl,
-    # ...) and `verl.checkpoint_engine` imports them all optionally, so a missing
-    # dependency would otherwise only show up as an unregistered backend.
-    _import_errors: dict[str, ImportError] = {}
-
     def register(backend: str):
         """Register a checkpoint engine.
 
@@ -72,16 +66,6 @@ class CheckpointEngineRegistry:
         return wrapper
 
     @classmethod
-    def record_import_error(cls, module: str, error: ImportError):
-        """Record an engine module that could not be imported.
-
-        Args:
-            module: The name of the checkpoint engine module.
-            error: The import error raised by the module.
-        """
-        cls._import_errors[module] = error
-
-    @classmethod
     def get(cls, backend: str) -> type["CheckpointEngine"]:
         """Get the checkpoint engine class.
 
@@ -91,12 +75,6 @@ class CheckpointEngineRegistry:
         Returns:
             The checkpoint engine class.
         """
-        if backend not in cls._registry:
-            message = f"Checkpoint engine {backend} not registered, registered backends: {sorted(cls._registry)}"
-            if cls._import_errors:
-                unavailable = ", ".join(f"{module}: {error}" for module, error in sorted(cls._import_errors.items()))
-                message += f". Engine modules that failed to import: {unavailable}"
-            raise ValueError(message)
         return cls._registry[backend]
 
     @classmethod
@@ -111,7 +89,9 @@ class CheckpointEngineRegistry:
         Returns:
             A new checkpoint engine instance.
         """
-        return cls.get(backend)(*args, **kwargs)
+        if backend not in cls._registry:
+            raise ValueError(f"Checkpoint engine {backend} not registered")
+        return cls._registry[backend](*args, **kwargs)
 
 
 class CheckpointEngine(ABC):
@@ -130,8 +110,7 @@ class CheckpointEngine(ABC):
 
     # How receive_weights yields weights to the server adapter:
     #   "named_tensors" -- (name, tensor) pairs, bucketed into full-tensor loads.
-    #   "delta_flush"   -- (named_tensors, is_last) flushes; the seed may be dense,
-    #                       while steady updates carry sparse patches.
+    #   "delta_flush"   -- per-flush sparse payloads applied via a custom loader.
     wire_format = "named_tensors"
 
     @abstractmethod
@@ -333,10 +312,12 @@ class CheckpointEngineWorker(Worker):
             return
 
         backend = self.rollout_config.checkpoint_engine.backend
-        if backend == "delta_sharded" and self.rollout_config.name not in {"sglang", "vllm"}:
+        if backend == "delta_sharded" and self.rollout_config.name != "sglang":
             raise NotImplementedError(
-                f"checkpoint_engine.backend={backend!r} has no delta weight consumer for "
-                f"rollout.name={self.rollout_config.name!r}; use sglang or vllm"
+                f"checkpoint_engine.backend={backend!r} currently supports only the sglang rollout "
+                f"(got rollout.name={self.rollout_config.name!r}): the sparse apply is dispatched "
+                "through sglang's custom-weight-loader hook. Other backends need a per-backend "
+                "apply interface, planned as a follow-up."
             )
         bucket_size = self.rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
         engine_kwargs = self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
@@ -491,14 +472,9 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
     @auto_await
-    async def abort_replicas(self, reject_request: bool = False):
-        """Abort all in-flight requests on every replica.
-
-        Args:
-            reject_request: Fail requests arriving behind the closed gate instead of
-                parking them, for replicas that will not resume generation soon.
-        """
-        await asyncio.gather(*[r.abort_all_requests(reject_request=reject_request) for r in self.replicas])
+    async def abort_replicas(self):
+        """Abort all in-flight requests on every replica."""
+        await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
 
     @auto_await
     async def resume_generation_replicas(self):
@@ -585,8 +561,8 @@ class CheckpointEngineManager:
 
 
 async def split_weight_chunks(
-    weights: Generator[tuple[str, torch.Tensor], None, None], bucket_size: int, meta_only: bool = False
-) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor | None], None]:
+    weights: Generator[tuple[str, torch.Tensor], None, None], bucket_size: int
+) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:
     """Split the weight into chunks.
 
     Args:
@@ -609,7 +585,7 @@ async def split_weight_chunks(
                 chunk_size=chunk_size,
                 offset=None,
             )
-            yield (tensor_meta, None if meta_only else buffer[chunk_offset : chunk_offset + chunk_size])
+            yield (tensor_meta, buffer[chunk_offset : chunk_offset + chunk_size])
             chunk_offset += chunk_size
 
 

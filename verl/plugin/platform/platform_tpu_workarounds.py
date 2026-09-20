@@ -20,6 +20,7 @@ import ray
 import ray._private.worker
 import torch
 
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -72,10 +73,11 @@ def patch_ray_worker():
             try:
                 return original_func(self, resource_name, resource_regex)
             except IndexError as e:
-                logger.debug(
-                    "Intercepted Ray accelerator lookup IndexError for resource '%s': %s",
-                    resource_name,
-                    e,
+                import traceback
+
+                print(
+                    f"[patch_ray_worker] Intercepted Ray accelerator lookup IndexError for resource '{resource_name}': {e}\n"
+                    f"{traceback.format_exc()}"
                 )
                 return []
 
@@ -103,6 +105,7 @@ def aggregate_sft_metrics_tpu(metrics):
                         aggregated_metrics[k] = torch.mean(vals_tensor).item()
                     except Exception:
                         aggregated_metrics[k] = vals[0]
+        return aggregated_metrics
     elif isinstance(metrics, dict):
         aggregated_metrics = {}
         for k, v in metrics.items():
@@ -116,12 +119,9 @@ def aggregate_sft_metrics_tpu(metrics):
                         aggregated_metrics[k] = v
             else:
                 aggregated_metrics[k] = v
+        return aggregated_metrics
     else:
         raise TypeError(f"Unexpected metrics structure type: {type(metrics)}")
-
-    for default_key in ("grad_norm", "lr", "mfu"):
-        aggregated_metrics.setdefault(default_key, 0.0)
-    return aggregated_metrics
 
 
 def extract_validation_loss(metrics) -> float:
