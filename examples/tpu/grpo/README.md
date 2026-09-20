@@ -52,7 +52,6 @@ ray job submit --address "${RAY_ADDRESS}" \
       "PYTHONPATH": ".",
       "PYTHONUNBUFFERED": "1",
       "VERL_PLATFORM": "tpu",
-      "VLLM_USE_V1": "0",
       "RAY_memory_monitor_refresh_ms": "0",
       "RAY_memory_usage_threshold": "0.99",
       "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",

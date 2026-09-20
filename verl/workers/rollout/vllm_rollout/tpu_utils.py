@@ -29,6 +29,8 @@ from typing import Any
 import numpy as np
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
+from vllm.v1.executor.ray_executor import RayWorkerMetaData
 
 from verl.utils.device import get_resource_name
 
@@ -77,45 +79,6 @@ try:
     from vllm_torchtpu.worker.tpu_worker import TPUWorker
 except ImportError:
     TPUWorker = None
-
-try:
-    from vllm.utils import get_ip
-except ImportError:
-    try:
-        from vllm.utils.network_utils import get_ip
-    except ImportError:
-        get_ip = None
-
-try:
-    from vllm.v1.executor.ray_executor import RayWorkerMetaData
-except ImportError:
-    try:
-        from vllm.v1.executor.ray_utils import RayWorkerMetaData
-    except ImportError:
-
-        class RayWorkerMetaData:
-            def __init__(self, worker, created_rank):
-                self.worker = worker
-                self.created_rank = created_rank
-                self.adjusted_rank = None
-                self.ip = None
-
-
-try:
-    from vllm.utils import get_open_port
-except ImportError:
-    try:
-        from vllm_torchtpu.utils import get_open_port
-    except ImportError:
-        try:
-            from vllm.utils.network_utils import get_open_port
-        except ImportError:
-            get_open_port = None
-
-try:
-    from vllm.utils.network_utils import get_distributed_init_method
-except ImportError:
-    get_distributed_init_method = None
 
 try:
     from vllm.platforms import current_platform
@@ -791,7 +754,7 @@ def patch_vllm_for_tpu() -> None:
                         bundle_indices.append(bundle_id)
 
             worker_metadata = []
-            driver_ip = get_ip() if get_ip is not None else ""
+            driver_ip = get_ip()
             num_tpu_per_worker = 1.0
             for rank, bundle_id in enumerate(bundle_indices):
                 scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -808,9 +771,7 @@ def patch_vllm_for_tpu() -> None:
                     scheduling_strategy=scheduling_strategy,
                     **ray_remote_kwargs,
                 )(RayWorkerWrapper_local).remote(rpc_rank=rank)
-                worker_metadata.append(
-                    RayWorkerMetaData(worker=worker, created_rank=rank) if RayWorkerMetaData is not None else None
-                )
+                worker_metadata.append(RayWorkerMetaData(worker=worker, created_rank=rank))
 
             worker_ips = ray.get([each.worker.get_node_ip.remote() for each in worker_metadata])
 
@@ -905,7 +866,7 @@ def patch_vllm_for_tpu() -> None:
             rank_0_node_id = unique_node_ids[0]
             rank_0_worker_index = node_workers[rank_0_node_id][0]
             master_addr = sorted_worker_metadata[rank_0_worker_index].ip
-            master_port = str(get_open_port()) if get_open_port is not None else ""
+            master_port = str(get_open_port())
 
             all_args_to_update_environment_variables = []
             for i in range(total_chips):
@@ -968,11 +929,7 @@ def patch_vllm_for_tpu() -> None:
 
             self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
 
-            distributed_init_method = (
-                get_distributed_init_method(driver_ip, get_open_port())
-                if get_distributed_init_method is not None
-                else ""
-            )
+            distributed_init_method = get_distributed_init_method(driver_ip, get_open_port())
 
             driver_node_id = ray.get_runtime_context().get_node_id()
 

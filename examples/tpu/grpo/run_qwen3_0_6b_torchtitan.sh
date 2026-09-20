@@ -6,7 +6,6 @@ set -xeuo pipefail
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
-export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
