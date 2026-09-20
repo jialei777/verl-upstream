@@ -1,31 +1,6 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
+# GRPO | Qwen3-4B | GSM8K | TorchTitan Training (Full FSDP) & vLLM Rollout | TPU v6e-8 x2 Slices
 # V1 PPOTrainer (Separate Async Overlap)
-#
-# By default this runs a realistic 100-step GRPO job whose reward curve actually
-# moves. Set SMOKE_TEST=1 for the 5-step configuration used to validate that the
-# stack comes up (it trains nothing useful).
-#
-# The settings that separate the two modes, and why they matter:
-#
-#   rollout.n              2  -> 8     GRPO estimates the advantage as the spread of
-#                                      rewards *within* a group of samples for the same
-#                                      prompt. With n=2 the group is almost always all-
-#                                      correct or all-wrong, the advantage collapses to
-#                                      zero and no gradient flows.
-#   train_batch_size       4  -> 32    4 prompts/step is far too noisy to show a trend.
-#   max_response_length  512  -> 1024  At 512 the smoke test truncated 87.5% of responses
-#                                      (`response_length/clip_ratio: 0.875`), so the model
-#                                      was cut off before emitting the `#### <answer>`
-#                                      line and scored zero regardless of correctness.
-#   total_training_steps   5  -> 100   Enough steps for the reward curve to move.
-#
-# Parallelism: the actor runs pure FSDP (tensor_parallel_size=1,
-# data_parallel_shard_size=8). Do not re-enable tensor parallelism without re-testing.
-# Under tensor_parallel_size=2 the actor produced non-finite gradients on most steps, and
-# because optimizer_step() silently skips the update when grad_norm is not finite, the job
-# still reported SUCCEEDED while the policy never changed. The same smoke config gives
-# grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and inf / 8.3e37 / 3.8e24 at tp=2.
 
 set -xeuo pipefail
 
@@ -42,19 +17,19 @@ export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
-    exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_fast_smoke_test}"
+    exp_name="${EXPERIMENT_NAME:-qwen3_4b_fast_smoke_test}"
     TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
     VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-4}"
     VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-8}"
     PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
-    ROLLOUT_N="${ROLLOUT_N:-2}"
-    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
+    ROLLOUT_N="${ROLLOUT_N:-4}"
+    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-768}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
     TEST_FREQ="${TEST_FREQ:-2}"
     VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 else
-    exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_gsm8k}"
+    exp_name="${EXPERIMENT_NAME:-qwen3_4b_gsm8k_fsdp}"
     TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
     VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
     VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-128}"
@@ -72,7 +47,7 @@ project_name='verl_tpu_grpo'
 
 # Paths
 RAY_DATA_HOME="/data/jialei"
-MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
+MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-4B}"
 
 TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
@@ -85,17 +60,16 @@ export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
 export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
+TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 
-# Sequence budget. max_model_len must cover prompt + response, otherwise vLLM
-# silently truncates the generation and the reward is always zero.
+# Sequence budget
 MAX_PROMPT_LEN=512
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 
-TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
+# Actor parallelism (default: Full FSDP across all 8 trainer chips: tp=1, dp_shard=8)
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE))
 DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
-
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \

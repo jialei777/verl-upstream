@@ -716,9 +716,9 @@ class TorchTitanEngine(BaseEngine):
             # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
             for name, param in dense.items():
                 if isinstance(param, DTensor):
-                    yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                    yield name, param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
                 else:
-                    yield name, param
+                    yield name, param.to(torch.bfloat16, non_blocking=True)
             # One stack at a time: the gathered (num_experts, ...) tensor is the peak allocation here.
             for stack, slots in expert_stacks:
                 full = stack.to(device, non_blocking=True)
