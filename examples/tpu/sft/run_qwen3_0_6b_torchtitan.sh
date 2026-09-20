@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# TorchTitan | SFT Training | Qwen3-0.6B | TPU v6e-4 Local VM
+# SFT | Qwen3-0.6B | GSM8K-SFT | TorchTitan Engine | TPU v6e-8 Slice (GKE)
 #
 # Hardware Setup:
-#   1 Slice of TPU v6e-4 (1 physical host VM, 4 TPU chips total).
-#   
+#   Default: 1 Slice of TPU v6e-8 (2 physical host VMs, 4 TPU chips per host = 8 TPU chips total).
+#   Can also be overridden for 1 Slice of TPU v6e-4 via `NNODES_TRAINER=1 N_CHIPS_TRAINER=4`.
+#
 # Parallelism Config:
-#   TP (Tensor Parallel) = 2
-#   DP (Data Parallel / FSDP) = 2
-#   PP (Pipeline Parallel) = 1
-#   Total Chips = TP * DP * PP = 2 * 2 * 1 = 4 chips.
+#   Pure FSDP2 (TP=1, DP_SHARD=8, PP=1) is used by default on TPU.
+#   Do NOT enable tensor_parallel_size > 1 on TPU without re-testing: TorchTitan's
+#   DTensor full_tensor() backward path produces non-finite gradients at TP > 1.
 
 set -xeuo pipefail
 
@@ -16,28 +16,41 @@ export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export PYTHONUNBUFFERED=1
+export RAY_memory_monitor_refresh_ms=0
+export RAY_memory_usage_threshold=0.99
 
-# Disable XLA HLO fusion passes for stable TPU compiler execution
-export XLA_FLAGS="--xla_disable_hlo_passes=instruction-fusion,fusion-merger,multi-output-fusion,horizontal-fusion"
+# JAX/XLA Launch Barrier Configuration
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
 
 # Project and Experiment details
-project_name='GRPO_TPU_SFT'
-exp_name='SFT-Qwen3-0.6B-tpu-torchtitan-v6e4'
+project_name="${PROJECT_NAME:-verl_tpu_sft}"
+exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_gsm8k_sft_torchtitan}"
 
-# Paths (overridable via env vars; supports HuggingFace model ID or local path)
-MODEL_PATH="${MODEL_PATH:-assets/hf/Qwen3-0.6B}"
-TRAIN_FILE="${TRAIN_FILE:-gsm8k_sft/train.parquet}"
-TEST_FILE="${TEST_FILE:-gsm8k_sft/test.parquet}"
+# Paths (overridable via env vars; defaults to GKE GCS Fuse mount /data/jialei)
+RAY_DATA_HOME="${RAY_DATA_HOME:-/data/jialei}"
+MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
+TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/train.parquet}"
+TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/test.parquet}"
 
-# JAX/XLA Memory Preallocation and Launch Barrier Configuration
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536"
+# TPU Node topology configs (defaults to 1 full v6e-8 slice = 2 hosts x 4 chips)
+export NNODES_TRAINER="${NNODES_TRAINER:-2}"
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"
+TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 
-# TPU Node topology configs
-export NNODES_TRAINER=1       # 1 physical VM host
-export N_CHIPS_TRAINER=4      # 4 TPU chips per VM host
+# Parallelism: Pure FSDP across all trainer chips
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${TOTAL_TRAINER_CHIPS}}"
+
+SMOKE_TEST="${SMOKE_TEST:-0}"
+if [[ "${SMOKE_TEST}" == "1" ]]; then
+    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-8}"
+    TEST_FREQ="${TEST_FREQ:-4}"
+else
+    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-20}"
+    TEST_FREQ="${TEST_FREQ:-5}"
+fi
 
 # Launch Ray SFT Trainer
-# We use the SFT Trainer Ray entrypoint to orchestrate across TPU VMs
 python3 -m verl.trainer.sft_trainer_ray \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -62,17 +75,17 @@ python3 -m verl.trainer.sft_trainer_ray \
     optim.clip_grad=1.0 \
     optim.min_lr_factor=0.1 \
     optim.decay_type=cosine \
-    trainer.total_training_steps=8 \
-    engine.tensor_parallel_size=2 \
+    trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
+    engine.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
     engine.pipeline_parallel_size=1 \
     engine.context_parallel_size=1 \
-    engine.data_parallel_shard_size=2 \
+    engine.data_parallel_shard_size="${DATA_PARALLEL_SHARD_SIZE}" \
     engine.use_torch_compile=False \
     engine.attn_type=varlen \
     engine.max_seq_len=2048 \
-    trainer.test_freq=-1 \
+    trainer.test_freq="${TEST_FREQ}" \
     trainer.save_freq=-1 \
-    trainer.logger="['console']" \
+    trainer.logger="['console','tensorboard']" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.total_epochs=2 \

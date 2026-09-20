@@ -62,6 +62,13 @@ ray job submit --address "${RAY_ADDRESS}" \
   -- bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
 ```
 
+The script defaults to a 100-step GSM8K run. For a quick bring-up check that only
+validates that the stack comes up, prepend `SMOKE_TEST=1`:
+
+```bash
+  -- bash -c 'SMOKE_TEST=1 bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh'
+```
+
 ---
 
 ## 📊 Monitoring Progress

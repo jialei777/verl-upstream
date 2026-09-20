@@ -14,7 +14,6 @@
 
 import asyncio
 import logging
-import os
 import re
 import time
 from typing import Any, Generator
@@ -40,6 +39,14 @@ TPU_COPY_CHUNK_SIZE_PARAMETERS = 30
 # looks the same detached actor up from the rollout side.
 TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
 TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
+
+# vLLM stores q/k/v and gate/up as single fused parameters, while TorchTitan
+# exports them under their original HuggingFace names. Maps the fused parameter
+# to its source projections, in the order vLLM concatenates them.
+_FUSED_PROJECTIONS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+}
 
 # =====================================================================
 # Namespace & Formatting Utilities
@@ -72,8 +79,6 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     """Worker-side weight loader. Performs host-side CPU sharding (slicing)
     and chunked, memory-safe, JIT-partitioned PCIe copying to TPU.
     """
-    # HACK: Guard against state_dict=None when shared memory weight cache is skipped on multi-host vLLM workers.
-    # TODO: remove HACK once shared memory state dict caching is synchronized across all secondary TPU worker nodes.
     if state_dict is None:
         return 0
 
@@ -109,7 +114,20 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     return total_keys
 
 
-def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor=None, temp_tpu_tensors=None) -> int:
+def _load_single_group_on_worker(
+    vllm_model,
+    group_sd: dict,
+    rank: int,
+    executor=None,
+    temp_tpu_tensors=None,
+    skipped_keys=None,
+    written_keys=None,
+) -> int:
+    if skipped_keys is None:
+        skipped_keys = []
+    if written_keys is None:
+        written_keys = set()
+
     flat_tensors = group_sd["flat_tensors"]
     metadata = group_sd["metadata"]
 
@@ -131,7 +149,8 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
             offset += numel
         clean_metadata[dtype] = clean_items
 
-    model_sd = vllm_model.model.state_dict()
+    model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
+    module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
 
     def resolve_key(k):
         if k in model_sd:
@@ -142,6 +161,16 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
             return f"model.{k}"
         return k
 
+    def get_parent_module(target_key):
+        parent_name = target_key.rsplit(".", 1)[0] if "." in target_key else ""
+        if parent_name in module_dict:
+            return module_dict[parent_name]
+        if parent_name.startswith("model.") and parent_name[6:] in module_dict:
+            return module_dict[parent_name[6:]]
+        if f"model.{parent_name}" in module_dict:
+            return module_dict[f"model.{parent_name}"]
+        return None
+
     for dtype, flat_data in flat_tensors.items():
         items = clean_metadata.get(dtype, [])
         if not items:
@@ -149,41 +178,104 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
 
         flat_cpu = torch.from_numpy(flat_data) if not isinstance(flat_data, torch.Tensor) else flat_data
         if dtype == torch.bfloat16 and flat_cpu.dtype == torch.int16:
-            # COMMENT: On TPU CPU builds (e.g. torch_tpu), converting torch.bfloat16 to numpy raises a TypeError.
-            # Thus, we serialize it as int16 (same bit representation) and view it back to bfloat16 here.
-            # TODO: remove HACK once PyTorch CPU native bfloat16 to numpy conversion is universally stable.
+            # bfloat16 is serialized via int16 numpy buffers (identical 16-bit representation)
+            # and viewed back as bfloat16 here.
             flat_cpu = flat_cpu.view(torch.bfloat16)
+
+        raw_tensors = {}
+        dedup_items = []
+        seen_clean_keys = set()
+        for item in items:
+            k, shape, numel, offset = item
+            raw_tensors[k] = flat_cpu[offset : offset + numel].view(shape)
+            if k not in seen_clean_keys:
+                seen_clean_keys.add(k)
+                dedup_items.append(item)
 
         local_items = []
         local_tensors_to_cat = []
         local_offset = 0
 
-        def process_item_parallel(item, flat_cpu=flat_cpu):
+        def to_target_layout(tensor, target_local, flipped):
+            """Match vllm-torchtpu's (n_in, n_out) weight layout when required."""
+            if tensor.ndim == 2 and (
+                flipped or (tensor.shape != target_local.shape and tensor.T.shape == target_local.shape)
+            ):
+                return tensor.transpose(0, 1).contiguous()
+            return tensor.contiguous()
+
+        def build_fused(fused_key, parts):
+            """Shard each source projection for this rank, then concatenate."""
+            target_v = model_sd[fused_key]
+            target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
+            module = get_parent_module(fused_key)
+            flipped = bool(getattr(module, "_tpu_weight_flipped", False))
+
+            out_dim = target_local.shape[1] if (flipped and target_local.ndim == 2) else target_local.shape[0]
+            tp_size = getattr(module, "tp_size", max(1, sum(p.shape[0] for p in parts) // out_dim))
+            # Grouped-query attention replicates KV heads when tp_size exceeds the
+            # KV head count, so k/v span fewer shards than q. For gate_up_proj
+            # num_kv_head_replicas is absent and this collapses to plain sharding.
+            kv_replicas = getattr(module, "num_kv_head_replicas", 1)
+            kv_tp, kv_rank = max(1, tp_size // kv_replicas), rank // kv_replicas
+
+            shards = []
+            for i, part in enumerate(parts):
+                n_shards, shard_rank = (tp_size, rank) if i == 0 else (kv_tp, kv_rank)
+                size = part.shape[0] // n_shards
+                shards.append(part[shard_rank * size : (shard_rank + 1) * size])
+
+            fused = to_target_layout(torch.cat(shards, dim=0), target_local, flipped)
+            return (fused_key, target_local.shape, target_local.numel(), fused.reshape(-1))
+
+        def process_item_parallel(item, raw_tensors=raw_tensors):
             k, shape, numel, offset = item
             target_key = resolve_key(k)
+
             if target_key not in model_sd:
+                # vLLM fuses q/k/v and gate/up into single parameters while
+                # TorchTitan exports them separately. The group is emitted once,
+                # by its first source; the rest resolve to nothing.
+                for suffix in (".weight", ".bias"):
+                    if not k.endswith(suffix):
+                        continue
+                    base = k[: -len(suffix)]
+                    for fused_name, sources in _FUSED_PROJECTIONS.items():
+                        if not base.endswith(sources[0]):
+                            continue
+                        prefix = base[: -len(sources[0])]
+                        fused_key = resolve_key(f"{prefix}{fused_name}{suffix}")
+                        parts = [raw_tensors.get(f"{prefix}{s}{suffix}") for s in sources]
+                        if fused_key not in model_sd or any(p is None for p in parts):
+                            return None
+                        return build_fused(fused_key, parts)
                 return None
 
             target_v = model_sd[target_key]
             target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
+            parent_mod = get_parent_module(target_key)
+            is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
 
-            param_cpu_global = flat_cpu[offset : offset + numel].view(shape)
-            if target_local.shape == shape:
-                param_cpu_local = param_cpu_global
+            param_cpu_global = raw_tensors[k]
+            if param_cpu_global.ndim == 2 and is_flipped:
+                param_cpu_global = param_cpu_global.transpose(0, 1)
+
+            eff_shape = param_cpu_global.shape
+            if target_local.shape == eff_shape:
+                param_cpu_local = param_cpu_global.contiguous()
             else:
                 sharded = False
-                for dim in range(len(shape)):
-                    if shape[dim] != target_local.shape[dim]:
+                for dim in range(len(eff_shape)):
+                    if eff_shape[dim] != target_local.shape[dim]:
                         shard_size = target_local.shape[dim]
                         rank_offset = shard_size * rank
-                        indices = [slice(None)] * len(shape)
+                        indices = [slice(None)] * len(eff_shape)
                         indices[dim] = slice(rank_offset, rank_offset + shard_size)
-                        # COMMENT: Removed .clone() to enable zero-copy views during slicing.
-                        param_cpu_local = param_cpu_global[tuple(indices)]
+                        param_cpu_local = param_cpu_global[tuple(indices)].contiguous()
                         sharded = True
                         break
                 if not sharded:
-                    param_cpu_local = param_cpu_global
+                    param_cpu_local = param_cpu_global.contiguous()
 
             return (target_key, target_local.shape, target_local.numel(), param_cpu_local.reshape(-1))
 
@@ -191,12 +283,13 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=8) as local_exec:
-                sliced_results = list(local_exec.map(process_item_parallel, items))
+                sliced_results = list(local_exec.map(process_item_parallel, dedup_items))
         else:
-            sliced_results = list(executor.map(process_item_parallel, items))
+            sliced_results = list(executor.map(process_item_parallel, dedup_items))
 
-        for res in sliced_results:
+        for item, res in zip(dedup_items, sliced_results, strict=False):
             if res is None:
+                skipped_keys.append(item[0])
                 continue
             target_key, target_shape, target_numel, param_cpu_local_flat = res
             local_tensors_to_cat.append(param_cpu_local_flat)
@@ -229,6 +322,7 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
                 target_v = model_sd[target_key]
                 target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
                 target_local.copy_(slice_tpu)
+                written_keys.add(target_key)
 
             if temp_tpu_tensors is None:
                 del flat_chunk_tpu
@@ -255,10 +349,6 @@ class TPUCheckpointEngine(CheckpointEngine):
             self.registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
         except ValueError:
             try:
-                # COMMENT: Since TPUWeightRegistry is already a remote class decorated with @ray.remote,
-                # wrapping it with ray.remote(TPUWeightRegistry) throws a TypeError.
-                # Calling TPUWeightRegistry.options directly is the correct way to specify options.
-                # TODO: remove HACK once a unified and clean TPU checkpoint/weight registry engine is standard.
                 self.registry = TPUWeightRegistry.options(
                     name="TPUWeightRegistry", namespace="verl", lifetime="detached"
                 ).remote()
@@ -293,6 +383,8 @@ class TPUCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        import gc
+
         t_start = time.perf_counter()
 
         try:
@@ -303,19 +395,28 @@ class TPUCheckpointEngine(CheckpointEngine):
             pass
 
         if not self.is_master:
-            # Non-master ranks must consume the generator to prevent hangs
-            for _ in weights:
+            # Non-master ranks must consume the generator to participate in FSDP all-gathers,
+            # then synchronize and collect so lazy all-gather buffers do not accumulate.
+            for _k, v in weights:
+                del v
+            try:
+                import torch_tpu
+
+                torch_tpu._internal.sync.synchronize(wait=True)
+            except Exception:
                 pass
+            gc.collect()
             return
 
         step_key = global_steps if global_steps is not None else 0
-        logger.info(f"@@@ TPUCheckpointEngine: [Step {step_key}] Start send_weights...")
+        logger.info(f"TPUCheckpointEngine: [Step {step_key}] Start send_weights...")
 
         # Time generator consumption and CPU offloading
         t_offload_start = time.perf_counter()
         grouped_weights = {}
         for k, v in weights:
             cpu_v = v.detach().cpu()
+            del v
             if "layers." in k:
                 # Extract layer part: model.layers.12.self_attn... -> model.layers.12
                 parts = k.split(".")
@@ -324,15 +425,23 @@ class TPUCheckpointEngine(CheckpointEngine):
             else:
                 group_name = "other"
             grouped_weights.setdefault(group_name, []).append((k, cpu_v))
+        try:
+            import torch_tpu
+
+            torch_tpu._internal.sync.synchronize(wait=True)
+        except Exception:
+            pass
         t_offload = time.perf_counter() - t_offload_start
 
-        # Time grouping and flattening
+        # Time grouping and flattening (pop groups as we flatten to avoid holding 2x CPU copies)
         t_group_start = time.perf_counter()
         grouped_dict = {}
-        for group_name, group_items in grouped_weights.items():
+        for group_name in list(grouped_weights.keys()):
+            group_items = grouped_weights.pop(group_name)
             by_dtype = {}
             for k, cpu_v in group_items:
                 by_dtype.setdefault(cpu_v.dtype, []).append((k, cpu_v))
+            del group_items
 
             flat_tensors = {}
             metadata = {}
@@ -343,6 +452,8 @@ class TPUCheckpointEngine(CheckpointEngine):
                 else:
                     flat_tensors[dtype] = flat_cpu.numpy()
                 metadata[dtype] = [(k, v.shape, v.numel()) for k, v in items]
+                del items
+            del by_dtype
 
             grouped_dict[group_name] = {"flat_tensors": flat_tensors, "metadata": metadata}
 
@@ -352,11 +463,14 @@ class TPUCheckpointEngine(CheckpointEngine):
         # Time Ray Put upload
         t_put_start = time.perf_counter()
         ref = ray.put(state_dict)
+        del grouped_dict, state_dict
         t_put = time.perf_counter() - t_put_start
 
         # Time Registry update
         t_reg_start = time.perf_counter()
         await self.registry.set_weights.remote(step_key, [ref])
+        del ref
+        gc.collect()
         t_reg = time.perf_counter() - t_reg_start
 
         t_total = time.perf_counter() - t_start
@@ -375,6 +489,8 @@ class TPUCheckpointEngine(CheckpointEngine):
 
 async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
     """Synchronize weights from actor worker group to rollout replicas on TPU."""
+    import gc
+
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
@@ -406,17 +522,28 @@ async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
             "debug logging enabled on verl.checkpoint_engine to confirm which rank "
             "was elected is_master."
         )
+    del published
 
     futures = [
         replica.server_handle.collective_rpc.remote(method="load_weights_from_ray_registry", args=(step_key,))
         for replica in manager.replicas
     ]
     results = await asyncio.gather(*futures)
+
+    # Release the state_dict ObjectRef from TPUWeightRegistry immediately after all
+    # rollout replicas have loaded the weights so it does not stay pinned in the
+    # actor node's Ray Object Store during the subsequent training step.
+    try:
+        await registry.clear.remote()
+    except Exception:
+        pass
+    gc.collect()
+
     t_total = time.perf_counter() - t_total_start
 
     flat_counts: list = []
     for replica_result in results:
-        if isinstance(replica_result, (list, tuple)):
+        if isinstance(replica_result, list | tuple):
             flat_counts.extend(replica_result)
         elif replica_result is not None:
             flat_counts.append(replica_result)

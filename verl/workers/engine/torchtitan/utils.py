@@ -246,9 +246,7 @@ def _create_varlen_metadata_for_document(input_batch: torch.Tensor, positions: t
             ]
         )
         if sample_cu_seqlens.device.type == "tpu":
-            # HACK: torch.unique_consecutive (aten::unique_consecutive) is not implemented on TPU (torch_tpu).
-            # Fall back to mask indexing for TPU compatibility.
-            # TODO: Remove HACK once aten::unique_consecutive is supported natively on TPU.
+            # aten::unique_consecutive is not implemented in torch_tpu; use mask indexing instead.
             mask = torch.cat(
                 [
                     torch.tensor([True], device=sample_cu_seqlens.device),
