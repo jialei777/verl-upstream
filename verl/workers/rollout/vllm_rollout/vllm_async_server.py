@@ -71,7 +71,6 @@ if get_resource_name() == "TPU":
         _tpu_preflight_log,
         get_tpu_server_launch_config,
         is_tpu_vllm_run,
-        override_vllm_configs_for_tpu,
         patch_vllm_for_tpu,
         prepare_tpu_server_args,
         report_stale_tpu_engines,
@@ -421,7 +420,6 @@ class vLLMHttpServer:
             args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
 
         prepare_tpu_server_args(args)
-        override_vllm_configs_for_tpu(args)
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
@@ -439,7 +437,6 @@ class vLLMHttpServer:
                 cmds[cmd.name] = cmd
         server_args = parser.parse_args(args=server_args)
         server_args.model = server_args.model_tag
-        override_vllm_configs_for_tpu(server_args)
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
 
@@ -450,9 +447,7 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
-        override_vllm_configs_for_tpu(args)
         engine_args = AsyncEngineArgs.from_cli_args(args)
-        override_vllm_configs_for_tpu(engine_args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port

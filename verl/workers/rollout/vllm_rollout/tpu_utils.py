@@ -24,14 +24,21 @@ import sys
 import time
 import types
 from collections import defaultdict
-from typing import Any
 
 import numpy as np
 import ray
+import torch_tpu  # noqa: F401  # imported for its side effect of registering the TPU backend
+import vllm.envs as vllm_envs
+import vllm_torchtpu.envs as tpu_envs
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_distributed_init_method, get_ip, get_open_port
 from vllm.v1.executor.ray_executor import RayWorkerMetaData
+from vllm_torchtpu.executors import ray_distributed_executor
+from vllm_torchtpu.worker.tpu_worker import TPUWorker
 
+from verl.checkpoint_engine.tpu_checkpoint_engine import load_weights_on_worker
 from verl.utils.device import get_resource_name
 
 # --- Google TPU specific global constants ---
@@ -42,48 +49,6 @@ TPU_HOST_BOUNDS_VAL = "2,4,1"
 TPU_CHIPS_PER_HOST_BOUNDS_VAL = "1,1,1"
 CHIPS_PER_HOST_VAL = "4"
 # -------------------------------------------
-
-try:
-    import torch_tpu
-except ImportError:
-    torch_tpu = None
-
-try:
-    from verl.checkpoint_engine.tpu_checkpoint_engine import load_weights_on_worker
-except ImportError:
-    load_weights_on_worker = None
-
-# Fallback imports for TPU vLLM platforms
-try:
-    from vllm_torchtpu.executors import ray_distributed_executor
-except ImportError:
-    ray_distributed_executor = None
-
-try:
-    from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
-except ImportError:
-    EngineArgs = None
-    AsyncEngineArgs = None
-
-try:
-    import vllm.envs as vllm_envs
-except ImportError:
-    vllm_envs = None
-
-try:
-    import vllm_torchtpu.envs as tpu_envs
-except ImportError:
-    tpu_envs = None
-
-try:
-    from vllm_torchtpu.worker.tpu_worker import TPUWorker
-except ImportError:
-    TPUWorker = None
-
-try:
-    from vllm.platforms import current_platform
-except ImportError:
-    current_platform = None
 
 
 class PickleableProcessWrapper:
@@ -154,6 +119,21 @@ def _patched_run_engine_core(*args, **kwargs):
     raise RuntimeError("[TPU ERROR] _orig_run_engine_core could not be resolved in _patched_run_engine_core")
 
 
+def _release_node_master_lock(lock_path: str) -> None:
+    """Best-effort removal of the per-node weight-load election lock.
+
+    The lock is created with O_CREAT|O_EXCL and /tmp survives across Ray jobs on
+    the same pod, so leaking it makes every subsequent job fail master election
+    and silently reload a stale cached state dict. Removal is still best-effort:
+    a concurrent rank may have unlinked it already, and on the error paths we are
+    unwinding from a failure that the caller has already reported.
+    """
+    try:
+        os.remove(lock_path)
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"Could not remove weight-cache lock {lock_path}: {e}")
+
+
 def patch_vllm_for_tpu() -> None:
     """
     Apply TPU-specific patches and workarounds to vLLM and torchtpu-vllm workers.
@@ -177,8 +157,10 @@ def patch_vllm_for_tpu() -> None:
                     if fn:
                         try:
                             fn(op)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Not every op in the namespace is allow-listable; this
+                            # runs per op, so keep it off the default log level.
+                            logger.debug(f"allow_in_graph({op}) rejected: {e}")
 
         for ns_name in ["_c10d_functional", "c10d_functional"]:
             if hasattr(torch.ops, ns_name):
@@ -190,10 +172,10 @@ def patch_vllm_for_tpu() -> None:
                         _allow(attr)
                         if hasattr(attr, "default"):
                             _allow(attr.default)
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                    except Exception as e:
+                        logger.debug(f"Skipping {ns_name}.{name} in the dynamo allowlist: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to allow c10d functional collectives in the dynamo graph: {e}")
 
     try:
         import vllm_torchtpu.worker.tpu_worker as tw
@@ -207,8 +189,8 @@ def patch_vllm_for_tpu() -> None:
 
             tw.TPUWorker.determine_available_memory = patched_determine
             tw.TPUWorker._patched_dynamo = True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to patch TPUWorker.determine_available_memory: {e}")
 
     try:
         import vllm_torchtpu.runner.tpu_runner as tr
@@ -222,8 +204,8 @@ def patch_vllm_for_tpu() -> None:
 
             tr.TPUModelRunner.profile_run = patched_profile
             tr.TPUModelRunner._patched_dynamo = True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to patch TPUModelRunner.profile_run: {e}")
 
     def dummy_reset_encoder_cache(*args, **kwargs):
         pass
@@ -264,7 +246,8 @@ def patch_vllm_for_tpu() -> None:
                                     old_path = os.path.join(shm_dir, file_name)
                                     os.remove(old_path)
                             except ValueError:
-                                pass
+                                # Not a "state_dict_<step>.*" file we own; leave it alone.
+                                logger.debug(f"Skipping unrecognized cache file {file_name}")
             except Exception as e:
                 logger.warning(f"Error during cache cleanup: {e}")
 
@@ -276,20 +259,14 @@ def patch_vllm_for_tpu() -> None:
                 logger.warning(f"Failed to get weights from TPUWeightRegistry: {e}")
                 if lock_fd is not None:
                     os.close(lock_fd)
-                    try:
-                        os.remove(lock_path)
-                    except Exception:
-                        pass
+                    _release_node_master_lock(lock_path)
                 return 0
 
             if state_dict_ref is None:
                 logger.warning(f"No weights registered under step_key={step_key}")
                 if lock_fd is not None:
                     os.close(lock_fd)
-                    try:
-                        os.remove(lock_path)
-                    except Exception:
-                        pass
+                    _release_node_master_lock(lock_path)
                 return 0
 
             if isinstance(state_dict_ref, str):
@@ -321,14 +298,7 @@ def patch_vllm_for_tpu() -> None:
 
             if lock_fd is not None:
                 os.close(lock_fd)
-                # The lock file must be removed on the success path too. It is
-                # created with O_CREAT|O_EXCL and /tmp survives across Ray jobs
-                # on the same pod, so leaking it makes every subsequent job fail
-                # master election and silently reload a stale cached state dict.
-                try:
-                    os.remove(lock_path)
-                except Exception:
-                    pass
+                _release_node_master_lock(lock_path)
 
             # Stagger ranks before loading to serialize memory traffic
             time.sleep((rank_val % 4) * 0.4)
@@ -376,13 +346,11 @@ def patch_vllm_for_tpu() -> None:
         else:
             vllm_model = worker_inst.model_runner.model
 
-        num_keys = 0
-        if load_weights_on_worker is not None:
-            res_loader = load_weights_on_worker(vllm_model, state_dict_data, rank_val)
-            if isinstance(res_loader, tuple):
-                num_keys = res_loader[0]
-            else:
-                num_keys = res_loader
+        res_loader = load_weights_on_worker(vllm_model, state_dict_data, rank_val)
+        if isinstance(res_loader, tuple):
+            num_keys = res_loader[0]
+        else:
+            num_keys = res_loader
 
         del state_dict_data
         gc.collect()
@@ -417,99 +385,87 @@ def patch_vllm_for_tpu() -> None:
             sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
         sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
 
-        os.environ["VLLM_USE_V1"] = "0"
-
-        if ray_distributed_executor is None:
-            return
-
         try:
-            if EngineArgs is not None:
-                orig_create_engine_config = EngineArgs.create_engine_config
+            orig_create_engine_config = EngineArgs.create_engine_config
 
-                def patched_create_engine_config(self, *args, **kwargs):
-                    is_tpu = get_resource_name() == "TPU" or os.environ.get("VLLM_USE_V1") == "0"
-                    is_multi_host = (
-                        self.tensor_parallel_size > 4
-                        or int(os.environ.get("NNODES_ROLLOUT", "1")) > 1
-                        or os.environ.get("TPU_MULTIHOST_BACKEND") == "ray"
+            def patched_create_engine_config(self, *args, **kwargs):
+                is_multi_host = (
+                    self.tensor_parallel_size > 4
+                    or int(os.environ.get("NNODES_ROLLOUT", "1")) > 1
+                    or os.environ.get("TPU_MULTIHOST_BACKEND") == "ray"
+                )
+
+                if getattr(self, "data_parallel_size", 1) <= 1:
+                    if hasattr(self, "data_parallel_external_lb"):
+                        self.data_parallel_external_lb = False
+                    if hasattr(self, "data_parallel_rank"):
+                        self.data_parallel_rank = None
+                    if hasattr(self, "data_parallel_size_local"):
+                        self.data_parallel_size_local = None
+                    if hasattr(self, "data_parallel_start_rank"):
+                        self.data_parallel_start_rank = None
+                    if hasattr(self, "data_parallel_hybrid_lb"):
+                        self.data_parallel_hybrid_lb = False
+
+                if not is_multi_host:
+                    if "TPU_MULTIHOST_BACKEND" in os.environ:
+                        del os.environ["TPU_MULTIHOST_BACKEND"]
+                    if hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
+                        vllm_envs.TPU_MULTIHOST_BACKEND = None
+                    if hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
+                        tpu_envs.TPU_MULTIHOST_BACKEND = None
+
+                    vllm_config = orig_create_engine_config(self, *args, **kwargs)
+
+                    logger.info(
+                        "[TPU HACK 16] Single-host rollout detected. Bypassed forcing Ray distributed executor backend."
                     )
-                    if is_tpu:
-                        os.environ["VLLM_USE_V1"] = "0"
+                    if hasattr(vllm_config, "scheduler_config") and hasattr(
+                        vllm_config.scheduler_config, "async_scheduling"
+                    ):
+                        vllm_config.scheduler_config.async_scheduling = True
+                        logger.info("[TPU HACK 20] Enabled async_scheduling on TPU for single-host.")
+                else:
+                    os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
+                    if hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
+                        vllm_envs.TPU_MULTIHOST_BACKEND = "ray"
+                    if hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
+                        tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
+                    # RayExecutorV2 is the default target of the "ray" backend
+                    # string. It never sets the TPU topology env vars, so workers
+                    # die in init_device with "PjRtClient is not initialized".
+                    # Opting out makes "ray" resolve to RayDistributedExecutor,
+                    # the class we patch below.
+                    os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
-                    if getattr(self, "data_parallel_size", 1) <= 1:
-                        if hasattr(self, "data_parallel_external_lb"):
-                            self.data_parallel_external_lb = False
-                        if hasattr(self, "data_parallel_rank"):
-                            self.data_parallel_rank = None
-                        if hasattr(self, "data_parallel_size_local"):
-                            self.data_parallel_size_local = None
-                        if hasattr(self, "data_parallel_start_rank"):
-                            self.data_parallel_start_rank = None
-                        if hasattr(self, "data_parallel_hybrid_lb"):
-                            self.data_parallel_hybrid_lb = False
-
-                    if not is_multi_host:
-                        if "TPU_MULTIHOST_BACKEND" in os.environ:
-                            del os.environ["TPU_MULTIHOST_BACKEND"]
-                        if vllm_envs is not None and hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
-                            vllm_envs.TPU_MULTIHOST_BACKEND = None
-                        if tpu_envs is not None and hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
-                            tpu_envs.TPU_MULTIHOST_BACKEND = None
-
-                        vllm_config = orig_create_engine_config(self, *args, **kwargs)
-
+                    vllm_config = orig_create_engine_config(self, *args, **kwargs)
+                    vllm_config.parallel_config.distributed_executor_backend = "ray"
+                    _tpu_preflight_log(
+                        "forced distributed_executor_backend=ray (v2 executor disabled) for multi-host",
+                        tag="TPU HACK 16",
+                    )
+                    if hasattr(vllm_config, "scheduler_config") and hasattr(
+                        vllm_config.scheduler_config, "async_scheduling"
+                    ):
+                        vllm_config.scheduler_config.async_scheduling = False
                         logger.info(
-                            "[TPU HACK 16] Single-host rollout detected. "
-                            "Bypassed forcing Ray distributed executor backend."
+                            "[TPU HACK 20] Disabled async_scheduling on TPU "
+                            "inside patched_create_engine_config because Ray does not support it."
                         )
-                        if hasattr(vllm_config, "scheduler_config") and hasattr(
-                            vllm_config.scheduler_config, "async_scheduling"
-                        ):
-                            vllm_config.scheduler_config.async_scheduling = True
-                            logger.info("[TPU HACK 20] Enabled async_scheduling on TPU for single-host.")
-                    else:
-                        os.environ["TPU_MULTIHOST_BACKEND"] = "ray"
-                        if vllm_envs is not None and hasattr(vllm_envs, "TPU_MULTIHOST_BACKEND"):
-                            vllm_envs.TPU_MULTIHOST_BACKEND = "ray"
-                        if tpu_envs is not None and hasattr(tpu_envs, "TPU_MULTIHOST_BACKEND"):
-                            tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
-                        # RayExecutorV2 is the default target of the "ray" backend
-                        # string. It never sets the TPU topology env vars, so workers
-                        # die in init_device with "PjRtClient is not initialized".
-                        # Opting out makes "ray" resolve to RayDistributedExecutor,
-                        # the class we patch below.
-                        os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
+                return vllm_config
 
-                        vllm_config = orig_create_engine_config(self, *args, **kwargs)
-                        vllm_config.parallel_config.distributed_executor_backend = "ray"
-                        _tpu_preflight_log(
-                            "forced distributed_executor_backend=ray (v2 executor disabled) for multi-host",
-                            tag="TPU HACK 16",
-                        )
-                        if hasattr(vllm_config, "scheduler_config") and hasattr(
-                            vllm_config.scheduler_config, "async_scheduling"
-                        ):
-                            vllm_config.scheduler_config.async_scheduling = False
-                            logger.info(
-                                "[TPU HACK 20] Disabled async_scheduling on TPU "
-                                "inside patched_create_engine_config because Ray does not support it."
-                            )
-                    return vllm_config
-
-                EngineArgs.create_engine_config = patched_create_engine_config
-                if AsyncEngineArgs is not None:
-                    AsyncEngineArgs.create_engine_config = patched_create_engine_config
+            EngineArgs.create_engine_config = patched_create_engine_config
+            AsyncEngineArgs.create_engine_config = patched_create_engine_config
         except Exception as e:
             logger.warning(f"Failed to patch EngineArgs.create_engine_config: {e}")
 
         try:
-            if TPUWorker is not None:
-                TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
-                TPUWorker.load_weights_from_ray_registry = load_weights_from_ray_registry
-                logger.info(
-                    "[TPU HACK 13] Successfully patched TPUWorker class with "
-                    "dummy_reset_encoder_cache and load_weights_from_ray_registry."
-                )
+            TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
+            TPUWorker.load_weights_from_ray_registry = load_weights_from_ray_registry
+            logger.info(
+                "[TPU HACK 13] Successfully patched TPUWorker class with "
+                "dummy_reset_encoder_cache and load_weights_from_ray_registry."
+            )
         except Exception as e:
             logger.warning(f"Failed to patch TPUWorker class directly: {e}")
 
@@ -563,8 +519,10 @@ def patch_vllm_for_tpu() -> None:
                         if pg_name:
                             try:
                                 curr_pg = ray.util.get_placement_group(pg_name)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                # Probing by name: a miss is an expected outcome, we
+                                # fall through to the table scan below.
+                                logger.debug(f"No placement group named {pg_name!r}: {e}")
                         if curr_pg is None:
                             try:
                                 pgs = ray.util.placement_group_table()
@@ -593,10 +551,11 @@ def patch_vllm_for_tpu() -> None:
                                                 if num_bundles >= parallel_config.world_size:
                                                     curr_pg = candidate_pg
                                                     break
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                pass
+                                        except Exception as e:
+                                            # One unreadable entry should not abort the scan.
+                                            logger.debug(f"Skipping placement group {name!r}: {e}")
+                            except Exception as e:
+                                logger.debug(f"Placement group table scan failed: {e}")
                     parallel_config.placement_group = curr_pg
                 try:
                     return orig_init_ray_cluster(parallel_config, *args, **kwargs)
@@ -680,15 +639,10 @@ def patch_vllm_for_tpu() -> None:
 
         def patched_setup_device_if_necessary(self):
             patch_vllm_for_tpu()
-            if not getattr(self, "compiled_dag_cuda_device_set", False):
-                try:
-                    from vllm.platforms import current_platform
-
-                    if current_platform.is_cuda() and hasattr(self.worker, "device") and self.worker.device is not None:
-                        current_platform.set_device(self.worker.device)
-                except Exception:
-                    pass
-                self.compiled_dag_cuda_device_set = True
+            # vLLM's stock implementation calls current_platform.set_device() here,
+            # which is a CUDA-only concern. On TPU the runtime binds the device for
+            # us, so all that is left to do is mark the setup as done.
+            self.compiled_dag_cuda_device_set = True
 
         OriginalRayWorkerWrapper.setup_device_if_necessary = patched_setup_device_if_necessary
 
@@ -698,18 +652,21 @@ def patch_vllm_for_tpu() -> None:
                 sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
             sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
 
+            # verl feeds real weights in through the TPU weight registry, so vLLM's
+            # dummy initialization must never run. If stubbing it out fails the run
+            # would silently serve random weights, so surface it.
             try:
                 import vllm.model_executor.model_loader.weight_utils as vllm_weight_utils
 
                 vllm_weight_utils.initialize_dummy_weights = lambda *args, **kwargs: None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to stub out weight_utils.initialize_dummy_weights: {e}")
             try:
                 import vllm.model_executor.model_loader.dummy_loader as vllm_dummy_loader
 
                 vllm_dummy_loader.initialize_dummy_weights = lambda *args, **kwargs: None
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to stub out dummy_loader.initialize_dummy_weights: {e}")
 
             self.__class__.load_weights_from_ray_registry = load_weights_from_ray_registry
             self.__class__.load_weights_from_state_dict_on_worker = lambda self, sd: load_weights_from_ray_registry(
@@ -738,7 +695,7 @@ def patch_vllm_for_tpu() -> None:
                 ray_remote_kwargs = self._configure_ray_workers_use_nsight(ray_remote_kwargs)
 
             bundle_indices = []
-            if vllm_envs is not None and vllm_envs.VLLM_RAY_BUNDLE_INDICES:
+            if vllm_envs.VLLM_RAY_BUNDLE_INDICES:
                 bundle_indices = list(map(int, vllm_envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
                 assert len(bundle_indices) == self.parallel_config.world_size, (
                     "VLLM_RAY_BUNDLE_INDICES must have the same size"
@@ -750,7 +707,7 @@ def patch_vllm_for_tpu() -> None:
                 )
             else:
                 for bundle_id, bundle in enumerate(placement_group.bundle_specs):
-                    if current_platform is not None and bundle.get(current_platform.ray_device_key, 0):
+                    if bundle.get(current_platform.ray_device_key, 0):
                         bundle_indices.append(bundle_id)
 
             worker_metadata = []
@@ -765,9 +722,7 @@ def patch_vllm_for_tpu() -> None:
                 worker = ray.remote(
                     num_cpus=0,
                     num_gpus=0,
-                    resources={current_platform.ray_device_key: num_tpu_per_worker}
-                    if current_platform is not None
-                    else {},
+                    resources={current_platform.ray_device_key: num_tpu_per_worker},
                     scheduling_strategy=scheduling_strategy,
                     **ray_remote_kwargs,
                 )(RayWorkerWrapper_local).remote(rpc_rank=rank)
@@ -1013,21 +968,14 @@ def patch_vllm_for_tpu() -> None:
 
             return FutureWrapper(refs, self.kv_output_aggregator)
 
-        if ray_distributed_executor is not None:
-            ray_distributed_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
-        try:
-            import vllm.executor.ray_distributed_executor as vllm_ray_dist_exec
-
-            vllm_ray_dist_exec.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
-        except Exception:
-            pass
+        ray_distributed_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
         try:
             import vllm.v1.executor.ray_executor as vllm_v1_ray_exec
 
             vllm_v1_ray_exec.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
             vllm_v1_ray_exec.RayDistributedExecutor._execute_dag = patched_execute_dag
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to patch vllm.v1.executor.ray_executor.RayDistributedExecutor: {e}")
 
         logger.info("Successfully applied all TPU patches and hacks to vLLM & torchtpu-vllm")
     except Exception as e:
@@ -1035,38 +983,8 @@ def patch_vllm_for_tpu() -> None:
 
 
 def is_tpu_vllm_run() -> bool:
-    """Returns True if executing on a Google TPU resource or with V1 explicitly disabled."""
-    return get_resource_name() == "TPU" or os.environ.get("VLLM_USE_V1") == "0"
-
-
-def override_vllm_configs_for_tpu(args_or_config: Any):
-    """Enforces VLLM_USE_V1=0 and use_v1=False across dictionary and namespace objects on TPU."""
-    os.environ["VLLM_USE_V1"] = "0"
-    try:
-        import vllm.envs as vllm_envs
-
-        vllm_envs.VLLM_USE_V1 = False
-    except Exception:
-        pass
-
-    if isinstance(args_or_config, dict):
-        args_or_config["use_v1"] = False
-        return
-
-    for obj in [args_or_config, getattr(args_or_config, "model_config", None)]:
-        if obj is None:
-            continue
-        for attr in ["use_v1", "_use_v1"]:
-            if hasattr(obj, attr):
-                try:
-                    setattr(obj, attr, False)
-                except Exception:
-                    pass
-            if hasattr(obj, "__dict__") and attr in obj.__dict__:
-                try:
-                    obj.__dict__[attr] = False
-                except Exception:
-                    pass
+    """Returns True if executing on a Google TPU resource."""
+    return get_resource_name() == "TPU"
 
 
 async def get_tpu_server_launch_config(workers):
@@ -1315,8 +1233,6 @@ def prepare_tpu_server_args(args: dict):
     os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     try:
-        import vllm_torchtpu.envs as tpu_envs
-
         tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
         if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
             tpu_envs.__getattr__.cache_clear()
