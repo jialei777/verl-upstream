@@ -1,7 +1,14 @@
 # Use the latest Ray master as base.
 FROM rayproject/ray:nightly.260501.1c7c90-py312-tpu
 
-RUN sudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev
+# g++ is required from vLLM 0.22.1 onward. Its setup.py appends the
+# `vllm.spinloop` CMake extension unconditionally, outside any device guard, so
+# even a VLLM_TARGET_DEVICE=tpu build invokes cmake and needs a CXX compiler;
+# 0.19.0 had no such extension and built with no compiler at all. The base image
+# ships gcc but not g++, so cmake fails with "No CMAKE_CXX_COMPILER could be
+# found". spinloop is pure C++ against the Python stable ABI (USE_SABI 3.11) and
+# does not link libtorch, so compiling it here introduces no torch ABI coupling.
+RUN sudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev g++
 RUN pip uninstall -y torch torchvision
 
 RUN pip install keyrings.google-artifactregistry-auth
@@ -66,24 +73,74 @@ RUN pip install -r requirements.txt
 # RUN pip install -r .ci/docker/requirements-flux.txt
 WORKDIR /
 
-RUN git clone --depth 1 --branch v0.19.0 https://github.com/vllm-project/vllm.git
+RUN git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git
 RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtpu-vllm.git
 
 WORKDIR /torchtpu-vllm
-RUN git checkout 98536189411258e7307f261759edfb6fc8df8a60
+RUN git checkout 88f359b38179a5345514358b7c9738c475e26ea0
 WORKDIR /
 
-# Patch vLLM's TPU requirements to accept our local workspace in torchtpu-vllm instead of overriding it
+# torchtpu-vllm is the TPU backend; vLLM's tpu.txt would otherwise pull the
+# tpu-inference package that it replaces.
 RUN sed -i '/tpu-inference/d' vllm/requirements/tpu.txt
 
-# Install vLLM in editable mode (forcing the 0.19.0 base version to prevent .dev prerelease mismatch during dependency resolution)
 WORKDIR /torchtpu-vllm
 
-# Hack pyproject.toml to pin versions
+# torchtpu-vllm @ 88f359b3 declares a dependency set we deliberately deviate
+# from. Each override below is load-bearing; `pip install -e .` resolves this
+# pyproject for real, so an unedited pin here silently rewrites the image.
+#
+#   torch 2.11.0 -> 2.12.0
+#     Two separate pins drag torch back to 2.11.0: this one and torchvision's
+#     (below). 2.11.0 is only published as the CUDA build on PyPI, so accepting
+#     it would both replace the CPU wheel installed above and pull the whole
+#     nvidia-* dependency set into a TPU image.
+#
+#   torch-tpu dev20260714090201 -> dev20260905000939
+#     0714 ships a single unversioned libpywrap built against torch 2.11 and
+#     fails to load on 2.12 (`undefined symbol: torch::Library::_def`). See the
+#     three bisected boundaries documented at the torch_tpu install above.
+#
+#   libtpu -> 0.0.42.1
+#     Matches what this commit's env_override.py workarounds were written
+#     against.
+#
+#   torchvision 0.26.0 -> dropped
+#     Its metadata hard-pins torch==2.11.0, so it cannot coexist with the line
+#     above. It is only needed for multimodal checkpoints whose HF processor
+#     imports it at class-definition time; nothing in this image does. Restoring
+#     it means moving to a torchvision built against torch 2.12.
+RUN sed -i 's/"torch==[0-9a-zA-Z.]*"/"torch==2.12.0"/' pyproject.toml
 RUN sed -i 's/torch-tpu==[0-9a-zA-Z.]*/torch-tpu==0.1.1.dev20260905000939/' pyproject.toml
-RUN sed -i 's/libtpu==[0-9a-zA-Z.]*/libtpu==0.0.41/' pyproject.toml
+RUN sed -i 's/libtpu==[0-9a-zA-Z.]*/libtpu==0.0.42.1/' pyproject.toml
+RUN sed -i '/"torchvision==/d' pyproject.toml
 
-RUN pip install --upgrade pip && SETUPTOOLS_SCM_PRETEND_VERSION=0.19.0 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
+# Fail loudly if any override above silently missed (e.g. upstream reformatted
+# pyproject.toml), rather than letting the build quietly produce a wrong image.
+RUN set -e; \
+    grep -q '"torch==2.12.0"' pyproject.toml \
+      || { echo "pyproject override failed: torch" >&2; exit 1; }; \
+    grep -q 'torch-tpu==0.1.1.dev20260905000939' pyproject.toml \
+      || { echo "pyproject override failed: torch-tpu" >&2; exit 1; }; \
+    grep -q 'libtpu==0.0.42.1' pyproject.toml \
+      || { echo "pyproject override failed: libtpu" >&2; exit 1; }; \
+    if grep -q '"torchvision==' pyproject.toml; then \
+      echo "pyproject override failed: torchvision still present" >&2; exit 1; \
+    fi; \
+    echo "pyproject overrides OK"
+
+# Hold transformers on the 4.x line, installed *before* vLLM so vLLM's own
+# requirement resolves as already-satisfied.
+#
+# vLLM 0.19.0 capped this at `transformers >= 4.56.0, < 5`; 0.22.1 widened it to
+# `>= 4.56.0, != 5.0.* .. != 5.5.0`, which permits 5.x, so a fresh resolve picks
+# the newest 5.x and drags huggingface-hub to 1.x with it. That is a major
+# version jump across the tokenizer and model-loading paths, unrelated to the
+# vLLM upgrade this image exists for. 4.57.6 is the version the validated image
+# runs and it still satisfies 0.22.1's constraint.
+RUN pip install "transformers==4.57.6"
+
+RUN pip install --upgrade pip && SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
 RUN pip install --pre -e .
 
 # --- Install verl Dependencies ---
@@ -113,51 +170,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Add /app to PYTHONPATH to allow standard fully qualified 'import verl.*' imports.
-ENV PYTHONPATH="${PYTHONPATH}:/app:/torchtitan:/torchtitan/torchtitan"
-
-# --- Upgrade to vLLM 0.22.1 / torchtpu-vllm @ 88f359b3 ---
-# The v0.19.0 editable install above is kept solely to provision vLLM's full
-# dependency tree; the wheel below is installed with --no-deps on top of it.
-
-# 1. Drop the 0.19.0 install (editable .pth + source tree).
-RUN pip uninstall -y vllm tpu_inference >/dev/null 2>&1 || true && \
-    rm -rf /home/ray/anaconda3/lib/python3.12/site-packages/*tpu_inference* \
-           /home/ray/anaconda3/lib/python3.12/site-packages/*vllm* \
-           /vllm
-
-# 2. Move torchtpu-vllm to the 0.22.1-compatible commit and reinstall editable.
-RUN cd /torchtpu-vllm && \
-    git fetch origin main && \
-    git checkout -f 88f359b38179a5345514358b7c9738c475e26ea0 && \
-    git clean -fdx && \
-    pip install --no-build-isolation --no-deps -e /torchtpu-vllm
-
-# 3. Install vLLM 0.22.1 as a wheel with pinned extras (no dep resolution).
-#    jax/jaxlib/libtpu are pinned here rather than at the `jax[tpu]` install
-#    above, because that early pin gets silently upgraded by a later transitive
-#    dependency. The values are not arbitrary: they are exactly what
-#    torchtpu-vllm @ 88f359b3 declares in its own pyproject (jax==0.10.2,
-#    jaxlib==0.10.2, libtpu==0.0.42.1), and its env_override.py carries
-#    workarounds written against that combination. Letting jax float to >= 0.11
-#    gates Pallas TPU lowering on libtpu >= 0.0.44; vLLM's ragged paged
-#    attention lowers through Pallas, so the attention graph fails to compile
-#    and the engine never starts.
-RUN pip install --no-cache-dir --no-deps \
-    --extra-index-url https://pypi.org/simple \
-    "vllm==0.22.1" \
-    "libtpu==0.0.42.1" \
-    "jax==0.10.2" \
-    "jaxlib==0.10.2" \
-    "numba==0.65.0" \
-    "llvmlite==0.47.0" \
-    "compressed-tensors==0.15.0.1" \
-    "outlines_core==0.2.14" \
-    "llguidance==1.7.6" \
-    "fastsafetensors==0.4.0" \
-    "fastapi<0.137" \
-    "pydantic>=2.12.0" \
-    "pydantic-core"
-
-# torchtpu-vllm ships as a src-layout package; both paths are required.
+# torchtpu-vllm ships as a src-layout package, so both of its paths are needed
+# alongside /app for fully qualified 'import verl.*'.
 ENV PYTHONPATH="/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan"
+
