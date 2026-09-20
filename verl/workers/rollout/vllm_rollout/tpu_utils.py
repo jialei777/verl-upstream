@@ -344,14 +344,26 @@ def patch_vllm_for_tpu() -> None:
                         pass
                 return 0
 
-            if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
-                state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
-            if isinstance(state_dict_ref, str):
-                state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
-            elif isinstance(state_dict_ref, ray.ObjectRef):
-                state_dict_data = ray.get(state_dict_ref)
+            if isinstance(state_dict_ref, list) and all(isinstance(r, ray.ObjectRef) for r in state_dict_ref):
+                grouped_dict = {}
+                for chunk_ref in state_dict_ref:
+                    chunk_obj = ray.get(chunk_ref)
+                    if isinstance(chunk_obj, tuple) and len(chunk_obj) == 2:
+                        group_name, group_sd = chunk_obj
+                        grouped_dict[group_name] = group_sd
+                    elif isinstance(chunk_obj, dict) and "grouped" in chunk_obj:
+                        grouped_dict.update(chunk_obj["grouped"])
+                    del chunk_obj
+                state_dict_data = {"grouped": grouped_dict}
             else:
-                state_dict_data = state_dict_ref
+                if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
+                    state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
+                if isinstance(state_dict_ref, str):
+                    state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
+                elif isinstance(state_dict_ref, ray.ObjectRef):
+                    state_dict_data = ray.get(state_dict_ref)
+                else:
+                    state_dict_data = state_dict_ref
 
             # Convert NumPy arrays back to native PyTorch CPU tensors
             if isinstance(state_dict_data, dict) and "grouped" in state_dict_data:

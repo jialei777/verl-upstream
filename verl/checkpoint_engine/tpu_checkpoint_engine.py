@@ -436,6 +436,8 @@ class TPUCheckpointEngine(CheckpointEngine):
         # Time grouping and flattening (pop groups as we flatten to avoid holding 2x CPU copies)
         t_group_start = time.perf_counter()
         grouped_dict = {}
+        chunk_refs = []
+        t_put = 0.0
         for group_name in list(grouped_weights.keys()):
             group_items = grouped_weights.pop(group_name)
             by_dtype = {}
@@ -455,21 +457,18 @@ class TPUCheckpointEngine(CheckpointEngine):
                 del items
             del by_dtype
 
-            grouped_dict[group_name] = {"flat_tensors": flat_tensors, "metadata": metadata}
+            group_sd = {"flat_tensors": flat_tensors, "metadata": metadata}
+            t_put_start = time.perf_counter()
+            chunk_refs.append(ray.put((group_name, group_sd)))
+            t_put += time.perf_counter() - t_put_start
+            del group_sd, flat_tensors, metadata
 
-        state_dict = {"grouped": grouped_dict}
-        t_group = time.perf_counter() - t_group_start
-
-        # Time Ray Put upload
-        t_put_start = time.perf_counter()
-        ref = ray.put(state_dict)
-        del grouped_dict, state_dict
-        t_put = time.perf_counter() - t_put_start
+        t_group = (time.perf_counter() - t_group_start) - t_put
 
         # Time Registry update
         t_reg_start = time.perf_counter()
-        await self.registry.set_weights.remote(step_key, [ref])
-        del ref
+        await self.registry.set_weights.remote(step_key, chunk_refs)
+        del chunk_refs
         gc.collect()
         t_reg = time.perf_counter() - t_reg_start
 
