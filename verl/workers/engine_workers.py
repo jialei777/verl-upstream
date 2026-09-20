@@ -40,7 +40,7 @@ from verl.utils.distributed import initialize_global_process_group_ray, set_numa
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.metric.utils import Metric
+from verl.utils.metric.utils import AggregationType, Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
@@ -346,7 +346,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                         # flattn dp and micro batch
                         if isinstance(val, list):
                             if isinstance(val[0], Metric):
-                                output[key] = Metric.aggregate_dp(val)
+                                dp_scale = (
+                                    self.engine.get_data_parallel_size()
+                                    if self.device_name == "tpu" and val[0].aggregation == AggregationType.SUM
+                                    else 1
+                                )
+                                output[key] = Metric.aggregate_dp(val) * dp_scale
                             elif isinstance(val[0], list | tuple):
                                 output[key] = list(chain.from_iterable(val))
                             else:
