@@ -402,11 +402,10 @@ class PlatformTPU(PlatformCUDA):
                             if res.startswith("tpu-group-"):
                                 tpu_slices.add(res)
                 tpu_slices = sorted(list(tpu_slices))
-                if len(tpu_slices) >= 2:
-                    if any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"]):
+                if len(tpu_slices) >= 1:
+                    if len(tpu_slices) >= 2 and any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"]):
                         return tpu_slices[1]
-                    elif any(k in name_prefix.lower() for k in ["trainer", "actor", "global"]):
-                        return tpu_slices[0]
+                    return tpu_slices[0]
         except Exception:
             pass
 

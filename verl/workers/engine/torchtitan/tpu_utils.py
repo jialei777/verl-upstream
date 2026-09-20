@@ -182,10 +182,17 @@ def pad_packed_inputs_for_tpu(
         pos_2d_cpu = F.pad(pos_2d_cpu, (0, pad_len), value=0)
 
     # Build static 4D causal + document-boundary mask [1, 1, padded_seq_len, padded_seq_len] on CPU
-    first_dummy = pos_2d_cpu[:, :1] - 1
-    boundary = torch.diff(pos_2d_cpu, prepend=first_dummy, dim=-1) != 1
-    boundary[:, 0] = True
-    seq_ids = boundary.cumsum(dim=-1)
+    if getattr(input_ids, "is_nested", False):
+        seq_lens = input_ids.offsets().diff().detach().cpu()
+        seq_ids_1d = torch.repeat_interleave(torch.arange(1, len(seq_lens) + 1, dtype=torch.int64), seq_lens)
+        if pad_len > 0:
+            seq_ids_1d = F.pad(seq_ids_1d, (0, pad_len), value=0)
+        seq_ids = seq_ids_1d.unsqueeze(0)
+    else:
+        first_dummy = pos_2d_cpu[:, :1] - 1
+        boundary = torch.diff(pos_2d_cpu, prepend=first_dummy, dim=-1) != 1
+        boundary[:, 0] = True
+        seq_ids = boundary.cumsum(dim=-1)
     idx = torch.arange(padded_seq_len, dtype=seq_ids.dtype).unsqueeze(0)
     valid = idx < orig_seq_len
     seq_ids = torch.where(valid, seq_ids, -idx - 1)

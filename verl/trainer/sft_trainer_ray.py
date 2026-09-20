@@ -351,9 +351,9 @@ class SFTTrainer:
 
                 # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                 metrics["train/loss"] = metrics.pop("loss")
-                metrics["train/grad_norm"] = metrics.pop("grad_norm")
-                metrics["train/lr"] = metrics.pop("lr")
-                metrics["train/mfu"] = metrics.pop("mfu")
+                metrics["train/grad_norm"] = metrics.pop("grad_norm", 0.0)
+                metrics["train/lr"] = metrics.pop("lr", 0.0)
+                metrics["train/mfu"] = metrics.pop("mfu", 0.0)
                 metrics["train/global_tokens"] = sum(batch_seqlens)
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9

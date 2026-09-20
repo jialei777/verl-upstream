@@ -43,28 +43,28 @@ SMOKE_TEST="${SMOKE_TEST:-0}"
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
     exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_fast_smoke_test}"
-    TRAIN_BATCH_SIZE=4
-    VAL_BATCH_SIZE=4
-    VAL_MAX_SAMPLES=8
-    PPO_MINI_BATCH_SIZE=4
-    ROLLOUT_N=2
-    MAX_RESPONSE_LEN=512
-    MAX_NUM_SEQS=16
-    TOTAL_TRAINING_STEPS=5
-    TEST_FREQ=2
-    VAL_BEFORE_TRAIN=False
+    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+    VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-4}"
+    VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-8}"
+    PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
+    ROLLOUT_N="${ROLLOUT_N:-2}"
+    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
+    TEST_FREQ="${TEST_FREQ:-2}"
+    VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 else
     exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_gsm8k}"
-    TRAIN_BATCH_SIZE=32
-    VAL_BATCH_SIZE=64
-    VAL_MAX_SAMPLES=128
-    PPO_MINI_BATCH_SIZE=32
-    ROLLOUT_N=8
-    MAX_RESPONSE_LEN=1024
-    MAX_NUM_SEQS=32
-    TOTAL_TRAINING_STEPS=100
-    TEST_FREQ=10
-    VAL_BEFORE_TRAIN=True
+    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
+    VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
+    VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-128}"
+    PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
+    ROLLOUT_N="${ROLLOUT_N:-8}"
+    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-100}"
+    TEST_FREQ="${TEST_FREQ:-10}"
+    VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 fi
 
 # Project details
@@ -143,7 +143,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    +actor_rollout_ref.ref_in_actor=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \

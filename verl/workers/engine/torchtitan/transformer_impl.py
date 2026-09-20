@@ -54,6 +54,7 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
+    bucket_length,
     compute_global_batch_num_tokens,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
@@ -215,7 +216,7 @@ class TorchTitanEngine(BaseEngine):
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
-        if self.engine_config.offload_policy or self.engine_config.forward_only:
+        if (self.engine_config.offload_policy or self.engine_config.forward_only) and device_name != "tpu":
             training = TrainingConfig(enable_cpu_offload=True, **training_kwargs)
         else:
             training = TrainingConfig(**training_kwargs)
@@ -326,6 +327,8 @@ class TorchTitanEngine(BaseEngine):
         else:
             self.optimizer = None
             self.lr_scheduler = None
+            self.trainer.optimizers = None
+            self.trainer.lr_schedulers = None
 
         self.to(
             device="cpu",
@@ -805,7 +808,9 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
-            max_seq_len = max(input_ids.offsets().diff())
+            max_seq_len = int(max(input_ids.offsets().diff()))
+            if get_device_name() == "tpu":
+                max_seq_len = bucket_length(max_seq_len)
 
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
             input_ids = torch.nested.to_padded_tensor(
