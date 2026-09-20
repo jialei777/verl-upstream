@@ -254,9 +254,13 @@ def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) ->
     Assembling the small padded response tensors on CPU avoids compiling a new
     `tt_jit_jagged_to_padded_dense_forward` HLO executable for every unbucketed jagged length.
     """
+    from verl.utils.device import get_device_id
+
     if not getattr(nt, "is_nested", False):
+        if isinstance(nt, torch.Tensor) and nt.device.type == "cpu":
+            return nt.to(device=get_device_id())
         return nt
-    target_device = nt.device
+    target_device = get_device_id() if nt.device.type == "cpu" else nt.device
     values_cpu = nt.values().detach().cpu()
     offsets_cpu = nt.offsets().detach().cpu()
     batch_size = int(offsets_cpu.shape[0]) - 1
@@ -279,6 +283,7 @@ def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) ->
 def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:
     """Selects fields from a TensorDict and converts NestedTensors to bucket-padded dense tensors on TPU."""
     from verl.utils import tensordict_utils as tu
+    from verl.utils.device import get_device_id
 
     max_response_len = tu.get_non_tensor_data(data=data, key="max_response_len", default=-1)
     if max_response_len is not None and int(max_response_len) > 0:
@@ -286,6 +291,7 @@ def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:
     else:
         max_response_len = None
 
+    target_device = get_device_id()
     padded_dict = {}
     for k in fields:
         if k in data.keys():
@@ -296,6 +302,8 @@ def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:
                     trailing_dims = tuple(val.values().shape[1:])
                     output_size = (int(data.batch_size[0]), max_response_len, *trailing_dims)
                 padded_dict[k] = safe_to_padded_tensor(val, output_size=output_size)
+            elif isinstance(val, torch.Tensor) and val.device.type == "cpu":
+                padded_dict[k] = val.to(device=target_device)
             else:
                 padded_dict[k] = val
     return TensorDict(padded_dict, batch_size=data.batch_size)

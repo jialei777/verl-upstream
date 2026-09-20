@@ -172,7 +172,8 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     Returns:
         value loss
     """
-    vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
+    pad_fn = tpu_no_padding_2_padding if get_device_name() == "tpu" else no_padding_2_padding
+    vpreds = pad_fn(model_output["values"], data)  # (bsz, response_length)
 
     # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
     # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
