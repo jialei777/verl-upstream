@@ -56,6 +56,7 @@ from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, Torchtita
 from verl.workers.engine.torchtitan.tpu_utils import (
     compute_global_batch_num_tokens,
     monkey_patch_varlen_attention_tpu,
+    pad_packed_inputs_for_tpu,
     synchronize_tpu_loss,
     unwrap_metadata,
 )
@@ -778,19 +779,28 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         output_args = {}
 
         if use_remove_padding:
-            input_ids = input_ids.values().unsqueeze(0)
-            if position_ids.dim() == 3:
-                position_ids = position_ids.values().unsqueeze(1)
+            if get_device_name() == "tpu":
+                input_ids, position_ids, labels, attention_mask, orig_seq_len = pad_packed_inputs_for_tpu(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    micro_batch=micro_batch,
+                    device=get_device_id(),
+                )
+                output_args["orig_seq_len"] = orig_seq_len
             else:
-                position_ids = position_ids.values().unsqueeze(0)
+                input_ids = input_ids.values().unsqueeze(0)
+                if position_ids.dim() == 3:
+                    position_ids = position_ids.values().unsqueeze(1)
+                else:
+                    position_ids = position_ids.values().unsqueeze(0)
 
-            labels = torch.roll(input_ids, shifts=-1, dims=1)
-            attn_type = self.engine_config.attn_type
-            attention_mask = get_attention_masks(
-                input_batch=input_ids,
-                positions=position_ids,
-                attn_type=attn_type,
-            )
+                labels = torch.roll(input_ids, shifts=-1, dims=1)
+                attn_type = self.engine_config.attn_type
+                attention_mask = get_attention_masks(
+                    input_batch=input_ids,
+                    positions=position_ids,
+                    attn_type=attn_type,
+                )
         else:
             loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
@@ -892,9 +902,21 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
 
-            log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
-            if calculate_entropy:
-                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+            padded_log_probs = log_probs.squeeze(0)
+            orig_seq_len = output_args.get("orig_seq_len")
+            if orig_seq_len is not None:
+                cu_seqlens_cpu = cu_seqlens.detach().cpu()
+                unpadded_log_probs = padded_log_probs.detach().cpu()[:orig_seq_len]
+                log_probs = torch.nested.nested_tensor_from_jagged(unpadded_log_probs, cu_seqlens_cpu)
+                log_probs._tpu_padded_values = padded_log_probs
+                if calculate_entropy:
+                    unpadded_entropy = entropy_rmpad.detach().cpu()[:orig_seq_len]
+                    entropy = torch.nested.nested_tensor_from_jagged(unpadded_entropy, cu_seqlens_cpu)
+                    entropy._tpu_padded_values = entropy_rmpad
+            else:
+                log_probs = torch.nested.nested_tensor_from_jagged(padded_log_probs, cu_seqlens)
+                if calculate_entropy:
+                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
         else:
             logits = logits / temperature
             if calculate_entropy:
@@ -922,7 +944,8 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
-        micro_batch = micro_batch.to(get_device_id())
+        if device_name != "tpu":
+            micro_batch = micro_batch.to(get_device_id())
 
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
@@ -939,6 +962,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            for val in model_output.values():
+                if hasattr(val, "_tpu_padded_values"):
+                    delattr(val, "_tpu_padded_values")
 
             # Detach before this lands in forward_backward_batch's output_lst; see detach_tree.
             output = {

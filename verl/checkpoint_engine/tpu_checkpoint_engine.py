@@ -383,6 +383,8 @@ class TPUCheckpointEngine(CheckpointEngine):
         weights: Generator[tuple[str, torch.Tensor], None, None],
         global_steps: int | None = None,
     ):
+        import gc
+
         t_start = time.perf_counter()
 
         try:
@@ -393,9 +395,17 @@ class TPUCheckpointEngine(CheckpointEngine):
             pass
 
         if not self.is_master:
-            # Non-master ranks must consume the generator to prevent hangs
-            for _ in weights:
+            # Non-master ranks must consume the generator to participate in FSDP all-gathers,
+            # then synchronize and collect so lazy all-gather buffers do not accumulate.
+            for _k, v in weights:
+                del v
+            try:
+                import torch_tpu
+
+                torch_tpu._internal.sync.synchronize(wait=True)
+            except Exception:
                 pass
+            gc.collect()
             return
 
         step_key = global_steps if global_steps is not None else 0
@@ -406,6 +416,7 @@ class TPUCheckpointEngine(CheckpointEngine):
         grouped_weights = {}
         for k, v in weights:
             cpu_v = v.detach().cpu()
+            del v
             if "layers." in k:
                 # Extract layer part: model.layers.12.self_attn... -> model.layers.12
                 parts = k.split(".")
@@ -414,15 +425,23 @@ class TPUCheckpointEngine(CheckpointEngine):
             else:
                 group_name = "other"
             grouped_weights.setdefault(group_name, []).append((k, cpu_v))
+        try:
+            import torch_tpu
+
+            torch_tpu._internal.sync.synchronize(wait=True)
+        except Exception:
+            pass
         t_offload = time.perf_counter() - t_offload_start
 
-        # Time grouping and flattening
+        # Time grouping and flattening (pop groups as we flatten to avoid holding 2x CPU copies)
         t_group_start = time.perf_counter()
         grouped_dict = {}
-        for group_name, group_items in grouped_weights.items():
+        for group_name in list(grouped_weights.keys()):
+            group_items = grouped_weights.pop(group_name)
             by_dtype = {}
             for k, cpu_v in group_items:
                 by_dtype.setdefault(cpu_v.dtype, []).append((k, cpu_v))
+            del group_items
 
             flat_tensors = {}
             metadata = {}
@@ -433,6 +452,8 @@ class TPUCheckpointEngine(CheckpointEngine):
                 else:
                     flat_tensors[dtype] = flat_cpu.numpy()
                 metadata[dtype] = [(k, v.shape, v.numel()) for k, v in items]
+                del items
+            del by_dtype
 
             grouped_dict[group_name] = {"flat_tensors": flat_tensors, "metadata": metadata}
 
@@ -442,11 +463,14 @@ class TPUCheckpointEngine(CheckpointEngine):
         # Time Ray Put upload
         t_put_start = time.perf_counter()
         ref = ray.put(state_dict)
+        del grouped_dict, state_dict
         t_put = time.perf_counter() - t_put_start
 
         # Time Registry update
         t_reg_start = time.perf_counter()
         await self.registry.set_weights.remote(step_key, [ref])
+        del ref
+        gc.collect()
         t_reg = time.perf_counter() - t_reg_start
 
         t_total = time.perf_counter() - t_start
@@ -465,6 +489,8 @@ class TPUCheckpointEngine(CheckpointEngine):
 
 async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
     """Synchronize weights from actor worker group to rollout replicas on TPU."""
+    import gc
+
     t_abort_start = time.perf_counter()
     if global_steps and global_steps > 0:
         try:
@@ -496,12 +522,23 @@ async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
             "debug logging enabled on verl.checkpoint_engine to confirm which rank "
             "was elected is_master."
         )
+    del published
 
     futures = [
         replica.server_handle.collective_rpc.remote(method="load_weights_from_ray_registry", args=(step_key,))
         for replica in manager.replicas
     ]
     results = await asyncio.gather(*futures)
+
+    # Release the state_dict ObjectRef from TPUWeightRegistry immediately after all
+    # rollout replicas have loaded the weights so it does not stay pinned in the
+    # actor node's Ray Object Store during the subsequent training step.
+    try:
+        await registry.clear.remote()
+    except Exception:
+        pass
+    gc.collect()
+
     t_total = time.perf_counter() - t_total_start
 
     flat_counts: list = []

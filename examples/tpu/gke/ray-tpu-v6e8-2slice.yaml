@@ -90,17 +90,21 @@ spec:
               imagePullPolicy: Always
               resources:
                 limits:
-                  memory: "200Gi"
+                  memory: "400Gi"
                   # Each Worker node has 4 TPU chips.
                   google.com/tpu: "4"
                 requests:
                   cpu: "48"
-                  memory: "200Gi"
+                  memory: "400Gi"
                   # Each Worker node has 4 TPU chips.
                   google.com/tpu: "4"
               env:
                 - name: RAY_TRAIN_V2_ENABLED
                   value: "1"
+                - name: RAY_memory_monitor_refresh_ms
+                  value: "0"
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
                 - name: HF_TOKEN
                   valueFrom:
                     secretKeyRef:

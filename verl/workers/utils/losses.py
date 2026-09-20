@@ -23,7 +23,7 @@ from verl.utils.device import get_device_name
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
-from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor
+from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor, tpu_no_padding_2_padding
 from verl.workers.utils.padding import no_padding_2_padding
 
 
@@ -39,11 +39,18 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # for each sample, loss mask shape is [1, prompt_length + response_length]
         loss_mask = data["loss_mask"]
 
-        log_prob_flatten = log_prob.values()
-        loss_mask_flatten = loss_mask.values()
-
-        # left-shift the loss mask by one token to align with log_prob
-        loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
+        log_prob_flatten = getattr(log_prob, "_tpu_padded_values", None)
+        if log_prob_flatten is not None:
+            loss_mask_flatten = torch.roll(loss_mask.values().detach().cpu(), shifts=-1, dims=0)
+            pad_len = int(log_prob_flatten.shape[0]) - int(loss_mask_flatten.shape[0])
+            if pad_len > 0:
+                loss_mask_flatten = torch.nn.functional.pad(loss_mask_flatten, (0, pad_len), value=0)
+            loss_mask_flatten = loss_mask_flatten.to(device=log_prob_flatten.device)
+        else:
+            log_prob_flatten = log_prob.values()
+            loss_mask_flatten = loss_mask.values()
+            # left-shift the loss mask by one token to align with log_prob
+            loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
 
         # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
@@ -58,10 +65,11 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
-    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    pad_fn = tpu_no_padding_2_padding if get_device_name() == "tpu" else no_padding_2_padding
+    log_prob = pad_fn(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
-        entropy = no_padding_2_padding(entropy, data)
+        entropy = pad_fn(entropy, data)
 
     # global batch info for loss aggregation
     dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)

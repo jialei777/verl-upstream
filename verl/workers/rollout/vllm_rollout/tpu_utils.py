@@ -312,7 +312,7 @@ def patch_vllm_for_tpu() -> None:
                             try:
                                 old_step_str = parts[2].split(".")[0]
                                 old_step = int(old_step_str)
-                                if old_step < step_key:
+                                if old_step != step_key:
                                     old_path = os.path.join(shm_dir, file_name)
                                     os.remove(old_path)
                             except ValueError:
