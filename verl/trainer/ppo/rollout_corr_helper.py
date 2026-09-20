@@ -845,6 +845,12 @@ def compute_rollout_correction_and_rejection_mask(
             f"log_prob shape {old_log_prob.shape} does not match response_mask shape {response_mask.shape}."
         )
 
+    from verl.utils.device import get_device_name
+
+    if (get_device_name() == "tpu") and rollout_log_prob is not None:
+        single_tok_corrupt = (response_mask.sum(dim=-1, keepdim=True) <= 1) & (rollout_log_prob < -20.0)
+        rollout_log_prob = torch.where(single_tok_corrupt, old_log_prob.detach(), rollout_log_prob)
+
     # Step 1: Compute log ratio (log(π_train / π_rollout))
     log_ratio: torch.Tensor = old_log_prob - rollout_log_prob
     metrics: dict[str, float] = {}
@@ -953,6 +959,12 @@ def compute_offpolicy_metrics(
 
     # 2. Compute rollout off-policy metrics (only if rollout_log_probs available)
     if rollout_log_prob is not None:
+        from verl.utils.device import get_device_name
+
+        if get_device_name() == "tpu":
+            single_tok_corrupt = (response_mask.sum(dim=-1, keepdim=True) <= 1) & (rollout_log_prob < -20.0)
+            rollout_log_prob = torch.where(single_tok_corrupt, old_log_prob.detach(), rollout_log_prob)
+
         # 2a. kl: Direct estimator for KL(π_rollout || π_training)
         # This is the standard KL divergence: E[log(π_rollout) - log(π_training)]
         # Positive value means rollout policy is more confident than training policy
@@ -1127,6 +1139,15 @@ def apply_bypass_mode(
         The implementation is copied from szrlee <szrlee@gmail.com>.
     """
     from omegaconf import open_dict
+
+    from verl.utils.device import get_device_name
+
+    if get_device_name() == "tpu":
+        raise ValueError(
+            "algorithm.rollout_correction.bypass_mode=True is not supported on TPU because "
+            "vLLM TPU V0 engine logprobs on 1-token EOS responses can diverge from TorchTitan "
+            "logprobs. Set bypass_mode=False so TorchTitan recomputes old_log_probs."
+        )
 
     if "rollout_log_probs" not in batch.batch:
         raise ValueError(
