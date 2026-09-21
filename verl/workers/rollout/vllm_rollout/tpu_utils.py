@@ -49,25 +49,50 @@ DEFAULT_TPU_TOPOLOGY_MAP = {
     128: "8,16,1",
     256: "16,16,1",
 }
+DEFAULT_TPU_V7X_TOPOLOGY_MAP = {
+    1: "1,1,1,1",
+    2: "1,1,1,2",
+    4: "1,2,1,2",
+    8: "2,2,1,2",
+    16: "2,2,2,2",
+}
 
 
 def _resolve_tpu_topology_bounds(
-    total_chips: int, num_nodes: int, fallback_map: dict | None = None
+    total_chips: int,
+    num_nodes: int,
+    fallback_map: dict | None = None,
+    is_v7x: bool | None = None,
 ) -> tuple[str, str, str, str]:
     """Dynamically resolves (topology, host_bounds, chips_per_host_bounds, chips_per_host) for TPU slices."""
+    if is_v7x is None:
+        try:
+            from verl.plugin.platform.platform_tpu import is_tpu_v7x as _check_tpu_v7x
+
+            is_v7x = _check_tpu_v7x()
+        except Exception:
+            is_v7x = False
+
     topo_map = dict(fallback_map) if fallback_map else {}
-    topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
-
-    topology = os.environ.get("TORCH_TPU_TOPOLOGY") or topo_map.get(total_chips, "1,1,1")
-    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
-    chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
-
-    if total_chips <= 4:
-        host_bounds = "1,1,1"
-        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
-    else:
+    if is_v7x:
+        topo_map.update(DEFAULT_TPU_V7X_TOPOLOGY_MAP)
+        topology = os.environ.get("TORCH_TPU_TOPOLOGY") or topo_map.get(total_chips, "1,1,1,1")
         host_bounds = topology
-        chips_per_host_bounds = "1,1,1"
+        chips_per_host_bounds = "1,1,1,1"
+        inferred_chips_per_host = max(total_chips // max(1, num_nodes), 8 if total_chips >= 8 else total_chips)
+        chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+    else:
+        topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
+        topology = os.environ.get("TORCH_TPU_TOPOLOGY") or topo_map.get(total_chips, "1,1,1")
+        inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+        chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+        if total_chips <= 4:
+            host_bounds = "1,1,1"
+            chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+        else:
+            host_bounds = topology
+            chips_per_host_bounds = "1,1,1"
 
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
@@ -858,8 +883,16 @@ def patch_vllm_for_tpu() -> None:
             "TPU_TOPOLOGY_MAP",
             getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", None),
         )
+        try:
+            from verl.plugin.platform.platform_tpu import is_tpu_v7x as _check_tpu_v7x
+        except Exception:
+            _check_tpu_v7x = lambda: False
+
         if _topo_map is not None:
-            _topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
+            if _check_tpu_v7x():
+                _topo_map.update(DEFAULT_TPU_V7X_TOPOLOGY_MAP)
+            else:
+                _topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -867,12 +900,13 @@ def patch_vllm_for_tpu() -> None:
             if key in (
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES",
                 "TPU_PROCESS_ADDRESSES",
-                "TPU_CHIPS_PER_HOST_BOUNDS",
-                "TPU_HOST_BOUNDS",
-                "TORCH_TPU_TOPOLOGY",
-                "TPU_WORKER_HOSTNAMES",
             ):
-                value = os.environ.get(key, value)
+                existing = os.environ.get(key)
+                # Prevent torch_tpu's single-device fallback ("localhost:...") from clobbering
+                # an already-configured multi-worker slicebuilder address list, while allowing
+                # explicit worker environment updates to override KubeRay pod-level defaults.
+                if existing and "localhost:" not in existing and "localhost:" in str(value):
+                    value = existing
             elif key == "LIBTPU_INIT_ARGS":
                 value = value.replace("--deepsea_chip_config_name=megachip_tccontrol", "")
             original_driver_environ_setitem(self, key, value)
@@ -886,8 +920,9 @@ def patch_vllm_for_tpu() -> None:
 
             def patched_avail_res(*args, **kwargs):
                 res_map = orig_avail_res(*args, **kwargs)
+                min_tpus = 8.0 if _check_tpu_v7x() else 4.0
                 for node_id, res in res_map.items():
-                    res["TPU"] = max(res.get("TPU", 0.0), 4.0)
+                    res["TPU"] = max(res.get("TPU", 0.0), min_tpus)
                 return res_map
 
             v1_ray_utils.available_resources_per_node = patched_avail_res
@@ -1080,9 +1115,17 @@ def patch_vllm_for_tpu() -> None:
             if self.parallel_config.ray_workers_use_nsight:
                 ray_remote_kwargs = self._configure_ray_workers_use_nsight(ray_remote_kwargs)
 
+            if not os.environ.get("VLLM_RAY_BUNDLE_INDICES") and placement_group is not None:
+                indices = [str(i) for i in range(len(placement_group.bundle_specs))]
+                if indices and len(indices) >= self.parallel_config.world_size:
+                    os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(indices[: self.parallel_config.world_size])
+
             bundle_indices = []
-            if vllm_envs is not None and vllm_envs.VLLM_RAY_BUNDLE_INDICES:
-                bundle_indices = list(map(int, vllm_envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
+            env_bundle_indices = os.environ.get("VLLM_RAY_BUNDLE_INDICES") or (
+                vllm_envs.VLLM_RAY_BUNDLE_INDICES if vllm_envs is not None else None
+            )
+            if env_bundle_indices:
+                bundle_indices = list(map(int, env_bundle_indices.split(",")))
                 assert len(bundle_indices) == self.parallel_config.world_size, (
                     "VLLM_RAY_BUNDLE_INDICES must have the same size"
                     f" as the world size, but got {bundle_indices=} "
@@ -1095,22 +1138,55 @@ def patch_vllm_for_tpu() -> None:
                 for bundle_id, bundle in enumerate(placement_group.bundle_specs):
                     if current_platform is not None and bundle.get(current_platform.ray_device_key, 0):
                         bundle_indices.append(bundle_id)
+                if not bundle_indices:
+                    bundle_indices = list(
+                        range(min(len(placement_group.bundle_specs), self.parallel_config.world_size))
+                    )
 
             worker_metadata = []
             driver_ip = get_ip() if get_ip is not None else ""
+
+            # Determine per-worker Ray TPU resource fraction so 8 TensorCore workers fit on a 4-chip TPU 7x node
             num_tpu_per_worker = 1.0
+            try:
+                avail_node_res = orig_avail_res()
+                pg_table = ray._private.state.state.placement_group_table(placement_group.id)
+                bundles_to_node = pg_table.get("bundles_to_node_id", {})
+                if bundles_to_node:
+                    node_bundle_counts = defaultdict(int)
+                    for b_id in bundle_indices:
+                        nid = bundles_to_node.get(b_id)
+                        if nid:
+                            node_bundle_counts[nid] += 1
+                    for nid, count in node_bundle_counts.items():
+                        node_free_tpu = float(avail_node_res.get(nid, {}).get("TPU", 0.0))
+                        if count > 0 and node_free_tpu < count:
+                            num_tpu_per_worker = min(
+                                num_tpu_per_worker,
+                                (node_free_tpu / float(count)) if node_free_tpu > 0 else 0.0,
+                            )
+                elif _check_tpu_v7x() and self.parallel_config.world_size >= 8:
+                    num_tpu_per_worker = 0.5
+            except Exception as res_err:
+                if _check_tpu_v7x() and self.parallel_config.world_size >= 8:
+                    num_tpu_per_worker = 0.5
+                logger.debug(f"Could not inspect placement group node TPU capacity: {res_err}")
+
             for rank, bundle_id in enumerate(bundle_indices):
                 scheduling_strategy = PlacementGroupSchedulingStrategy(
                     placement_group=placement_group,
                     placement_group_capture_child_tasks=True,
                     placement_group_bundle_index=bundle_id,
                 )
+                worker_resources = (
+                    {current_platform.ray_device_key: num_tpu_per_worker}
+                    if (current_platform is not None and num_tpu_per_worker > 0)
+                    else {}
+                )
                 worker = ray.remote(
                     num_cpus=0,
                     num_gpus=0,
-                    resources={current_platform.ray_device_key: num_tpu_per_worker}
-                    if current_platform is not None
-                    else {},
+                    resources=worker_resources,
                     scheduling_strategy=scheduling_strategy,
                     **ray_remote_kwargs,
                 )(RayWorkerWrapper_local).remote(rpc_rank=rank)
@@ -1190,10 +1266,12 @@ def patch_vllm_for_tpu() -> None:
             logger.info(f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {sb_addresses_str}")
 
             total_chips = len(self.workers)
+            is_v7x = _check_tpu_v7x()
             topology, host_bounds, chips_per_host_bounds, chips_per_host = _resolve_tpu_topology_bounds(
                 total_chips=total_chips,
                 num_nodes=num_nodes,
                 fallback_map=TPU_TOPOLOGY_MAP_local,
+                is_v7x=is_v7x,
             )
 
             rank_0_node_id = unique_node_ids[0]
@@ -1205,13 +1283,14 @@ def patch_vllm_for_tpu() -> None:
             for i in range(total_chips):
                 node_id = worker_node_and_tpu_ids[i][0]
                 node_rank = unique_node_ids.index(node_id)
+                local_ws = len(node_workers[node_id]) or len(node_tpus[node_id]) or total_chips
                 args = {
                     "NNODES": str(num_nodes),
                     "NODE_RANK": str(node_rank),
                     "MASTER_ADDR": master_addr,
                     "MASTER_PORT": master_port,
                     "TORCH_TPU_TOPOLOGY": topology,
-                    "LOCAL_WORLD_SIZE": str(len(node_tpus[node_id])),
+                    "LOCAL_WORLD_SIZE": str(local_ws),
                     "TPU_NUM_HOSTS": str(num_nodes),
                 }
                 if "TORCH_TPU_XPROF_SESSION_ID" not in os.environ:
@@ -1246,30 +1325,36 @@ def patch_vllm_for_tpu() -> None:
             try:
                 unique_host_ips = [sorted_worker_metadata[node_workers[nid][0]].ip for nid in unique_node_ids]
                 host_names_str = ",".join(unique_host_ips)
+                device_offset = int(os.environ.get("DEBUG_TPU_LOCAL_RANK_OFFSET", "0"))
                 for i, worker in enumerate(self.workers):
                     node_id = worker_node_and_tpu_ids[i][0]
                     host_idx = unique_node_ids.index(node_id)
                     local_chip_id = node_workers[node_id].index(i)
+                    effective_chip_id = local_chip_id + device_offset
                     args = self._env_vars_for_all_workers[i]
                     args["RANK"] = str(i)
                     args["LOCAL_RANK"] = str(local_chip_id)
-                    args["TPU_VISIBLE_CHIPS"] = str(local_chip_id)
+                    args["TPU_VISIBLE_CHIPS"] = str(effective_chip_id)
+                    args["TPU_VISIBLE_DEVICES"] = str(effective_chip_id)
+                    args["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
                     args["TPU_PROCESS_PORT"] = str(base_port + local_chip_id)
-                    args["CLOUD_TPU_TASK_ID"] = str(host_idx)
+                    args["CLOUD_TPU_TASK_ID"] = str(i)
                     args["TPU_WORKER_HOSTNAMES"] = host_names_str
                     args["TPU_HOST_BOUNDS"] = host_bounds
+                    args["TPU_PROCESS_BOUNDS"] = host_bounds
                     args["TPU_CHIPS_PER_HOST_BOUNDS"] = chips_per_host_bounds
+                    args["TPU_CHIPS_PER_PROCESS_BOUNDS"] = chips_per_host_bounds
                     args["CHIPS_PER_HOST"] = chips_per_host
                     args["TORCH_TPU_TOPOLOGY"] = topology
                     args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
                     args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
-                    if total_chips > 4 or num_nodes > 1:
+                    if total_chips > 4 or num_nodes > 1 or is_v7x:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
                     logger.info(
-                        f"Configured TPU worker {i} (host {host_idx}, chip {local_chip_id}) env vars: "
-                        f"TPU_VISIBLE_CHIPS={local_chip_id}, TPU_PROCESS_PORT={base_port + local_chip_id}, "
-                        f"CLOUD_TPU_TASK_ID={host_idx}"
+                        f"Configured TPU worker {i} (host {host_idx}, chip {effective_chip_id}) env vars: "
+                        f"TPU_VISIBLE_DEVICES={effective_chip_id}, TPU_PROCESS_PORT={base_port + local_chip_id}, "
+                        f"CLOUD_TPU_TASK_ID={i}, TORCH_TPU_TOPOLOGY={topology}"
                     )
             except Exception as patch_err:
                 logger.warning(f"Failed to inject TPU worker env vars: {patch_err}")
@@ -1474,6 +1559,8 @@ async def get_tpu_server_launch_config(workers):
                     in (
                         "CLOUD_TPU_TASK_ID",
                         "CHIPS_PER_HOST",
+                        "ALLOW_MULTIPLE_LIBTPU_LOAD",
+                        "DEBUG_TPU_LOCAL_RANK_OFFSET",
                         "JAX_MEM_FRACTION",
                         "JAX_THREE_G_MEM_ALLOC_ON_FREE",
                         "XLA_PYTHON_CLIENT_PREALLOCATE",

@@ -155,7 +155,12 @@ class RayResourcePool(ResourcePool):
         bundle = {"CPU": self.max_colocate_count}
         if get_platform().device_name == "tpu":
             get_platform().configure_placement_group_bundle(
-                bundle, self.use_gpu, device_name, self.name_prefix, self.accelerator_type
+                bundle,
+                self.use_gpu,
+                device_name,
+                self.name_prefix,
+                self.accelerator_type,
+                process_count=self._store[0] if self._store else None,
             )
         else:
             if self.use_gpu:
@@ -243,13 +248,33 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
-        device_name = get_platform().ray_resource_name()
-        total_cluster_gpus = sum(
-            node.get("Resources", {}).get(device_name, 0) for node in ray.nodes() if node.get("Alive", False)
-        )
+        platform = get_platform()
+        device_name = platform.ray_resource_name()
+        if hasattr(platform, "get_logical_device_count_on_node"):
+            total_cluster_gpus = sum(
+                platform.get_logical_device_count_on_node(node) for node in ray.nodes() if node.get("Alive", False)
+            )
+        else:
+            total_cluster_gpus = sum(
+                node.get("Resources", {}).get(device_name, 0) for node in ray.nodes() if node.get("Alive", False)
+            )
         total_required_gpus = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
+        # On TPU clusters where rollout placement groups omit hard TPU bundle reservations, validate against
+        # the largest pool requirement if single-slice sharing is active, otherwise against total required devices.
+        if platform.device_name == "tpu" and total_cluster_gpus < total_required_gpus:
+            max_pool_gpus = max(
+                (sum(process_on_nodes) for process_on_nodes in self.resource_pool_spec.values()),
+                default=0,
+            )
+            if total_cluster_gpus >= max_pool_gpus > 0:
+                logger.warning(
+                    f"TPU cluster logical device count ({total_cluster_gpus}) is less than sum of all pools "
+                    f"({total_required_gpus}), but satisfies max single pool ({max_pool_gpus}). "
+                    "Allowing shared-slice TPU placement."
+                )
+                return
         if total_cluster_gpus < total_required_gpus:
             raise ValueError(
                 f"Total cluster {device_name} count ({total_cluster_gpus}) "
