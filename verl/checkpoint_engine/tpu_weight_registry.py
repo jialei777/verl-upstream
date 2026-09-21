@@ -23,6 +23,21 @@ class TPUWeightRegistry:
 
     def __init__(self):
         self.weights = {}
+        self.checksums = {}
+        self.controller_address = None
+        self.sampler_meta = {}
+
+    def set_controller_address(self, addr: str):
+        self.controller_address = addr
+
+    def get_controller_address(self):
+        return self.controller_address
+
+    def set_sampler_meta(self, rank: int, meta: dict):
+        self.sampler_meta[rank] = meta
+
+    def get_sampler_meta(self):
+        return self.sampler_meta
 
     def set_weights(self, step, ref):
         self.weights[step] = ref
@@ -46,6 +61,32 @@ class TPUWeightRegistry:
     def get_weights(self, step):
         return self.weights.get(step, None)
 
+    def set_checksum(self, step: int, checksum: dict):
+        self.checksums[step] = checksum
+        for old_step in [s for s in self.checksums if s != step]:
+            del self.checksums[old_step]
+
+    def get_checksum(self, step: int):
+        return self.checksums.get(step, None)
+
     def clear(self):
         """Drops every cached entry. Used to reset state left by a previous job."""
         self.weights.clear()
+        self.checksums.clear()
+        self.sampler_meta.clear()
+
+
+def get_tpu_weight_registry():
+    """Retrieve or create the detached TPUWeightRegistry Ray actor."""
+    actor_name = "TPUWeightRegistry"
+    namespace = "verl"
+    try:
+        return ray.get_actor(actor_name, namespace=namespace)
+    except ValueError:
+        try:
+            return TPUWeightRegistry.options(
+                name=actor_name, namespace=namespace, lifetime="detached"
+            ).remote()
+        except Exception:
+            return ray.get_actor(actor_name, namespace=namespace)
+

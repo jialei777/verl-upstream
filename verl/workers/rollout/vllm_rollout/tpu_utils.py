@@ -219,6 +219,284 @@ def patch_vllm_for_tpu() -> None:
     def dummy_reset_encoder_cache(*args, **kwargs):
         pass
 
+    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
+        """Initialize Raiden WeightSynchronizer on Sampler worker and register with central RaidenController."""
+        rank_val = getattr(
+            self, "rank", getattr(self, "adjusted_rank", getattr(self, "rpc_rank", int(os.environ.get("RANK", "0"))))
+        )
+        if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
+            return True
+
+        if hasattr(self, "worker") and self.worker is not None:
+            worker_inst = self.worker
+        else:
+            worker_inst = self
+
+        if hasattr(worker_inst, "get_model"):
+            vllm_model = worker_inst.get_model()
+        else:
+            vllm_model = getattr(worker_inst, "model_runner", None)
+            if vllm_model is not None and hasattr(vllm_model, "model"):
+                vllm_model = vllm_model.model
+
+        if vllm_model is None:
+            logging.getLogger(__name__).warning("Raiden Sampler: could not locate vllm_model to bind parameters.")
+            return False
+
+        if hasattr(torch, "tpu") and hasattr(torch.tpu, "synchronize"):
+            torch.tpu.synchronize()
+
+        from tpu_sync.rpc import raiden_service_pb2
+        from verl.checkpoint_engine.raiden_checkpoint_engine import (
+            _create_torch_weight_synchronizer,
+        )
+
+        bind_ip = ray.util.get_node_ip_address().strip("[]")
+        listener_port = getattr(self, "_saved_sampler_listener_port", 0)
+
+        flipped_weight_keys = {
+            f"{mod_name}.weight" if mod_name else "weight"
+            for mod_name, mod in vllm_model.named_modules()
+            if getattr(mod, "_tpu_weight_flipped", False)
+        }
+
+        named_params = list(vllm_model.named_parameters())
+        has_embed = any("embed_tokens" in k or "tok_embeddings" in k for k, _ in named_params)
+        if has_embed:
+            named_params = [
+                (k, v)
+                for k, v in named_params
+                if not (k == "lm_head.weight" or k.endswith(".lm_head.weight"))
+            ]
+        sorted_params = sorted(named_params, key=lambda x: x[0])
+
+        device = torch.device("tpu:0" if hasattr(torch, "tpu") else "tpu")
+        valid_params = []
+        for name, p in sorted_params:
+            if p is None:
+                continue
+            t = p.data if hasattr(p, "data") else p
+            if hasattr(t, "to_local"):
+                t = t.to_local()
+            if hasattr(t, "data"):
+                t = t.data
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.numel() == 0 or getattr(t, "is_meta", False):
+                continue
+            if not (hasattr(t, "device") and str(t.device).startswith("tpu")):
+                try:
+                    t = t.to(device)
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Could not move {name} to TPU: {e}")
+                    continue
+            if not t.is_contiguous() or t.storage_offset() != 0 or t.untyped_storage().nbytes() != t.nbytes:
+                t = t.contiguous().clone()
+            valid_params.append((name, t, p))
+
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
+
+        self._sorted_vllm_params = [(name, t, p) for name, t, p in valid_params]
+        sampler_tensors = [[t] for name, t, p in valid_params]
+
+        print(
+            f"@@@ [RAIDEN SAMPLER] Rank {rank_val}: binding {len(sampler_tensors)} tensors to WeightSynchronizer "
+            f"(sample tensor: name={valid_params[0][0]}, shape={list(valid_params[0][1].shape)}, "
+            f"device={valid_params[0][1].device}, dtype={valid_params[0][1].dtype}, "
+            f"total numel={sum(t.numel() for t in [v[1] for v in valid_params])})",
+            flush=True,
+        )
+
+        self._raiden_ws = _create_torch_weight_synchronizer(
+            sampler_tensors,
+            local_port=getattr(self, "_saved_sampler_local_port", 0),
+            parallelism=parallelism,
+            listener_port=listener_port,
+            bind_ip=bind_ip,
+        )
+        self._saved_sampler_local_port = self._raiden_ws.local_port
+        self._saved_sampler_listener_port = self._raiden_ws.listener_port
+
+        variable_protos = []
+        for idx, (name, t, _) in enumerate(valid_params):
+            shape = list(t.shape)
+            itemsize = t.element_size()
+            layout = list(range(len(shape) - 1, -1, -1))
+            variable_protos.append(
+                raiden_service_pb2.VariableMetadataProto(
+                    name=name,
+                    shape=shape,
+                    mesh_shape=[1] * len(shape),
+                    layout=layout,
+                    item_size=itemsize,
+                    layer_idx=idx,
+                )
+            )
+
+        try:
+            from tpu_sync.rpc import raiden_controller
+
+            controller_addr = None
+            registry = None
+            for _ in range(30):
+                try:
+                    registry = ray.get_actor(TPU_WEIGHT_REGISTRY_ACTOR_NAME, namespace=TPU_WEIGHT_REGISTRY_NAMESPACE)
+                    controller_addr = ray.get(registry.get_controller_address.remote())
+                    if controller_addr:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            if registry is not None:
+                ray.get(
+                    registry.set_sampler_meta.remote(
+                        rank_val,
+                        {
+                            "flipped_keys": list(flipped_weight_keys),
+                            "shapes": {name: list(t.shape) for name, t, _ in valid_params},
+                        },
+                    )
+                )
+
+            data_name = f"weights_{rank_val}"
+            if controller_addr and ":" in controller_addr:
+                ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
+                unit_id = raiden_controller.RaidenId("sampler", str(rank_val), data_name)
+                ctrl_client.register_work_unit(
+                    unit_id,
+                    [f"{bind_ip}:{self._raiden_ws.local_port}"],
+                    f"{bind_ip}:{self._raiden_ws.listener_port}",
+                    mesh_shape=[1, 1],
+                    variables=variable_protos,
+                    mesh_axes=["fsdp", "tp"],
+                )
+                logging.getLogger(__name__).info(
+                    f"Raiden Sampler Rank {rank_val} bound {len(sampler_tensors)} dynamic tensors and registered directly with "
+                    f"RaidenController ({controller_addr}): data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Raiden Sampler Rank {rank_val}: No RaidenController address found in TPUWeightRegistry after timeout"
+                )
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"Raiden Sampler Rank {rank_val} failed to register with RaidenController: {e}"
+            )
+            raise
+
+        return True
+
+    @torch.no_grad()
+    def install_raiden_weights(self) -> int:
+        """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA."""
+        if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
+            logging.getLogger(__name__).warning(
+                "Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized."
+            )
+            return 0
+
+        t_start = time.perf_counter()
+
+        try:
+            hb = self._raiden_ws.get_host_buffer(0, 0)
+            hb_l1 = float(hb.float().abs().sum().item())
+        except Exception:
+            hb_l1 = -1.0
+
+        if hasattr(self._raiden_ws, "h2d"):
+            self._raiden_ws.h2d()
+        else:
+            self._raiden_ws.H2d()
+
+        try:
+            m = self._raiden_ws.get_metrics()
+            print(
+                f"@@@ [RAIDEN DIAG | Sampler] install_raiden_weights: host_buf(0,0) L1={hb_l1:.6f}, "
+                f"metrics: last_h2h_bytes={m.get('last_h2h_bytes')}, total_h2h_bytes={m.get('total_h2h_bytes')}, "
+                f"h2h_time_ms={m.get('last_h2h_time_ms')}",
+                flush=True,
+            )
+        except Exception as diag_e:
+            print(f"@@@ [RAIDEN DIAG | Sampler] install_raiden_weights diag error: {diag_e}", flush=True)
+
+        for name, t, p in self._sorted_vllm_params:
+            target_p = p.to_local() if hasattr(p, "to_local") else p
+            if target_p is not t and getattr(target_p, "data", None) is not t:
+                target_p.data.copy_(t)
+
+        worker_inst = self.worker if hasattr(self, "worker") else self
+        vllm_model = (
+            worker_inst.get_model()
+            if hasattr(worker_inst, "get_model")
+            else getattr(worker_inst, "model_runner", None)
+        )
+        if vllm_model is not None and hasattr(vllm_model, "model"):
+            vllm_model = vllm_model.model
+        if vllm_model is not None and hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
+            if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
+                vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
+
+        t_sync_start = time.perf_counter()
+        try:
+            import torch_xla.core.xla_model as xm
+
+            xm.mark_step()
+        except Exception:
+            pass
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
+        t_sync = time.perf_counter() - t_sync_start
+        t_total = time.perf_counter() - t_start
+
+        msg = (
+            f"[RAIDEN TELEMETRY | Sampler Worker] install_raiden_weights completed in {t_total:.4f}s "
+            f"(TPUSyncBarrier={t_sync:.4f}s)"
+        )
+        logging.getLogger(__name__).info(msg)
+        print(msg, flush=True)
+        return 1
+
+    def get_model_weights_checksum(self) -> dict:
+        """Computes deterministic parameter count, L1 norm, L2 norm, and SHA-256 hash across all model parameters."""
+        worker_inst = self.worker if hasattr(self, "worker") else self
+        vllm_model = (
+            worker_inst.get_model()
+            if hasattr(worker_inst, "get_model")
+            else getattr(worker_inst, "model_runner", None)
+        )
+        if vllm_model is not None and hasattr(vllm_model, "model"):
+            vllm_model = vllm_model.model
+
+        if vllm_model is None:
+            return {"error": "No model found on worker"}
+
+        from verl.checkpoint_engine.raiden_checkpoint_engine import _compute_tensor_checksum
+
+        if hasattr(self, "_sorted_vllm_params") and self._sorted_vllm_params:
+            items = [(name, p) for name, _, p in self._sorted_vllm_params]
+        else:
+            named_params = list(vllm_model.named_parameters())
+            has_embed = any("embed_tokens" in k or "tok_embeddings" in k for k, _ in named_params)
+            if has_embed:
+                named_params = [
+                    (k, v)
+                    for k, v in named_params
+                    if not (k == "lm_head.weight" or k.endswith(".lm_head.weight"))
+                ]
+            items = sorted(named_params, key=lambda x: x[0])
+
+        return _compute_tensor_checksum(items)
+
     def load_weights_from_ray_registry(self, step_key: int):
         rank_val = getattr(
             self, "rank", getattr(self, "adjusted_rank", getattr(self, "rpc_rank", int(os.environ.get("RANK", "0"))))
@@ -471,6 +749,9 @@ def patch_vllm_for_tpu() -> None:
         try:
             TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
             TPUWorker.load_weights_from_ray_registry = load_weights_from_ray_registry
+            TPUWorker.init_raiden_sync_on_worker = init_raiden_sync_on_worker
+            TPUWorker.install_raiden_weights = install_raiden_weights
+            TPUWorker.get_model_weights_checksum = get_model_weights_checksum
             if not isinstance(getattr(TPUWorker, "device", None), property):
                 TPUWorker.device = property(
                     lambda self: self.__dict__.get("device")
@@ -697,6 +978,9 @@ def patch_vllm_for_tpu() -> None:
                 self, 0
             )
             self.__class__.reset_encoder_cache = dummy_reset_encoder_cache
+            self.__class__.init_raiden_sync_on_worker = init_raiden_sync_on_worker
+            self.__class__.install_raiden_weights = install_raiden_weights
+            self.__class__.get_model_weights_checksum = get_model_weights_checksum
 
             torch.set_grad_enabled(False)
 
@@ -704,6 +988,9 @@ def patch_vllm_for_tpu() -> None:
             if hasattr(self, "worker") and self.worker is not None:
                 self.worker.reset_encoder_cache = dummy_reset_encoder_cache
                 self.worker.__class__.reset_encoder_cache = dummy_reset_encoder_cache
+                self.worker.__class__.init_raiden_sync_on_worker = init_raiden_sync_on_worker
+                self.worker.__class__.install_raiden_weights = install_raiden_weights
+                self.worker.__class__.get_model_weights_checksum = get_model_weights_checksum
             return res
 
         OriginalRayWorkerWrapper.init_worker = patched_init_worker

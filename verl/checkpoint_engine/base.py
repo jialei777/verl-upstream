@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
 import ray
 import torch
+
+logger = logging.getLogger(__name__)
 
 from verl.plugin.platform import get_platform
 from verl.single_controller.base import Worker
@@ -416,6 +419,33 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        self.raiden_controller = None
+        self.raiden_controller_server = None
+        self.raiden_controller_address = None
+
+        if self.backend == "raiden":
+            try:
+                from tpu_sync.rpc.raiden_controller import (
+                    RaidenController,
+                    RaidenControllerServer,
+                    WeightSyncWorkerRpcClient,
+                )
+
+                self.raiden_controller = RaidenController(port=0, worker_rpc_client=WeightSyncWorkerRpcClient())
+                self.raiden_controller_server = RaidenControllerServer(self.raiden_controller)
+                self.raiden_controller_server.start()
+                head_ip = ray.util.get_node_ip_address().strip("[]")
+                self.raiden_controller_address = f"{head_ip}:{self.raiden_controller.port}"
+                logger.info(
+                    f"[RAIDEN CONTROLLER] Started embedded RaidenControllerServer on Headnode at {self.raiden_controller_address}"
+                )
+                from verl.checkpoint_engine.tpu_weight_registry import get_tpu_weight_registry
+
+                registry = get_tpu_weight_registry()
+                ray.get(registry.set_controller_address.remote(self.raiden_controller_address))
+            except Exception as e:
+                logger.error(f"Failed to initialize embedded RaidenControllerServer on Headnode: {e}")
+                raise
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -516,6 +546,11 @@ class CheckpointEngineManager:
             from .tpu_checkpoint_engine import update_tpu_weights
 
             return await update_tpu_weights(self, global_steps=global_steps)
+
+        if self.backend == "raiden":
+            from .raiden_checkpoint_engine import update_raiden_weights
+
+            return await update_raiden_weights(self, global_steps=global_steps)
 
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()
