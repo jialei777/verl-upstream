@@ -117,6 +117,27 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
+# Qwen3 ships with thinking mode ON by default (apply_chat_template's enable_thinking
+# defaults to True), so every rollout opens a <think> block. Inspecting the step-10 rollout
+# dump from /tmp/verl_dump/rollout showed 99.2% of samples opened <think>, only 76.6% ever
+# closed it, and 56.2% never emitted the "#### <answer>" line at all -- they ran out of the
+# 1024-token budget mid-reasoning and scored 0.0 despite being on the right track.
+#
+# That is not a policy failure, it is a truncated-reward artifact, and it poisons GRPO twice:
+# the advantage baseline is computed over mostly-zero groups, and the only reliable way for
+# the policy to raise its reward is to stop thinking. Run 39 shows exactly that pathology --
+# response_length/clip_ratio falls 0.355 (step 5) -> 0.0625 (step 65) while the reward curve
+# flattens after ~step 40. The model was learning to dodge the truncation, not to do math.
+#
+# Turning thinking off puts the whole 1024-token budget behind the answer. Set
+# ENABLE_THINKING=True to restore the old behaviour, but then also raise MAX_RESPONSE_LEN
+# (>= 2048) or the truncation artifact comes straight back.
+ENABLE_THINKING="${ENABLE_THINKING:-False}"
+
+# data.shuffle defaults to True while data.seed defaults to null, so two runs of this script
+# saw different prompt orders and the reward curves were not comparable. Pin it.
+DATA_SEED="${DATA_SEED:-42}"
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -139,6 +160,8 @@ python3 -m verl.trainer.main_ppo \
     +data.max_token_len_per_gpu=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    data.seed="${DATA_SEED}" \
+    +data.apply_chat_template_kwargs.enable_thinking="${ENABLE_THINKING}" \
     +data.pad_mode=no_padding \
     actor_rollout_ref.actor.strategy=torchtitan \
     actor_rollout_ref.model.path="${MODEL_PATH}" \

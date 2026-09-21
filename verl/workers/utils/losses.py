@@ -23,8 +23,19 @@ from verl.utils.device import get_device_name
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
-from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor, tpu_no_padding_2_padding
 from verl.workers.utils.padding import no_padding_2_padding
+
+
+def _get_tpu_pad_helpers():
+    """Lazily import the TPU padding helpers.
+
+    ``verl.workers.engine.torchtitan.__init__`` imports the third-party ``torchtitan`` package,
+    which is absent in GPU/CPU installs, so this import must stay out of module scope: this file
+    is imported by every backend.
+    """
+    from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor, tpu_no_padding_2_padding
+
+    return select_and_to_padded_tensor, tpu_no_padding_2_padding
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -65,7 +76,9 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
-    pad_fn = tpu_no_padding_2_padding if get_device_name() == "tpu" else no_padding_2_padding
+    is_tpu = get_device_name() == "tpu"
+    select_and_to_padded_tensor, tpu_no_padding_2_padding = _get_tpu_pad_helpers() if is_tpu else (None, None)
+    pad_fn = tpu_no_padding_2_padding if is_tpu else no_padding_2_padding
     log_prob = pad_fn(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
@@ -100,11 +113,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
-    data = (
-        select_and_to_padded_tensor(data, *fields)
-        if get_device_name() == "tpu"
-        else data.select(*fields).to_padded_tensor()
-    )
+    data = select_and_to_padded_tensor(data, *fields) if is_tpu else data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
@@ -172,7 +181,9 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     Returns:
         value loss
     """
-    pad_fn = tpu_no_padding_2_padding if get_device_name() == "tpu" else no_padding_2_padding
+    is_tpu = get_device_name() == "tpu"
+    select_and_to_padded_tensor, tpu_no_padding_2_padding = _get_tpu_pad_helpers() if is_tpu else (None, None)
+    pad_fn = tpu_no_padding_2_padding if is_tpu else no_padding_2_padding
     vpreds = pad_fn(model_output["values"], data)  # (bsz, response_length)
 
     # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
@@ -196,11 +207,7 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
 
     # select fields and convert to padded tensor
     fields = ("values", "returns", "response_mask")
-    data = (
-        select_and_to_padded_tensor(data, *fields)
-        if get_device_name() == "tpu"
-        else data.select(*fields).to_padded_tensor()
-    )
+    data = select_and_to_padded_tensor(data, *fields) if is_tpu else data.select(*fields).to_padded_tensor()
 
     values = data["values"]
     returns = data["returns"]

@@ -79,6 +79,16 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
+# Qwen3 enables thinking mode by default, which burns the response budget inside <think>
+# before the "#### <answer>" line can be emitted; the truncated sample then scores 0.0 even
+# when the reasoning was correct, and GRPO learns to stop thinking rather than to do math.
+# See run_qwen3_0_6b_torchtitan.sh for the rollout-dump measurements behind this.
+# Set ENABLE_THINKING=True only together with MAX_RESPONSE_LEN>=2048.
+ENABLE_THINKING="${ENABLE_THINKING:-False}"
+
+# data.shuffle defaults to True with data.seed=null, making runs non-reproducible.
+DATA_SEED="${DATA_SEED:-42}"
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -101,6 +111,8 @@ python3 -m verl.trainer.main_ppo \
     +data.max_token_len_per_gpu=4096 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    data.seed="${DATA_SEED}" \
+    +data.apply_chat_template_kwargs.enable_thinking="${ENABLE_THINKING}" \
     +data.pad_mode=no_padding \
     actor_rollout_ref.actor.strategy=torchtitan \
     actor_rollout_ref.model.path="${MODEL_PATH}" \

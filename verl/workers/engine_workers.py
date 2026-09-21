@@ -29,7 +29,6 @@ from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
-from verl.plugin.platform.platform_tpu_workarounds import convert_tensors_to_scalars
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
@@ -216,6 +215,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
         if self.device_name == "tpu":
+            # Imported lazily so non-TPU backends never import TPU-specific modules.
+            from verl.plugin.platform.platform_tpu_workarounds import convert_tensors_to_scalars
+
             # Convert device-bound TPU tensors in the metrics dict to standard Python scalars.
             metrics = convert_tensors_to_scalars(metrics)
 
@@ -250,6 +252,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if forward_only:
                 final_metrics["mfu"] /= 3.0
         if self.device_name == "tpu":
+            from verl.plugin.platform.platform_tpu_workarounds import convert_tensors_to_scalars
+
             # Convert any tensors in final_metrics to scalars/cpu before moving to cpu inside TensorDict
             final_metrics = convert_tensors_to_scalars(final_metrics)
         # model outputs
@@ -359,6 +363,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     append_to_dict(metrics, output)
 
                 if self.device_name == "tpu":
+                    from verl.plugin.platform.platform_tpu_workarounds import convert_tensors_to_scalars
+
                     metrics = convert_tensors_to_scalars(metrics)
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:

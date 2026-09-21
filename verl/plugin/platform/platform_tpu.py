@@ -89,18 +89,33 @@ def get_tpu_chip_hbm_bytes() -> int:
     return -1
 
 
-# Enforce static compilation graph for torch.compile on TPU
-try:
-    _orig_compile = torch.compile
+_TORCH_COMPILE_PATCHED = False
 
-    def patched_compile(*args, **kwargs):
-        if get_platform().device_name == "tpu":
-            kwargs["dynamic"] = False
-        return _orig_compile(*args, **kwargs)
 
-    torch.compile = patched_compile
-except Exception as e:
-    logger.warning(f"Failed to patch torch.compile for TPU: {e}")
+def _patch_torch_compile_for_tpu() -> None:
+    """Enforce static compilation graph (``dynamic=False``) for ``torch.compile`` on TPU.
+
+    This mutates the global ``torch.compile``, so it must NOT run at import time: this module is
+    imported unconditionally by ``platform_manager`` to register the TPU platform, which means an
+    import-time patch would leak into every GPU/CPU/CI process. It is instead applied from
+    ``PlatformTPU.__init__`` only when the current host really is a TPU host, and is idempotent
+    because ``_detect_platform_name()`` may instantiate the class more than once.
+    """
+    global _TORCH_COMPILE_PATCHED
+    if _TORCH_COMPILE_PATCHED:
+        return
+    try:
+        orig_compile = torch.compile
+
+        def patched_compile(*args, **kwargs):
+            if get_platform().device_name == "tpu":
+                kwargs["dynamic"] = False
+            return orig_compile(*args, **kwargs)
+
+        torch.compile = patched_compile
+        _TORCH_COMPILE_PATCHED = True
+    except Exception as e:
+        logger.warning(f"Failed to patch torch.compile for TPU: {e}")
 
 
 class DummyTpuDeviceModule:
@@ -238,6 +253,11 @@ class PlatformTPU(PlatformCUDA):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        # Platform auto-detection instantiates *every* registered platform class to probe it
+        # (see platform_manager._detect_platform_name), so gate the global torch.compile patch on
+        # this host actually being a TPU host. GPU/CPU processes keep the stock torch.compile.
+        if self.is_platform_available():
+            _patch_torch_compile_for_tpu()
 
     @property
     def vendor_name(self) -> str:

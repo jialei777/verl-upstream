@@ -80,7 +80,14 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     and chunked, memory-safe, JIT-partitioned PCIe copying to TPU.
     """
     if state_dict is None:
-        return 0
+        # A worker that could not mmap/deserialize the published state dict would
+        # otherwise keep serving the previous step's weights while reporting "0 keys",
+        # which the caller cannot distinguish from "nothing to do". Fail loudly.
+        raise RuntimeError(
+            f"TPU weight sync failed on rank {rank}: no state dict was provided to "
+            "load_weights_on_worker (the shared-memory/registry fetch failed), so this "
+            "worker would keep running on stale weights."
+        )
 
     t_start = time.perf_counter()
 
@@ -114,6 +121,26 @@ def load_weights_on_worker(vllm_model, state_dict: dict, rank: int) -> int:
     return total_keys
 
 
+def _is_expected_skip(clean_key: str) -> bool:
+    """Whether ``clean_key`` legitimately maps to no vLLM parameter.
+
+    Only two kinds of source tensors are expected to resolve to nothing:
+    the non-leading members of a fused projection (k/v_proj fold into
+    ``qkv_proj``, up_proj folds into ``gate_up_proj``; the group is written once
+    by its leading source), and the ``lm_head.weight`` alias synthesized below
+    from ``tok_embeddings.weight``, which tied-embedding models may not expose
+    as a separate parameter. Anything else that is dropped means the rollout
+    would silently keep a stale tensor, so it must be reported as an error.
+    """
+    for suffix in (".weight", ".bias"):
+        if clean_key.endswith(suffix):
+            base = clean_key[: -len(suffix)]
+            for sources in _FUSED_PROJECTIONS.values():
+                if any(base.endswith(src) for src in sources[1:]):
+                    return True
+    return clean_key.endswith("lm_head.weight")
+
+
 def _load_single_group_on_worker(
     vllm_model,
     group_sd: dict,
@@ -132,19 +159,19 @@ def _load_single_group_on_worker(
     metadata = group_sd["metadata"]
 
     clean_metadata = {}
-    num_keys = 0
+    num_metadata_keys = 0
     for dtype, items in metadata.items():
         clean_items = []
         offset = 0
         for k, shape, numel in items:
             clean_k = get_clean_name(k)
             clean_items.append((clean_k, shape, numel, offset))
-            num_keys += 1
+            num_metadata_keys += 1
 
             if "tok_embeddings.weight" in clean_k:
                 lm_k = clean_k.replace("tok_embeddings", "lm_head")
                 clean_items.append((lm_k, shape, numel, offset))
-                num_keys += 1
+                num_metadata_keys += 1
 
             offset += numel
         clean_metadata[dtype] = clean_items
@@ -170,6 +197,10 @@ def _load_single_group_on_worker(
         if f"model.{parent_name}" in module_dict:
             return module_dict[f"model.{parent_name}"]
         return None
+
+    # Every target that resolved successfully must end up in ``written_keys``; tracked
+    # across dtype groups so the mismatch check below can name what was dropped.
+    planned_keys: set[str] = set()
 
     for dtype, flat_data in flat_tensors.items():
         items = clean_metadata.get(dtype, [])
@@ -294,6 +325,7 @@ def _load_single_group_on_worker(
             target_key, target_shape, target_numel, param_cpu_local_flat = res
             local_tensors_to_cat.append(param_cpu_local_flat)
             local_items.append((target_key, target_shape, target_numel, local_offset))
+            planned_keys.add(target_key)
             local_offset += target_numel
 
         if not local_tensors_to_cat:
@@ -330,7 +362,20 @@ def _load_single_group_on_worker(
 
                 torch_tpu._internal.sync.synchronize(wait=True)
 
-    return num_keys
+    # The previous return value was ``num_keys``, i.e. the count of tensors the
+    # *sender* announced, computed before any key resolution. It stayed correct even when
+    # nothing was copied, so a partial/failed load left this TP shard on stale weights
+    # while still reporting success. Validate the actually-written set instead.
+    unexpected_skips = sorted({k for k in skipped_keys if not _is_expected_skip(k)})
+    not_written = sorted(planned_keys - written_keys)
+    if unexpected_skips or not_written:
+        raise RuntimeError(
+            f"TPU weight sync failed on rank {rank}: {len(written_keys)}/{num_metadata_keys} tensors "
+            f"were written. Keys that resolved to no vLLM parameter: {unexpected_skips}. "
+            f"Keys that resolved but were never copied: {not_written}."
+        )
+
+    return len(written_keys)
 
 
 # =====================================================================
@@ -592,10 +637,15 @@ async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
             flat_counts.extend(replica_result)
         elif replica_result is not None:
             flat_counts.append(replica_result)
-    if flat_counts and not any(isinstance(n, int) and n > 0 for n in flat_counts):
+    # Per-worker, not aggregate: `any(n > 0)` passed as long as a single worker loaded
+    # something, so one TP shard silently left on the previous step's weights (e.g. a
+    # failed mmap of the shared state dict) went unnoticed and corrupted the rollout.
+    int_counts = [n for n in flat_counts if isinstance(n, int)]
+    if int_counts and not all(n > 0 for n in int_counts):
         raise RuntimeError(
-            f"TPU weight sync failed: no rollout worker loaded any tensor for "
-            f"step_key={step_key} (per-worker key counts: {results})."
+            f"TPU weight sync failed: {sum(1 for n in int_counts if n <= 0)}/{len(int_counts)} rollout "
+            f"workers loaded no tensor for step_key={step_key}; those shards are still running the "
+            f"previous step's weights (per-worker key counts: {results})."
         )
 
     logger.info(f"TPU weight sync for step {global_steps} completed in {t_total + t_abort:.3f}s")

@@ -41,6 +41,14 @@ _DEVICE_FLOPS = {
     "Ascend950DT": 432e12,
     "Ascend910": 354e12,
     "RTX 3070 Ti": 21.75e12,
+    # Google TPU. Keys must match torch.tpu.get_device_name() exactly (e.g. "TPU v6e"),
+    # which is what get_torch_device().get_device_name() returns on TPU; the lookup below
+    # is a substring match and none of these names is a substring of another.
+    # Values are published peak bf16 FLOP/s per chip.
+    "TPU v6e": 918e12,
+    "TPU v5p": 459e12,
+    "TPU v5e": 197e12,
+    "TPU v4": 275e12,
 }
 
 

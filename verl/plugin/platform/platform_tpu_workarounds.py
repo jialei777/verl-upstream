@@ -16,8 +16,6 @@
 import logging
 import os
 
-import ray
-import ray._private.worker
 import torch
 
 logger = logging.getLogger(__file__)
@@ -66,6 +64,10 @@ def patch_ray_worker():
     os.environ["VERL_PLATFORM"] = "tpu"
 
     try:
+        # Imported lazily: ``ray._private`` is a private API that may move between Ray releases,
+        # and this module is imported from generic (non-TPU) code paths.
+        import ray._private.worker
+
         original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
 
         def patched_func(self, resource_name, resource_regex):
@@ -162,6 +164,8 @@ def run_trainer_on_tpu(trainer_cls, config):
     Wrapping trainer initialization inside a remote actor ensures that PJRT client initialization
     and device setup run directly on TPU worker nodes.
     """
+    # Imported lazily so this TPU-only module stays importable/cheap from generic code paths.
+    import ray
 
     @ray.remote(num_cpus=DEFAULT_TASK_RUNNER_CPUS, max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY)
     class TaskRunner:

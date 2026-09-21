@@ -498,6 +498,55 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         logger.warning("Response mask is all False, returning default advantage metrics")
         adv_mean = adv_max = adv_min = float("nan")
 
+    # Group-saturation diagnostics.
+    #
+    # Group-baseline estimators (GRPO and friends) subtract the within-prompt mean, so a group
+    # whose samples all received the same reward yields an advantage of exactly zero for every
+    # member. Those samples still occupy tokens in the loss denominator but contribute nothing to
+    # the numerator, so the effective step size is scaled by the fraction of non-degenerate
+    # tokens. With a binary reward this fraction collapses as accuracy approaches either 0 or 1,
+    # which looks exactly like a learning plateau.
+    #
+    # None of the pre-existing metrics reveal this: `critic/advantages/mean` is ~0 by
+    # construction, and max/min are dominated by the extreme groups. These three make the
+    # effective batch size observable.
+    zero_adv_token_mask = (advantages.abs() < 1e-8) & response_mask
+    num_response_tokens = response_mask.sum()
+    effective_token_frac = (
+        1.0 - (zero_adv_token_mask.sum().float() / num_response_tokens.float()).detach().item()
+        if num_response_tokens > 0
+        else float("nan")
+    )
+
+    # Per-sequence: a sequence is "dead" if every one of its response tokens has zero advantage.
+    seq_has_signal = (advantages.abs() >= 1e-8) & response_mask
+    dead_seq_mask = ~seq_has_signal.any(dim=-1)
+    zero_adv_seq_frac = dead_seq_mask.float().mean().detach().item()
+
+    grpo_metrics = {
+        "grpo/zero_adv_seq_frac": zero_adv_seq_frac,
+        "grpo/effective_token_frac": effective_token_frac,
+    }
+
+    # Degenerate-group fraction, when prompt grouping is available.
+    uids = batch.non_tensor_batch.get("uid", None) if hasattr(batch, "non_tensor_batch") else None
+    if uids is not None and len(uids) == sequence_score.shape[0]:
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        scores_list = sequence_score.detach().float().tolist()
+        for uid, sc in zip(uids, scores_list, strict=False):
+            groups[uid].append(sc)
+        if groups:
+            num_degenerate = sum(1 for v in groups.values() if len(v) > 1 and max(v) == min(v))
+            num_singleton = sum(1 for v in groups.values() if len(v) == 1)
+            grpo_metrics["grpo/degenerate_group_frac"] = num_degenerate / len(groups)
+            # Singleton groups get advantage == raw reward (no baseline), which is a different
+            # and much larger-variance estimator than the rest of the batch.
+            grpo_metrics["grpo/singleton_group_frac"] = num_singleton / len(groups)
+            grpo_metrics["grpo/num_groups"] = float(len(groups))
+
+
     if valid_returns.numel() > 0:
         returns_mean = torch.mean(valid_returns).detach().item()
         returns_max = torch.max(valid_returns).detach().item()
@@ -564,6 +613,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/advantages/mean": adv_mean,
         "critic/advantages/max": adv_max,
         "critic/advantages/min": adv_min,
+        **grpo_metrics,
         # returns
         "critic/returns/mean": returns_mean,
         "critic/returns/max": returns_max,

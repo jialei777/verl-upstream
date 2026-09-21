@@ -129,7 +129,16 @@ class BaseEngine:
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
+            # Surface silently-discarded updates. An engine skips the optimizer step when
+            # grad_norm is non-finite; if that happens every step the policy never changes while
+            # the job still reports success, which is indistinguishable from "the task is hard"
+            # unless it is measured. Engines opt in by maintaining these two counters.
+            total_steps = getattr(self, "_num_optimizer_steps", 0)
+            if total_steps > 0:
+                skipped = getattr(self, "_num_skipped_optimizer_steps", 0)
+                outputs["metrics"]["optimizer_step_skip_frac"] = skipped / total_steps
         return outputs
+
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
         """

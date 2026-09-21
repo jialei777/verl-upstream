@@ -73,23 +73,33 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
-if get_resource_name() == "TPU":
+# Canonical "am I on TPU?" predicate for this module. The platform registry is the single source
+# of truth; `tpu_utils.is_tpu_vllm_run()` must NOT be used here because it also returns True when
+# VLLM_USE_V1=0, which is a legal setting on GPU and would run TPU-only code on GPU hosts.
+# Evaluated once at import time because it selects which symbols below are defined.
+_IS_TPU_PLATFORM = get_resource_name() == "TPU"
+
+if _IS_TPU_PLATFORM:
     from verl.workers.rollout.vllm_rollout.tpu_utils import (
-        is_tpu_vllm_run,
         launch_tpu_vllm_servers,
         override_vllm_configs_for_tpu,
         patch_vllm_for_tpu,
         prepare_tpu_server_args,
     )
 else:
+    # No-op fallbacks. Every name bound in the TPU branch must also be bound here, otherwise a
+    # reference on the non-TPU path raises NameError.
 
-    def is_tpu_vllm_run():
-        return False
-
-    def prepare_tpu_server_args(*args, **kwargs):
+    async def launch_tpu_vllm_servers(*args, **kwargs):
         pass
 
     def override_vllm_configs_for_tpu(*args, **kwargs):
+        pass
+
+    def patch_vllm_for_tpu(*args, **kwargs):
+        pass
+
+    def prepare_tpu_server_args(*args, **kwargs):
         pass
 
 
@@ -1365,7 +1375,7 @@ class vLLMReplica(RolloutReplica):
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
 
-        if is_tpu_vllm_run():
+        if _IS_TPU_PLATFORM:
             await launch_tpu_vllm_servers(self)
             return
 
@@ -1517,5 +1527,5 @@ class vLLMReplica(RolloutReplica):
         return "vllm_"
 
 
-if is_tpu_vllm_run():
+if _IS_TPU_PLATFORM:
     patch_vllm_for_tpu()

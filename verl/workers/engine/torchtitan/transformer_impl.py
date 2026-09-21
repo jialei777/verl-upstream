@@ -205,6 +205,13 @@ class TorchTitanEngine(BaseEngine):
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
+            # torchtitan's CheckpointManager.save() early-returns unless
+            # `curr_step % interval == 0` (_should_save(); the Config default is 500),
+            # so with the default every explicit save_checkpoint() call from verl is a
+            # silent no-op. verl already decides *when* to checkpoint via
+            # trainer.save_freq, so force interval=1 to make torchtitan honor every
+            # explicit save() and keep trainer.save_freq the single source of truth.
+            interval=1,
             initial_load_in_hf=True,
             initial_load_model_only=True,
             initial_load_path=model_config.path,
@@ -480,7 +487,13 @@ class TorchTitanEngine(BaseEngine):
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
-        """Perform optimizer step with gradient clipping."""
+        """Perform optimizer step with gradient clipping.
+
+        Returns:
+            float: the gradient norm. The update is discarded when this is non-finite; see
+            ``_num_skipped_optimizer_steps`` / ``_num_optimizer_steps``, which the base engine
+            exports as ``actor/optimizer_step_skip_frac``.
+        """
         # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
         # it returns inf even when every gradient is exactly zero. Since a non-finite
         # grad_norm makes this method skip the update entirely, that silently froze the
@@ -493,14 +506,20 @@ class TorchTitanEngine(BaseEngine):
             ep_enabled=self.parallel_dims.ep_enabled,
         )
 
-        # If grad_norm is not finite the update is thrown away. This is silent by design,
-        # so say it loudly: a run where this fires on every step reports success while the
-        # policy never changes.
+        # If grad_norm is not finite the update is thrown away. A warning alone is not enough:
+        # it lands in a per-worker Ray log that nobody reads on a multi-node run, so a job in
+        # which this fires every single step reports SUCCESS with a flat reward curve and no
+        # visible cause. Count it so the base engine can export it as a metric.
         if not torch.isfinite(grad_norm):
-            logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
+            self._num_skipped_optimizer_steps = getattr(self, "_num_skipped_optimizer_steps", 0) + 1
+            logger.warning(
+                f"grad_norm is not finite ({grad_norm}); skipping this optimizer step "
+                f"(total skipped so far: {self._num_skipped_optimizer_steps})"
+            )
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+        self._num_optimizer_steps = getattr(self, "_num_optimizer_steps", 0) + 1
         return grad_norm.item()
 
     def lr_scheduler_step(self):
@@ -553,7 +572,17 @@ class TorchTitanEngine(BaseEngine):
         if max_ckpt_to_keep is not None:
             self.checkpointer.keep_latest_k = max_ckpt_to_keep
 
-        self.checkpointer.save(curr_step=global_step)
+        # save() returns False when torchtitan decided not to write anything (e.g. the
+        # `curr_step % interval` gate in _should_save()). verl treats save_checkpoint()
+        # as unconditional, so a False here means the checkpoint the trainer believes it
+        # took does not exist on disk; surface it instead of silently losing the state.
+        if not self.checkpointer.save(curr_step=global_step):
+            raise RuntimeError(
+                f"TorchTitan CheckpointManager.save(curr_step={global_step}) wrote nothing to "
+                f"{parent_dir} (enable={getattr(self.checkpointer, 'enable', None)}, "
+                f"interval={getattr(self.checkpointer, 'interval', None)}, "
+                f"load_only={getattr(self.checkpointer, 'load_only', None)})."
+            )
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -572,14 +601,28 @@ class TorchTitanEngine(BaseEngine):
         parent_dir = os.path.dirname(local_path)
         self.checkpointer.folder = parent_dir
 
+        # torchtitan's CheckpointManager.load() treats a missing folder as "first run"
+        # and silently re-loads the *base* HF weights from initial_load_path, returning
+        # True. A resume from a wrong/absent path would then report success while the
+        # policy is reset to step 0, so check the folder ourselves and fail loudly.
+        if not os.path.isdir(parent_dir):
+            raise FileNotFoundError(
+                f"Cannot resume: checkpoint folder {parent_dir} does not exist. TorchTitan would "
+                f"silently fall back to the base HF weights at {self.model_config.path}."
+            )
+
         # Extract step number from path (verl uses global_step_N format)
         match = re.search(r"global_step_(\d+)", local_path)
         if match:
             step = int(match.group(1))
-            self.checkpointer.load(step=step)
+            loaded = self.checkpointer.load(step=step)
         else:
             # Fallback to latest
-            self.checkpointer.load(step=-1)
+            loaded = self.checkpointer.load(step=-1)
+        if not loaded:
+            raise FileNotFoundError(
+                f"Cannot resume: TorchTitan found no checkpoint to load under {parent_dir} (local_path={local_path})."
+            )
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -818,24 +861,18 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
             to_padded_fn = safe_to_padded_tensor if get_device_name() == "tpu" else torch.nested.to_padded_tensor
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
-            input_ids = to_padded_fn(
-                input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
-            )
+            input_ids = to_padded_fn(input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len))
 
             if position_ids.dim() == 3:
                 position_ids = to_padded_fn(
                     position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
                 ).transpose(0, 1)
             else:
-                position_ids = to_padded_fn(
-                    position_ids, padding=0, output_size=(batch_size, max_seq_len)
-                )
+                position_ids = to_padded_fn(position_ids, padding=0, output_size=(batch_size, max_seq_len))
 
             attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
             attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-            attention_mask = to_padded_fn(
-                attention_mask, padding=0, output_size=(batch_size, max_seq_len)
-            )
+            attention_mask = to_padded_fn(attention_mask, padding=0, output_size=(batch_size, max_seq_len))
 
         extra_inputs = {
             "positions": position_ids,

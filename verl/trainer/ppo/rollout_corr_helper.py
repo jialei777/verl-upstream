@@ -1172,9 +1172,10 @@ def apply_bypass_mode(
         The implementation is copied from szrlee <szrlee@gmail.com>.
     """
     from omegaconf import open_dict
+
     from verl.utils.device import get_device_name
 
-    if (get_device_name() == "tpu"):
+    if get_device_name() == "tpu":
         raise ValueError(
             "algorithm.rollout_correction.bypass_mode=True is not supported on TPU because "
             "vLLM TPU V0 engine logprobs on 1-token EOS responses can diverge from TorchTitan "

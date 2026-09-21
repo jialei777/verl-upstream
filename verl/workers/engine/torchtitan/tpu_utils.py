@@ -368,14 +368,25 @@ class _VocabParallelLogprobsFn(torch.autograd.Function):
         torch.distributed.all_reduce(target_shifted, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
         log_probs = target_shifted - torch.log(sum_exp.squeeze(-1))
-        softmax_local = (exp_logits / sum_exp).to(orig_dtype)
+        # Keep the saved softmax in fp32. The gradient w.r.t. the *target* logit is (1 - p_t),
+        # and bf16 spacing just below 1.0 is 2^-8 = 0.0039. Downcasting here would mean:
+        #   p_t = 0.99  -> true grad 0.01, absolute error up to 0.002  => ~20% error
+        #   p_t = 0.999 -> bf16(0.999) rounds to exactly 1.0           => gradient exactly 0
+        # An RL-finetuned policy is confident on most tokens, so this silently destroys the
+        # majority of the gradient signal while low-confidence tokens stay accurate -- a bias,
+        # not just noise. This is the most likely cause of the non-finite grad_norm previously
+        # observed under tensor_parallel_size > 1.
+        softmax_local = exp_logits / sum_exp
         ctx.save_for_backward(softmax_local, local_labels, target_mask)
         ctx.temperature = float(temperature)
+        ctx.orig_dtype = orig_dtype
         return log_probs.to(orig_dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         softmax_local, local_labels, target_mask = ctx.saved_tensors
+        # softmax_local is fp32 (see forward); do the whole (1 - p_t) construction in fp32 and
+        # only cast back to the parameter dtype at the very end.
         grad_logits = -softmax_local.clone()
         one_hot_update = target_mask.to(grad_logits.dtype).unsqueeze(-1)
         grad_logits.scatter_add_(-1, local_labels.unsqueeze(-1), one_hot_update)
@@ -383,7 +394,7 @@ class _VocabParallelLogprobsFn(torch.autograd.Function):
         if ctx.temperature != 1.0:
             scale = scale / ctx.temperature
         grad_logits.mul_(scale)
-        return grad_logits, None, None, None, None
+        return grad_logits.to(ctx.orig_dtype), None, None, None, None
 
 
 def vocab_parallel_logprobs_from_logits(
@@ -406,4 +417,3 @@ def vocab_parallel_logprobs_from_logits(
         tp_rank = torch.distributed.get_rank(tp_group)
         local_logits = logits
     return _VocabParallelLogprobsFn.apply(local_logits, labels, temperature, tp_group, tp_rank)
-

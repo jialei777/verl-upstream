@@ -49,7 +49,9 @@ DEFAULT_TPU_TOPOLOGY_MAP = {
 }
 
 
-def _resolve_tpu_topology_bounds(total_chips: int, num_nodes: int, fallback_map: dict | None = None) -> tuple[str, str, str, str]:
+def _resolve_tpu_topology_bounds(
+    total_chips: int, num_nodes: int, fallback_map: dict | None = None
+) -> tuple[str, str, str, str]:
     """Dynamically resolves (topology, host_bounds, chips_per_host_bounds, chips_per_host) for TPU slices."""
     topo_map = dict(DEFAULT_TPU_TOPOLOGY_MAP)
     if fallback_map:
@@ -68,6 +70,8 @@ def _resolve_tpu_topology_bounds(total_chips: int, num_nodes: int, fallback_map:
         chips_per_host_bounds = "1,1,1"
 
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
+
+
 # -------------------------------------------
 
 try:

@@ -14,15 +14,22 @@
 
 import re
 
-_SOLUTION_CLIP_CHARS = 300
+# Upper bound on how much of the tail of a solution we regex-search for the answer.
+#
+# This exists purely as a performance guard: regex over a very long string is slow, and for math
+# problems the final answer is at the end. The previous value was 300 *characters* with a comment
+# claiming it approximated 300 tokens -- but one token averages ~4 characters of English, so 300
+# characters is only ~75 tokens. Any model that emitted "#### <answer>" and then kept writing for
+# more than ~75 tokens had its answer silently clipped out of the search window and scored 0
+# despite being correct. That is a systematic false negative, and it gets worse as a model's style
+# drifts during RL. 1200 characters is the ~300 tokens that was originally intended.
+_SOLUTION_CLIP_CHARS = 1200
 
 
 def extract_solution(solution_str, method="strict"):
     assert method in ["strict", "flexible"]
 
-    # Optimization: Regular expression matching on very long strings can be slow.
-    # For math problems, the final answer is usually at the end.
-    # We only match on the last 300 characters, which is a safe approximation for 300 tokens.
+    # Only search the tail of the string; see _SOLUTION_CLIP_CHARS above.
     if len(solution_str) > _SOLUTION_CLIP_CHARS:
         solution_str = solution_str[-_SOLUTION_CLIP_CHARS:]
 
@@ -49,6 +56,27 @@ def extract_solution(solution_str, method="strict"):
     return final_answer
 
 
+def _answers_match(answer, ground_truth):
+    """Compares two answer strings, numerically when both parse as numbers.
+
+    Exact string equality rejects answers that are numerically correct but differently formatted
+    -- "72.0", "72.00" and "72." all fail against a ground truth of "72". Those are correct
+    solutions being scored 0, which both understates measured accuracy and injects label noise
+    into the RL signal. Falls back to a whitespace-stripped string compare when either side is
+    not numeric, so non-numeric ground truths behave exactly as before.
+    """
+    if answer is None:
+        return False
+    normalized = str(answer).replace(",", "").replace("$", "").strip()
+    truth = str(ground_truth).replace(",", "").replace("$", "").strip()
+    if normalized == truth:
+        return True
+    try:
+        return abs(float(normalized) - float(truth)) < 1e-6
+    except (ValueError, TypeError):
+        return False
+
+
 def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
     """The scoring function for GSM8k.
 
@@ -66,7 +94,8 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
     if answer is None:
         return 0
     else:
-        if answer == ground_truth:
+        if _answers_match(answer, ground_truth):
             return score
         else:
             return format_score
+
