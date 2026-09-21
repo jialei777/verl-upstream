@@ -131,6 +131,11 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
         clean_metadata[dtype] = clean_items
 
     model_sd = vllm_model.model.state_dict()
+    flipped_weight_keys = {
+        f"{mod_name}.weight" if mod_name else "weight"
+        for mod_name, mod in vllm_model.model.named_modules()
+        if getattr(mod, "_tpu_weight_flipped", False)
+    }
 
     def resolve_key(k):
         if k in model_sd:
@@ -167,6 +172,9 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
             target_local = target_v.to_local() if isinstance(target_v, DTensor) else target_v
 
             param_cpu_global = flat_cpu[offset : offset + numel].view(shape)
+            if target_key in flipped_weight_keys and param_cpu_global.dim() == 2:
+                param_cpu_global = param_cpu_global.transpose(0, 1)
+                shape = param_cpu_global.shape
             if target_local.shape == shape:
                 param_cpu_local = param_cpu_global
             else:
@@ -184,7 +192,7 @@ def _load_single_group_on_worker(vllm_model, group_sd: dict, rank: int, executor
                 if not sharded:
                     param_cpu_local = param_cpu_global
 
-            return (target_key, target_local.shape, target_local.numel(), param_cpu_local.reshape(-1))
+            return (target_key, target_local.shape, target_local.numel(), param_cpu_local.contiguous().reshape(-1))
 
         if executor is None:
             from concurrent.futures import ThreadPoolExecutor

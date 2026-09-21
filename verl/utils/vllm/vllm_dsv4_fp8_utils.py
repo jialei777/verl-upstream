@@ -16,8 +16,15 @@
 from types import MethodType
 
 import torch
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
+
+try:
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    # Removed in vLLM 0.29. Only ``_is_mxfp4_fused_moe_module`` needs it, and
+    # this module is imported unconditionally by the rollout server, so the
+    # absence must not be fatal for models that are not DeepSeek-V4.
+    FusedMoE = None
 
 
 def is_deepseek_v4_model(model):
@@ -46,6 +53,9 @@ def _is_mega_moe_module(module):
 
 
 def _is_mxfp4_fused_moe_module(module):
+    if FusedMoE is None:
+        return False
+
     from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     return isinstance(module, FusedMoE) and isinstance(module.quant_method, Mxfp4MoEMethod)

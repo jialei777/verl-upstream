@@ -23,10 +23,18 @@ import torch
 from packaging import version
 
 try:
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
     from vllm.model_executor.layers.linear import LinearBase
 except ImportError as e:
     raise ImportError("FP8 quantization not available") from e
+
+try:
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+except ImportError:
+    # vLLM 0.29 removed the name entirely (0.24 had already demoted it from a
+    # class to a factory function). The MoE class resolution below handles its
+    # absence, so this must not be fatal: this module is imported at module
+    # scope by the rollout server, which needs it even for unquantized models.
+    FusedMoE = None
 
 from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise
 from verl.utils.vllm.vllm_dsv4_fp8_utils import (
@@ -95,7 +103,9 @@ def is_fp8_model(vllm_config):
 # (i.e. ``experts`` -> ``experts.routed_experts``). Resolve the concrete module
 # classes once so ``isinstance`` checks keep working across vLLM versions --
 # calling ``isinstance(x, FusedMoE)`` when ``FusedMoE`` is a function raises
-# ``TypeError: isinstance() arg 2 must be a type``.
+# ``TypeError: isinstance() arg 2 must be a type``. vLLM 0.29 then dropped the
+# name altogether, in which case ``FusedMoE`` is ``None`` here and the same
+# ``RoutedExperts`` / ``MoERunner`` branch below applies.
 if isinstance(FusedMoE, type):
     # vLLM < 0.24: ``FusedMoE`` is itself the expert-weight-holding module.
     _MOE_STOP_CLASSES = (FusedMoE,)

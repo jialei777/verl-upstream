@@ -148,6 +148,15 @@ def patch_vllm_for_tpu() -> None:
         import torch._ops
         import torch.compiler
 
+        # In PyTorch 2.13, torch._dynamo.config is thread-local. TPUModelRunner.__init__
+        # widens cache_size_limit on the actor's main init thread, but Ray Compiled
+        # Graph executes execute_model_ray on a background thread whose TLS still has
+        # the default recompile_limit=8. Set it here (called from both init and
+        # patched_setup_device_if_necessary on the DAG thread) so both threads see it.
+        torch._dynamo.config.cache_size_limit = 2048
+        torch._dynamo.config.recompile_limit = 2048
+        torch._dynamo.config.accumulated_recompile_limit = 8192
+
         def _allow(op):
             if op is not None:
                 for fn in (
@@ -462,6 +471,13 @@ def patch_vllm_for_tpu() -> None:
         try:
             TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
             TPUWorker.load_weights_from_ray_registry = load_weights_from_ray_registry
+            if not isinstance(getattr(TPUWorker, "device", None), property):
+                TPUWorker.device = property(
+                    lambda self: self.__dict__.get("device")
+                    or (self.devices[0] if getattr(self, "devices", None) else torch.device("tpu:0")),
+                    lambda self, val: self.__dict__.__setitem__("device", val),
+                    lambda self: self.__dict__.pop("device", None),
+                )
             logger.info(
                 "[TPU HACK 13] Successfully patched TPUWorker class with "
                 "dummy_reset_encoder_cache and load_weights_from_ray_registry."
@@ -473,8 +489,16 @@ def patch_vllm_for_tpu() -> None:
         # TPU_MULTIHOST_TOPOLOGY_MAP ships only a 16-chip entry, so TP=4 and TP=8 both
         # have to be injected. Mutate in place: every executor module imports the same
         # dict object from tpu_platform, so rebinding here would not be seen.
-        ray_distributed_executor.TPU_MULTIHOST_TOPOLOGY_MAP[4] = "2,2,1"
-        ray_distributed_executor.TPU_MULTIHOST_TOPOLOGY_MAP[8] = "2,4,1"
+        import vllm_torchtpu.platforms.tpu_platform as tpu_platform
+
+        topo_map = getattr(
+            ray_distributed_executor,
+            "TPU_MULTIHOST_TOPOLOGY_MAP",
+            getattr(tpu_platform, "TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP", None),
+        )
+        if isinstance(topo_map, dict):
+            topo_map[4] = "2,2,1"
+            topo_map[8] = "2,4,1"
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -685,8 +709,16 @@ def patch_vllm_for_tpu() -> None:
         OriginalRayWorkerWrapper.init_worker = patched_init_worker
 
         def patched_init_workers_ray(self, placement_group, **ray_remote_kwargs):
-            RayWorkerWrapper_local = ray_distributed_executor.RayWorkerWrapper
-            TPU_TOPOLOGY_MAP_local = ray_distributed_executor.TPU_MULTIHOST_TOPOLOGY_MAP
+            RayWorkerWrapper_local = getattr(
+                ray_distributed_executor,
+                "RayWorkerWrapper",
+                getattr(ray_distributed_executor, "RayWorkerWrapperV1", OriginalRayWorkerWrapper),
+            )
+            TPU_TOPOLOGY_MAP_local = getattr(
+                ray_distributed_executor,
+                "TPU_MULTIHOST_TOPOLOGY_MAP",
+                getattr(tpu_platform, "TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP", {4: "2,2,1", 8: "2,4,1", 16: "4,4,1"}),
+            )
 
             self.workers = []
             self.pp_tp_workers = []
@@ -968,14 +1000,28 @@ def patch_vllm_for_tpu() -> None:
 
             return FutureWrapper(refs, self.kv_output_aggregator)
 
-        ray_distributed_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
         try:
-            import vllm.v1.executor.ray_executor as vllm_v1_ray_exec
+            import vllm.v1.executor.ray_utils as vllm_v1_ray_utils
 
-            vllm_v1_ray_exec.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
-            vllm_v1_ray_exec.RayDistributedExecutor._execute_dag = patched_execute_dag
+            vllm_v1_ray_utils.RayWorkerWrapper.setup_device_if_necessary = patched_setup_device_if_necessary
+            vllm_v1_ray_utils.RayWorkerWrapper.init_worker = patched_init_worker
         except Exception as e:
-            logger.warning(f"Failed to patch vllm.v1.executor.ray_executor.RayDistributedExecutor: {e}")
+            logger.warning(f"Failed to patch vllm.v1.executor.ray_utils.RayWorkerWrapper: {e}")
+
+        # patched_init_workers_ray is a backport for torchtpu-vllm 0.22.1 (where
+        # TPU_MULTIHOST_TOPOLOGY_MAP lived on ray_distributed_executor and
+        # RayWorkerWrapper exposed get_node_and_gpu_ids). On vLLM >= 0.29 the
+        # native _init_workers_ray already supports multi-host TPU and
+        # get_node_and_gpu_ids no longer exists.
+        if hasattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP"):
+            ray_distributed_executor.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
+            try:
+                import vllm.v1.executor.ray_executor as vllm_v1_ray_exec
+
+                vllm_v1_ray_exec.RayDistributedExecutor._init_workers_ray = patched_init_workers_ray
+                vllm_v1_ray_exec.RayDistributedExecutor._execute_dag = patched_execute_dag
+            except Exception as e:
+                logger.warning(f"Failed to patch vllm.v1.executor.ray_executor.RayDistributedExecutor: {e}")
 
         logger.info("Successfully applied all TPU patches and hacks to vLLM & torchtpu-vllm")
     except Exception as e:

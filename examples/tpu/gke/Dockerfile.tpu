@@ -1,151 +1,57 @@
-# Use the latest Ray master as base.
-FROM rayproject/ray:nightly.260501.1c7c90-py312-tpu
-
-# g++ is required from vLLM 0.22.1 onward. Its setup.py appends the
-# `vllm.spinloop` CMake extension unconditionally, outside any device guard, so
-# even a VLLM_TARGET_DEVICE=tpu build invokes cmake and needs a CXX compiler;
-# 0.19.0 had no such extension and built with no compiler at all. The base image
-# ships gcc but not g++, so cmake fails with "No CMAKE_CXX_COMPILER could be
-# found". spinloop is pure C++ against the Python stable ABI (USE_SABI 3.11) and
-# does not link libtorch, so compiling it here introduces no torch ABI coupling.
-RUN sudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev g++
-RUN pip uninstall -y torch torchvision
-
-RUN pip install keyrings.google-artifactregistry-auth
-RUN pip install pandas==2.3.3
-
-ARG AUTH_TOKEN
-# Set the PIP_INDEX_URL environment variable to point to the Torch TPU virtual registry
-ENV PIP_INDEX_URL="https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
-
-# --- Add torchtitan setup from Dockerfile ---
-USER root
-WORKDIR /
-
-RUN pip install "jax[tpu]==0.9.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-RUN pip install git+https://github.com/openxla/tokamax.git@8cba6a6a1e52e9efbb7ff8facb66f18f0bfcbe4c
-RUN pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
-RUN pip install libtpu==0.0.41 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-
-# Pinned: `--pre` alone tracks the registry HEAD (~5 nightlies/day), so the
-# installed version silently drifts with the build date. Must stay in sync with
-# the torch-tpu pin in the pyproject sed below, otherwise the editable install
-# of torchtpu-vllm resolves that pin and downgrades this one back out.
+# syntax=docker/dockerfile:1.7
 #
-# The usable range is boxed in by three independent changes in torch_tpu. All
-# three were located by bisecting the nightly index; each one was also observed
-# as a real failure on v6e-8 before the window was narrowed:
+# TPU image for verl on the vLLM 0.29 / torch 2.13 / torch_tpu / tpu-sync stack.
 #
-#   * >= dev20260729090127 required. Earlier nightlies (including
-#     dev20260714090201, which torchtpu-vllm @ 88f359b3 nominally declares)
-#     ship a single unversioned libpywrap_torch_tpu_common.so built against
-#     torch 2.11. Against the torch 2.12 installed above it fails to load with
-#     `undefined symbol: torch::Library::_def(...)`. This nightly is the first
-#     with per-ABI variants (libpywrap_2_{11,12,13,15}_0_common.so) plus
-#     _versioned_so_loader.py, which resolve correctly on 2.12.
+# We start FROM upstream vllm-torchtpu's production image rather than rebuilding
+# that stack from source, because the tpu-sync-torch wheel their pyproject pins
+# (0.0.1.dev20260917080754) is not published to the public raiden registry;
+# their prebuilt image ships the exact matched set:
 #
-#   * <  dev20260905051045 required. That nightly makes
-#     _internal/compile/_backend.py read `node._dynamo_source` on graph
-#     placeholders. vLLM's VllmBackend splits and rewrites the FX graph before
-#     handing it to the TPU backend, so the attribute is gone by then and
-#     compilation dies with `AttributeError: 'Node' object has no attribute
-#     '_dynamo_source'`.
+#     torch 2.13.0+cpu · torch_tpu 0.1.1.dev20260912075415
+#     tpu_sync_torch 0.0.1.dev20260917080754 · vLLM 0.29.0
+#     ray 2.58.0 · transformers 5.10.4 · libtpu 0.0.47
 #
-#   * <  dev20260910000446 required. That nightly renames the module
-#     torch_tpu._internal.profiler.profiler_api to ._api, while torchtpu-vllm's
-#     worker/tpu_worker.py imports it by name -> ImportError at engine start.
-#
-# dev20260905000939 is the newest nightly inside that window. Note this means
-# torch_tpu cannot currently be advanced to what the tpu-sync/Raiden build
-# chain wants (dev20260912075415); that needs a torchtpu-vllm change first.
-RUN pip install --pre --no-deps torch_tpu==0.1.1.dev20260905000939
+# The GitHub PAT for cloning google-pytorch/torchtitan is passed via BuildKit
+# `--secret id=ghtoken` so it is never persisted in image layer history.
+FROM us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
 
-RUN pip install 'typeguard==2.13.3'
-RUN pip install portpicker absl-py numpy gcsfs frozendict triton fairscale tamm
+# Record the pins we must not disturb, so the assertion at the bottom can prove
+# that nothing installed below silently re-resolved them.
+RUN python -c "\
+import importlib.metadata as md, json;\
+print(json.dumps({p: md.version(p) for p in\
+ ['torch','torch_tpu','tpu_sync_torch','vllm','ray','transformers','libtpu']}))" \
+    > /baseline_pins.json && cat /baseline_pins.json
 
-# --- Install torchtitan, vllm and torchtpu-vllm ---
+# KubeRay's default readiness/liveness probes execute `wget`, which the slim
+# upstream base image omits; without it pods stay 1/2 Ready and get killed by
+# kubelet after the liveness timeout.
+RUN apt-get update && apt-get install -y --no-install-recommends wget \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- torchtitan: the TPU training engine verl's actor runs on ---
+# verl selects it via model_engine=torchtitan / actor.strategy=torchtitan, and
+# it must be the google-pytorch fork, which is the one carrying TPU support.
+# 971dd82c matches verl's TorchTitanEngine config imports (ActivationCheckpointConfig,
+# etc.) and is verified compatible with torch 2.13.
 ARG GITHUB_USER
-ARG GITHUB_TOKEN
-RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtitan.git
-WORKDIR /torchtitan
-RUN git checkout 971dd82ceb3dd191088a2a74cdec594682c95ef1
-RUN pip install -r requirements.txt
-# RUN pip install -r .ci/docker/requirements-flux.txt
-WORKDIR /
+ARG TORCHTITAN_REF=971dd82ceb3dd191088a2a74cdec594682c95ef1
+RUN --mount=type=secret,id=ghtoken \
+    git clone "https://${GITHUB_USER}:$(cat /run/secrets/ghtoken)@github.com/google-pytorch/torchtitan.git" /torchtitan \
+ && cd /torchtitan \
+ && git checkout ${TORCHTITAN_REF} \
+ && git log -1 --format='torchtitan at %h %ad %s' --date=short
 
-RUN git clone --depth 1 --branch v0.22.1 https://github.com/vllm-project/vllm.git
-RUN git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/google-pytorch/torchtpu-vllm.git
+# Install torchtitan's dependencies and register /torchtitan via a .pth file
+# in site-packages so it stays importable even when Ray's runtime_env replaces
+# PYTHONPATH.
+RUN pip install --no-cache-dir -r /torchtitan/requirements.txt \
+ && printf '/torchtitan\n/torchtitan/torchtitan\n' > /usr/local/lib/python3.12/site-packages/torchtitan.pth
 
-WORKDIR /torchtpu-vllm
-RUN git checkout 88f359b38179a5345514358b7c9738c475e26ea0
-WORKDIR /
-
-# torchtpu-vllm is the TPU backend; vLLM's tpu.txt would otherwise pull the
-# tpu-inference package that it replaces.
-RUN sed -i '/tpu-inference/d' vllm/requirements/tpu.txt
-
-WORKDIR /torchtpu-vllm
-
-# torchtpu-vllm @ 88f359b3 declares a dependency set we deliberately deviate
-# from. Each override below is load-bearing; `pip install -e .` resolves this
-# pyproject for real, so an unedited pin here silently rewrites the image.
-#
-#   torch 2.11.0 -> 2.12.0
-#     Two separate pins drag torch back to 2.11.0: this one and torchvision's
-#     (below). 2.11.0 is only published as the CUDA build on PyPI, so accepting
-#     it would both replace the CPU wheel installed above and pull the whole
-#     nvidia-* dependency set into a TPU image.
-#
-#   torch-tpu dev20260714090201 -> dev20260905000939
-#     0714 ships a single unversioned libpywrap built against torch 2.11 and
-#     fails to load on 2.12 (`undefined symbol: torch::Library::_def`). See the
-#     three bisected boundaries documented at the torch_tpu install above.
-#
-#   libtpu -> 0.0.42.1
-#     Matches what this commit's env_override.py workarounds were written
-#     against.
-#
-#   torchvision 0.26.0 -> dropped
-#     Its metadata hard-pins torch==2.11.0, so it cannot coexist with the line
-#     above. It is only needed for multimodal checkpoints whose HF processor
-#     imports it at class-definition time; nothing in this image does. Restoring
-#     it means moving to a torchvision built against torch 2.12.
-RUN sed -i 's/"torch==[0-9a-zA-Z.]*"/"torch==2.12.0"/' pyproject.toml
-RUN sed -i 's/torch-tpu==[0-9a-zA-Z.]*/torch-tpu==0.1.1.dev20260905000939/' pyproject.toml
-RUN sed -i 's/libtpu==[0-9a-zA-Z.]*/libtpu==0.0.42.1/' pyproject.toml
-RUN sed -i '/"torchvision==/d' pyproject.toml
-
-# Fail loudly if any override above silently missed (e.g. upstream reformatted
-# pyproject.toml), rather than letting the build quietly produce a wrong image.
-RUN set -e; \
-    grep -q '"torch==2.12.0"' pyproject.toml \
-      || { echo "pyproject override failed: torch" >&2; exit 1; }; \
-    grep -q 'torch-tpu==0.1.1.dev20260905000939' pyproject.toml \
-      || { echo "pyproject override failed: torch-tpu" >&2; exit 1; }; \
-    grep -q 'libtpu==0.0.42.1' pyproject.toml \
-      || { echo "pyproject override failed: libtpu" >&2; exit 1; }; \
-    if grep -q '"torchvision==' pyproject.toml; then \
-      echo "pyproject override failed: torchvision still present" >&2; exit 1; \
-    fi; \
-    echo "pyproject overrides OK"
-
-# Hold transformers on the 4.x line, installed *before* vLLM so vLLM's own
-# requirement resolves as already-satisfied.
-#
-# vLLM 0.19.0 capped this at `transformers >= 4.56.0, < 5`; 0.22.1 widened it to
-# `>= 4.56.0, != 5.0.* .. != 5.5.0`, which permits 5.x, so a fresh resolve picks
-# the newest 5.x and drags huggingface-hub to 1.x with it. That is a major
-# version jump across the tokenizer and model-loading paths, unrelated to the
-# vLLM upgrade this image exists for. 4.57.6 is the version the validated image
-# runs and it still satisfies 0.22.1's constraint.
-RUN pip install "transformers==4.57.6"
-
-RUN pip install --upgrade pip && SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE="tpu" pip install -e ../vllm
-RUN pip install --pre -e .
-
-# --- Install verl Dependencies ---
-# Pre-installing these ensures that Ray Job Submission doesn't have to download
-# packages on the fly, which drastically reduces GKE node startup and rollout times.
+# --- verl runtime dependencies ---
+# Pre-installed so Ray job submission does not download them per-run.
+# transformers is intentionally NOT pinned to 4.57.6 here - the upstream stack
+# ships 5.10.4 and vLLM 0.29.0 expects it.
 RUN pip install --no-cache-dir \
     accelerate \
     codetiming \
@@ -158,7 +64,6 @@ RUN pip install --no-cache-dir \
     pylatexenc \
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0" \
     torchdata \
-    "transformers!=5.6.0" \
     wandb \
     "packaging>=20.0" \
     uvicorn \
@@ -168,9 +73,24 @@ RUN pip install --no-cache-dir \
     tensorboard \
     TransferQueue==0.1.8
 
+# Fail the build if anything above moved a load-bearing pin, rather than
+# shipping an image that silently is not the stack we set out to run.
+RUN python - <<'PY'
+import importlib.metadata as md, json, sys
+base = json.load(open('/baseline_pins.json'))
+bad = []
+for pkg, want in base.items():
+    got = md.version(pkg)
+    print(f"  {pkg:16s} {want:28s} -> {got}")
+    if got != want:
+        bad.append(f"{pkg}: {want} -> {got}")
+if bad:
+    sys.exit("PIN DRIFT, image is not the intended stack:\n  " + "\n  ".join(bad))
+print("all load-bearing pins intact")
+PY
+
 WORKDIR /app
 
-# torchtpu-vllm ships as a src-layout package, so both of its paths are needed
-# alongside /app for fully qualified 'import verl.*'.
-ENV PYTHONPATH="/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan"
-
+# torchtpu-vllm lives at /workspace/vllm-torchtpu in the upstream image (not
+# /torchtpu-vllm as in the 0.22.1 image), and is src-layout.
+ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu:/app:/torchtitan:/torchtitan/torchtitan"
