@@ -71,6 +71,14 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE))
 DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 
+# Off-policy correction (truncated importance sampling). Required, not optional: this pipeline
+# runs verl's decoupled regime with one batch in flight, so rollouts come from theta_{t-1} while
+# old_log_probs are recomputed under theta_t. Without IS weights the reward peaks around step 50
+# and then collapses (grad_norm 0.4 -> 363, rollout/training logprob correlation 0.98 -> 0.28).
+# See run_qwen3_0_6b_torchtitan.sh for the full derivation.
+ROLLOUT_IS="${ROLLOUT_IS:-token}"
+ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -80,6 +88,8 @@ python3 -m verl.trainer.main_ppo \
     model_engine=torchtitan \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
+    algorithm.rollout_correction.rollout_is="${ROLLOUT_IS}" \
+    algorithm.rollout_correction.rollout_is_threshold="${ROLLOUT_IS_THRESHOLD}" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \

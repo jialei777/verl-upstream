@@ -783,6 +783,41 @@ def compute_is_metrics(
     return metrics
 
 
+def sanitize_tpu_rollout_log_prob(
+    old_log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Repairs rollout log probs that the vLLM TPU V0 engine failed to report.
+
+    The TPU rollout path does not always return a log prob for every token it emitted. Missing
+    entries are not flagged; they simply arrive as the pad fill value ``0.0``, which reads back as
+    ``pi_rollout == 1.0``. Two situations are repaired here:
+
+    1. Single-token responses (an immediate EOS). These are affected on essentially every batch.
+    2. Any in-mask token whose log prob came back as exactly ``0.0``. At ``temperature=1.0`` over a
+       ~150k vocabulary a genuinely sampled token cannot have probability exactly 1.0, so an exact
+       zero is a reliable marker of a missing value rather than a real measurement.
+
+    Leaving these unrepaired is actively harmful once importance sampling is enabled: the resulting
+    ratio is ``exp(old_log_prob - 0.0)``, which for a typical immediate-EOS token (``old_log_prob``
+    around ``-15`` to ``-33``) collapses to ~0 and silently deletes the sample from the gradient.
+    Those are exactly the zero-reward samples the policy most needs to learn to suppress. Falling
+    back to ``old_log_prob`` makes the ratio exactly 1.0, keeping the sample at full weight.
+
+    Args:
+        old_log_prob: Log probs from the training policy, shape (batch_size, seq_length).
+        rollout_log_prob: Log probs reported by the rollout engine, same shape.
+        response_mask: Binary mask for valid response tokens, same shape.
+
+    Returns:
+        ``rollout_log_prob`` with unreported entries replaced by ``old_log_prob``.
+    """
+    is_single_token_response = response_mask.sum(dim=-1, keepdim=True) <= 1
+    corrupt = (is_single_token_response | (rollout_log_prob == 0.0)) & response_mask.to(torch.bool)
+    return torch.where(corrupt, old_log_prob.detach(), rollout_log_prob)
+
+
 def compute_rollout_correction_and_rejection_mask(
     old_log_prob: torch.Tensor,
     rollout_log_prob: torch.Tensor,
@@ -848,8 +883,7 @@ def compute_rollout_correction_and_rejection_mask(
     from verl.utils.device import get_device_name
 
     if (get_device_name() == "tpu") and rollout_log_prob is not None:
-        single_tok_corrupt = (response_mask.sum(dim=-1, keepdim=True) <= 1) & (rollout_log_prob < -20.0)
-        rollout_log_prob = torch.where(single_tok_corrupt, old_log_prob.detach(), rollout_log_prob)
+        rollout_log_prob = sanitize_tpu_rollout_log_prob(old_log_prob, rollout_log_prob, response_mask)
 
     # Step 1: Compute log ratio (log(π_train / π_rollout))
     log_ratio: torch.Tensor = old_log_prob - rollout_log_prob
@@ -961,9 +995,8 @@ def compute_offpolicy_metrics(
     if rollout_log_prob is not None:
         from verl.utils.device import get_device_name
 
-        if (get_device_name() == "tpu"):
-            single_tok_corrupt = (response_mask.sum(dim=-1, keepdim=True) <= 1) & (rollout_log_prob < -20.0)
-            rollout_log_prob = torch.where(single_tok_corrupt, old_log_prob.detach(), rollout_log_prob)
+        if get_device_name() == "tpu":
+            rollout_log_prob = sanitize_tpu_rollout_log_prob(old_log_prob, rollout_log_prob, response_mask)
 
         # 2a. kl: Direct estimator for KL(π_rollout || π_training)
         # This is the standard KL divergence: E[log(π_rollout) - log(π_training)]

@@ -96,6 +96,26 @@ TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE))
 DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 
+# Off-policy correction. This pipeline is NOT on-policy: trainer.v1.separate_async with
+# num_warmup_batches=1 keeps one batch in flight, so a batch is sampled by vLLM under weights
+# theta_{t-1} while old_log_probs are recomputed by torchtitan under theta_t
+# (training/off_policy/trajectory_staleness/mean is 1.0 on every step). That is verl's "decoupled"
+# regime, which is only correct when the pi_old <-> pi_rollout gap is corrected by importance
+# weights -- but algorithm/rollout_correction.yaml ships with rollout_is=null.
+#
+# Running decoupled PPO with the correction term deleted is what makes the reward collapse after
+# ~50 steps. The PPO clip cannot substitute for it here: ppo_mini_batch_size == train_batch_size
+# means exactly one optimizer step per batch, so the ratio is identically 1 and actor/ppo_kl and
+# actor/pg_clipfrac are 0.0 on every single step. The only other trust region, kl_loss_coef=0.001,
+# contributes ~0.004 against a pg_loss of ~0.03, i.e. nothing.
+#
+# Failure mechanism: as the policy sharpens, one lr=1e-6 step moves the distribution far enough
+# that tokens happily sampled by the stale rollout policy get near-zero probability under the
+# training policy. Their d/dtheta log pi blows up like 1/p, grad_norm goes 1.4 -> 13 -> 125 -> 363,
+# and the policy is destroyed. Token-level TIS assigns those tokens weight
+# pi_old/pi_rollout ~ 0 and removes them from the gradient instead of letting them dominate it.
+ROLLOUT_IS="${ROLLOUT_IS:-token}"
+ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -106,6 +126,8 @@ python3 -m verl.trainer.main_ppo \
     model_engine=torchtitan \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
+    algorithm.rollout_correction.rollout_is="${ROLLOUT_IS}" \
+    algorithm.rollout_correction.rollout_is_threshold="${ROLLOUT_IS_THRESHOLD}" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
