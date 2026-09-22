@@ -1,7 +1,7 @@
 Multi-Chip Support
 ==================
 
-Last updated: 06/03/2026.
+Last updated: 09/22/2026.
 
 Overview
 --------
@@ -32,6 +32,7 @@ package, which provides reference implementations for vendors to adapt:
 - Intel XPU (Data Center GPU Max / Arc)
 - Cambricon MLU (MLU370 / MLU590)
 - MetaX (CUDA-compatible)
+- Google TPU (v6e), see :ref:`tpu-support`
 
 .. note::
 
@@ -39,6 +40,66 @@ package, which provides reference implementations for vendors to adapt:
    production support requires collaboration with the respective hardware
    vendors. Vendors can use these as templates to build and maintain their own
    plugins.
+
+.. _platform-extension-points:
+
+Platform Extension Points
+-------------------------
+
+Beyond the device API, ``PlatformBase`` exposes a few optional hooks that verl core calls at
+well-defined points. All of them have a default that preserves the CUDA behaviour, so a platform
+only implements the ones it needs.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 68
+
+   * - Hook
+     - Called by / purpose
+   * - ``ray_local_rank_override()``
+     - ``Worker._configure_before_init``. Return the local rank when Ray does not enumerate the
+       accelerator itself. Default ``None`` (use Ray's accelerator ids).
+   * - ``supports_colocated_worker_groups()``
+     - ``RayResourcePool`` / ``ResourcePoolManager``. Return ``False`` when a device cannot be
+       shared by two WorkerGroups; verl then caps ``max_colocate_count`` at 1. Default ``True``.
+   * - ``get_worker_env_vars(...)``
+     - ``RayWorkerGroup``. Extra env vars for a worker's ``runtime_env``, built once the
+       placement groups exist (mesh addresses, device index, ...). Default ``{}``.
+   * - ``get_ray_init_kwargs()``
+     - The training entrypoints. Extra kwargs merged into ``ray.init()``, e.g. a
+       ``runtime_env.worker_process_setup_hook``. Default ``{}``.
+   * - ``requires_remote_driver()``
+     - The training entrypoints. Return ``True`` when the trainer has to run inside a Ray actor
+       because the driver node owns no device. Default ``False``.
+   * - ``supports_eager_collectives()``
+     - ``TrainingWorker`` metric reduction. Return ``False`` for backends that only run
+       collectives inside a traced graph; verl then merges the per-rank metrics on the driver
+       instead of all-gathering them. Default ``True``.
+
+.. _tpu-support:
+
+Google TPU
+----------
+
+TPU support has two halves: the platform itself (device API, Ray resources, slice environment)
+lives in `verl-hardware-plugin <https://github.com/verl-project/verl-hardware-plugin>`_, and the
+training path in verl core adapts to the XLA execution model:
+
+- The TorchTitan engine is registered for ``device="tpu"``, uses the ``tpu`` compile backend and
+  the non-fused optimizer and gradient-clipping paths.
+- Packed sequences are padded to a static bucket (``VERL_TPU_SEQ_BUCKET_SIZE``, default 256)
+  before they reach the device, so XLA compiles a bounded set of shapes per run instead of one
+  per micro batch.
+- ``VarlenAttention`` is routed through ``scaled_dot_product_attention``, and the few operators
+  that ``torch_tpu`` does not implement (``unique_consecutive``, the chunked log-prob kernel)
+  fall back to portable equivalents.
+- Metrics are reduced on the driver, since the device backend cannot issue a collective outside
+  its traced graph.
+
+Use pure FSDP2 (``tensor_parallel_size=1``): with tensor parallelism the DTensor backward path
+intermittently produces non-finite gradients, which the optimizer step silently skips.
+
+See ``examples/tpu/sft/README.md`` for a runnable SFT example and the tuning notes.
 
 Design Principles
 -----------------
