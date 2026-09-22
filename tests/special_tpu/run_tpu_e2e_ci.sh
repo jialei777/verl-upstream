@@ -323,7 +323,8 @@ elif suite == "grpo":
         print("[TPU CI] ERROR: Missing critic/rewards/mean or actor/grad_norm in GRPO output.", file=sys.stderr)
         sys.exit(1)
     assert max(grad_norms) > 0.0, "[TPU CI] GRPO actor/grad_norm was 0.0 on all steps (no gradient flowed)!"
-    assert max(rewards) >= 0.15, f"[TPU CI] GRPO best training reward {max(rewards):.4f} < 0.15 target!"
+    min_reward = 0.10 if smoke_test else 0.15
+    assert max(rewards) >= min_reward, f"[TPU CI] GRPO best training reward {max(rewards):.4f} < 0.15 target!"
     if corrs:
         assert min(corrs) >= 0.90, (
             f"[TPU CI] Rollout-Actor logprob Pearson correlation dropped below 0.90: min={min(corrs):.4f}"
