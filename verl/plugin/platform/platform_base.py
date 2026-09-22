@@ -230,6 +230,83 @@ class PlatformBase(abc.ABC):
             return {"num_gpus": num_gpus}
         return {"resources": {resource_name: num_gpus}}
 
+    def ray_local_rank_override(self) -> Optional[str]:
+        """Return the local rank of the current worker, or ``None`` to let Ray decide.
+
+        verl normally reads the local rank from ``ray.get_runtime_context().get_accelerator_ids()``.
+        That only works for accelerators Ray enumerates (``GPU``, ``NPU``, ...). A platform whose
+        devices Ray does not enumerate individually can report the local rank here instead.
+        """
+        return None
+
+    def supports_colocated_worker_groups(self) -> bool:
+        """Return ``True`` if several WorkerGroups may be colocated on the same device.
+
+        Platforms where one device is owned by exactly one process (so two WorkerGroups cannot
+        share it) return ``False``; verl then caps ``max_colocate_count`` at 1.
+        """
+        return True
+
+    def get_worker_env_vars(
+        self,
+        resource_pool: Any,
+        rank: int,
+        world_size: int,
+        local_rank: int,
+        local_world_size: int,
+        name_prefix: str,
+        device_name: str,
+    ) -> dict[str, str]:
+        """Return extra env vars to inject into a Ray worker's ``runtime_env``.
+
+        Called by :class:`~verl.single_controller.ray.base.RayWorkerGroup` once per worker, after
+        the placement groups exist and before the actor is created. Platforms that need the
+        topology of the whole placement group to configure their runtime (mesh addresses, device
+        index, ...) build those variables here.
+
+        Args:
+            resource_pool: The ``RayResourcePool`` the worker is created from.
+            rank: Global rank of the worker.
+            world_size: Total number of workers in the group.
+            local_rank: Rank of the worker within its node.
+            local_world_size: Number of workers on the worker's node.
+            name_prefix: Name prefix of the WorkerGroup.
+            device_name: Device name the WorkerGroup was created with.
+        """
+        return {}
+
+    def get_ray_init_kwargs(self) -> dict[str, Any]:
+        """Return extra kwargs to merge into ``ray.init()``.
+
+        Platforms that need a ``runtime_env`` entry for every Ray worker in the job (for example a
+        ``worker_process_setup_hook``) provide it here. The keys are merged into the kwargs verl
+        builds from the config; ``runtime_env.env_vars`` is merged key by key.
+        """
+        return {}
+
+    def requires_remote_driver(self) -> bool:
+        """Return ``True`` if the training driver has to run inside a Ray actor on a worker node.
+
+        Some clusters run the Ray driver on a head node that has no accelerator attached, while the
+        device runtime has to be initialized from a node that owns devices. Those platforms return
+        ``True`` and verl wraps the trainer in a Ray actor.
+        """
+        return False
+
+    # ------------------------------------------------------------------
+    # Collective communication capabilities
+    # ------------------------------------------------------------------
+
+    def supports_eager_collectives(self) -> bool:
+        """Return ``True`` if ``torch.distributed`` collectives can be issued eagerly.
+
+        Backends that trace and compile the execution graph (XLA/PJRT style) deadlock when a
+        collective is issued outside the traced graph, which is what verl does to reduce metrics
+        after a training step. Those platforms return ``False``, and verl aggregates the per-rank
+        metrics on the driver instead.
+        """
+        return True
+
     # ------------------------------------------------------------------
     # IPC support
     # ------------------------------------------------------------------

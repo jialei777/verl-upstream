@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import ray
 
+from verl.plugin.platform import get_platform
 from verl.utils.device import (
     get_resource_name,
     get_torch_device,
@@ -276,8 +277,13 @@ class Worker(WorkerHelper):
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
             # so we need to set local rank when the flag is set.
             device_name = get_resource_name()
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
-            os.environ["LOCAL_RANK"] = local_rank
+            # Ray only enumerates the accelerators it knows about. Platforms whose devices are not
+            # enumerated (e.g. chips selected through a visibility env var) report the local rank
+            # through the platform instead.
+            local_rank = get_platform().ray_local_rank_override()
+            if local_rank is None:
+                local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            os.environ["LOCAL_RANK"] = str(local_rank)
             get_torch_device().set_device(int(local_rank))
 
     def _configure_with_store(self, store: dict):

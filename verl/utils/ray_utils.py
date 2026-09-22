@@ -17,12 +17,49 @@ Contains commonly used utilities for ray
 
 import asyncio
 import concurrent.futures
+import copy
 import functools
 import inspect
 import os
 from typing import Any, Optional
 
 import ray
+
+
+def merge_platform_ray_init_kwargs(ray_init_kwargs: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Merge the current platform's ``ray.init()`` kwargs into ``ray_init_kwargs``.
+
+    Platforms contribute their entries through
+    :meth:`~verl.plugin.platform.platform_base.PlatformBase.get_ray_init_kwargs`, typically a
+    ``runtime_env`` that has to apply to every Ray worker of the job. Config-provided values win
+    over platform-provided ones for ``runtime_env.env_vars`` so a user can always override them.
+
+    Args:
+        ray_init_kwargs: kwargs built from the verl config. Not modified in place.
+
+    Returns:
+        The merged kwargs, ready to be passed to ``ray.init()``.
+    """
+    from verl.plugin.platform import get_platform
+
+    merged = copy.deepcopy(dict(ray_init_kwargs or {}))
+    platform_kwargs = get_platform().get_ray_init_kwargs()
+    if not platform_kwargs:
+        return merged
+
+    for key, value in platform_kwargs.items():
+        if key != "runtime_env":
+            merged.setdefault(key, value)
+            continue
+        runtime_env = merged.setdefault("runtime_env", {})
+        for env_key, env_value in value.items():
+            if env_key == "env_vars":
+                env_vars = dict(env_value)
+                env_vars.update(runtime_env.get("env_vars", {}))
+                runtime_env["env_vars"] = env_vars
+            else:
+                runtime_env.setdefault(env_key, env_value)
+    return merged
 
 
 def ray_noset_visible_devices(env_vars=os.environ):
