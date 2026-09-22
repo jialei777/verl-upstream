@@ -487,7 +487,7 @@ class TPUCheckpointEngine(CheckpointEngine):
         raise NotImplementedError("Rollout on TPU uses direct load_weights_from_ray_registry via collective_rpc.")
 
 
-async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
+async def update_tpu_weights(manager, global_steps: int | None = None, **kwargs) -> dict:
     """Synchronize weights from actor worker group to rollout replicas on TPU."""
     import gc
 

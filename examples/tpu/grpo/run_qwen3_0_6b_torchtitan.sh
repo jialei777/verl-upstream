@@ -32,12 +32,13 @@ set -xeuo pipefail
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
-export VLLM_USE_V1=0
+export VLLM_USE_V1=1
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
-# JAX/XLA Launch Barrier Configuration
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
+# JAX/XLA Launch Barrier & Compilation Configuration
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536"
+export XLA_FLAGS="--xla_disable_hlo_passes=instruction-fusion,fusion-merger,multi-output-fusion,horizontal-fusion"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
@@ -161,7 +162,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
