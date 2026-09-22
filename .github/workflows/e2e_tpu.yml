@@ -32,14 +32,15 @@ on:
           - "1"
           - "0"
       runner_type:
-        description: "GitHub runner label (ubuntu-latest or self-hosted)"
+        description: "GitHub runner label (self-hosted or ubuntu-latest)"
         required: false
-        default: "ubuntu-latest"
+        default: "self-hosted"
         type: string
   push:
     branches:
       - main
       - tpu-main*
+      - jialei/add-ci
       - v0.*
     paths:
       - ".github/workflows/e2e_tpu.yml"
@@ -56,10 +57,6 @@ on:
       - "verl/workers/rollout/vllm_rollout/**"
       - "verl/workers/utils/**"
   pull_request:
-    branches:
-      - main
-      - tpu-main*
-      - v0.*
     paths:
       - ".github/workflows/e2e_tpu.yml"
       - "examples/tpu/**"
@@ -97,7 +94,7 @@ jobs:
   e2e_sft_tpu:
     name: E2E TPU v6e SFT (Qwen3-0.6B TorchTitan FSDP2)
     if: ${{ (github.event_name != 'workflow_dispatch') || inputs.test_suite == 'all' || inputs.test_suite == 'sft' }}
-    runs-on: ${{ inputs.runner_type || vars.TPU_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_type || vars.TPU_CI_RUNNER || 'self-hosted' }}
     timeout-minutes: 35
     steps:
       - name: Checkout repository
@@ -144,7 +141,7 @@ jobs:
     name: E2E TPU v6e GRPO (Qwen3-0.6B TorchTitan + vLLM V1 Separate Async)
     needs: [e2e_sft_tpu]
     if: ${{ !cancelled() && (needs.e2e_sft_tpu.result == 'success' || needs.e2e_sft_tpu.result == 'skipped') && ((github.event_name != 'workflow_dispatch') || inputs.test_suite == 'all' || inputs.test_suite == 'grpo') }}
-    runs-on: ${{ inputs.runner_type || vars.TPU_CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner_type || vars.TPU_CI_RUNNER || 'self-hosted' }}
     timeout-minutes: 45
     steps:
       - name: Checkout repository
