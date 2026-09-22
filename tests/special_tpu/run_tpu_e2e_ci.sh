@@ -187,10 +187,11 @@ print(json.dumps({
         status_out="$(kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- \
             ray job status --address http://127.0.0.1:8265 "${sub_id}" 2>/dev/null || true)"
         echo "[$(date +%H:%M:%S)] ${sub_id}: ${status_out}"
-        if [[ "${status_out}" == *"SUCCEEDED"* ]]; then
+        local status_lower="${status_out,,}"
+        if [[ "${status_lower}" == *"succeeded"* ]]; then
             final_status="SUCCEEDED"
             break
-        elif [[ "${status_out}" == *"FAILED"* || "${status_out}" == *"STOPPED"* ]]; then
+        elif [[ "${status_lower}" == *"failed"* || "${status_lower}" == *"stopped"* ]]; then
             final_status="FAILED"
             break
         fi
