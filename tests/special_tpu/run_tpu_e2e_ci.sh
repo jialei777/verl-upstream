@@ -168,6 +168,14 @@ print(json.dumps({
 }))
 ')"
 
+    local extra_args=""
+    if [[ "${suite_name}" == "grpo" ]]; then
+        # Disable Qwen3 <think> truncation in CI smoke runs so 512-token rollouts emit
+        # "#### <answer>", enabling real GSM8K test pass-rate and non-zero gradient checks
+        # even in 5-step smoke mode.
+        extra_args="+data.apply_chat_template_kwargs.enable_thinking=False trainer.val_before_train=True data.val_max_samples=32 data.train_batch_size=8 actor_rollout_ref.actor.ppo_mini_batch_size=8 actor_rollout_ref.rollout.n=4"
+    fi
+
     echo "=================================================================="
     echo "[TPU CI] Submitting ${suite_name^^} job (${sub_id}): ${script_path}"
     echo "=================================================================="
@@ -177,7 +185,7 @@ print(json.dumps({
         --working-dir "${REPO_ROOT}" \
         --runtime-env-json "${runtime_env}" \
         --no-wait \
-        -- bash "${script_path}"
+        -- bash "${script_path}" ${extra_args}
 
     # Poll status via kubectl exec so transient port-forward drops never kill the CI run
     local deadline=$((SECONDS + timeout_mins * 60))
@@ -208,12 +216,13 @@ print(json.dumps({
         exit 1
     fi
 
-    # Verify training metrics in log output
-    python3 - "${suite_name}" "${log_file}" <<'PY'
+    # Verify training convergence & test pass rate in log output
+    python3 - "${suite_name}" "${log_file}" "${SMOKE_TEST}" <<'PY'
+import math
 import re
 import sys
 
-suite, log_path = sys.argv[1], sys.argv[2]
+suite, log_path, smoke_test = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 text = open(log_path, encoding="utf-8", errors="replace").read()
 
 steps = re.findall(r"step[:\s]+([1-9][0-9]*)", text, flags=re.IGNORECASE)
@@ -223,19 +232,57 @@ if not steps:
 
 if suite == "sft":
     losses = [float(x) for x in re.findall(r"train/loss[:\s]+([0-9.eE+-]+)", text)]
-    if not losses:
-        print("[TPU CI] ERROR: No train/loss metrics found in SFT output.", file=sys.stderr)
+    val_losses = [float(x) for x in re.findall(r"val/loss[:\s]+([0-9.eE+-]+)", text)]
+    grad_norms = [float(x) for x in re.findall(r"train/grad_norm[:\s]+([0-9.eE+-]+)", text)]
+    if not losses or not val_losses:
+        print("[TPU CI] ERROR: Missing train/loss or val/loss metrics in SFT output.", file=sys.stderr)
         sys.exit(1)
-    print(f"[TPU CI] SFT verified: {len(losses)} train/loss entries, final train/loss={losses[-1]:.4f}")
+    if any(not math.isfinite(g) for g in grad_norms):
+        print("[TPU CI] ERROR: Non-finite train/grad_norm in SFT output.", file=sys.stderr)
+        sys.exit(1)
+    assert losses[-1] < losses[0] * 0.80, (
+        f"[TPU CI] SFT train/loss did not converge sufficiently: {losses[0]:.4f} -> {losses[-1]:.4f}"
+    )
+    assert val_losses[-1] <= val_losses[0] and val_losses[-1] < 0.85, (
+        f"[TPU CI] SFT val/loss did not converge sufficiently: {val_losses[0]:.4f} -> {val_losses[-1]:.4f}"
+    )
+    print(
+        f"[TPU CI] SFT convergence verified: train/loss {losses[0]:.4f} -> {losses[-1]:.4f}, "
+        f"val/loss {val_losses[0]:.4f} -> {val_losses[-1]:.4f}"
+    )
 elif suite == "grpo":
     if re.search(r"actor/grad_norm[:\s]+(nan|inf)", text, flags=re.IGNORECASE):
         print("[TPU CI] ERROR: Non-finite actor/grad_norm detected in GRPO output!", file=sys.stderr)
         sys.exit(1)
+    grad_norms = [float(x) for x in re.findall(r"actor/grad_norm[:\s]+([0-9.eE+-]+)", text)]
     rewards = [float(x) for x in re.findall(r"critic/rewards/mean[:\s]+([0-9.eE+-]+)", text)]
-    if not rewards:
-        print("[TPU CI] ERROR: No critic/rewards/mean metrics found in GRPO output.", file=sys.stderr)
+    corrs = [float(x) for x in re.findall(r"training/rollout_actor_probs_pearson_corr[:\s]+([0-9.eE+-]+)", text)]
+    val_accs = [
+        float(x)
+        for x in re.findall(r"val-core/openai/gsm8k/acc/mean@1['\"]?:\s*(?:np\.float64\()?([0-9.eE+-]+)", text)
+    ]
+    if not rewards or not grad_norms:
+        print("[TPU CI] ERROR: Missing critic/rewards/mean or actor/grad_norm in GRPO output.", file=sys.stderr)
         sys.exit(1)
-    print(f"[TPU CI] GRPO verified: {len(rewards)} steps with finite metrics, final reward={rewards[-1]:.4f}")
+    assert max(grad_norms) > 0.0, "[TPU CI] GRPO actor/grad_norm was 0.0 on all steps (no gradient flowed)!"
+    assert max(rewards) >= 0.15, f"[TPU CI] GRPO best training reward {max(rewards):.4f} < 0.15 target!"
+    if corrs:
+        assert min(corrs) >= 0.90, (
+            f"[TPU CI] Rollout-Actor logprob Pearson correlation dropped below 0.90: min={min(corrs):.4f}"
+        )
+    if val_accs:
+        assert max(val_accs) >= 0.25, (
+            f"[TPU CI] GSM8K test pass rate (val-core/openai/gsm8k/acc/mean@1) {max(val_accs):.4f} < 0.25!"
+        )
+        if not smoke_test and len(val_accs) >= 2:
+            assert val_accs[-1] > val_accs[0], (
+                f"[TPU CI] GSM8K test pass rate did not improve over full run: {val_accs[0]:.4f} -> {val_accs[-1]:.4f}"
+            )
+    print(
+        f"[TPU CI] GRPO convergence & quality verified: best_reward={max(rewards):.4f}, "
+        f"val_acc={val_accs[-1] if val_accs else 'N/A'}, min_corr={min(corrs) if corrs else 'N/A'}, "
+        f"max_grad_norm={max(grad_norms):.4f}"
+    )
 PY
 
     echo "[TPU CI] ${suite_name^^} E2E test PASSED!"
