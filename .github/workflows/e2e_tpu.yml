@@ -40,7 +40,7 @@ on:
     branches:
       - main
       - tpu-main*
-      - jialei/add-ci
+      - tpu_sft
       - v0.*
     paths:
       - ".github/workflows/e2e_tpu.yml"
