@@ -394,11 +394,56 @@ class TPUCheckpointEngine(CheckpointEngine):
         except Exception:
             pass
 
+        def _layer_chunk_name(param_name: str) -> str:
+            if "layers." in param_name:
+                parts = param_name.split(".")
+                idx = parts.index("layers")
+                if idx + 1 < len(parts) and parts[idx + 1].isdigit():
+                    layer_idx = int(parts[idx + 1])
+                    chunk_start = (layer_idx // 4) * 4
+                    return f"layers_{chunk_start}_{chunk_start + 3}"
+                return ".".join(parts[: idx + 2])
+            return "other"
+
+        def _flush_group(group_name: str, group_items: list[tuple[str, torch.Tensor]]) -> tuple[Any, float, float]:
+            t_g0 = time.perf_counter()
+            by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+            for k_item, cpu_v in group_items:
+                by_dtype.setdefault(cpu_v.dtype, []).append((k_item, cpu_v))
+            group_items.clear()
+
+            flat_tensors = {}
+            metadata = {}
+            for dtype, items in by_dtype.items():
+                flat_cpu = torch.cat([v.view(-1) for _, v in items])
+                if dtype == torch.bfloat16:
+                    flat_tensors[dtype] = flat_cpu.view(torch.int16).numpy()
+                else:
+                    flat_tensors[dtype] = flat_cpu.numpy()
+                metadata[dtype] = [(k_item, v.shape, v.numel()) for k_item, v in items]
+                del items
+            del by_dtype
+
+            group_sd = {"flat_tensors": flat_tensors, "metadata": metadata}
+            t_g_elapsed = time.perf_counter() - t_g0
+            t_p0 = time.perf_counter()
+            ref = ray.put((group_name, group_sd))
+            t_p_elapsed = time.perf_counter() - t_p0
+            del group_sd, flat_tensors, metadata
+            return ref, t_g_elapsed, t_p_elapsed
+
         if not self.is_master:
             # Non-master ranks must consume the generator to participate in FSDP all-gathers,
-            # then synchronize and collect so lazy all-gather buffers do not accumulate.
-            for _k, v in weights:
+            # synchronizing periodically so lazy all-gather buffers do not accumulate on 4B+ models.
+            for idx_tensor, (_k, v) in enumerate(weights, start=1):
                 del v
+                if idx_tensor % 32 == 0:
+                    try:
+                        import torch_tpu
+
+                        torch_tpu._internal.sync.synchronize(wait=True)
+                    except Exception:
+                        pass
             try:
                 import torch_tpu
 
@@ -411,65 +456,57 @@ class TPUCheckpointEngine(CheckpointEngine):
         step_key = global_steps if global_steps is not None else 0
         logger.info(f"TPUCheckpointEngine: [Step {step_key}] Start send_weights...")
 
-        # Time generator consumption and CPU offloading
+        # Stream generator consumption, CPU offloading, and per-chunk ray.put
         t_offload_start = time.perf_counter()
-        grouped_weights = {}
-        for k, v in weights:
+        grouped_weights: dict[str, list[tuple[str, torch.Tensor]]] = {}
+        chunk_refs = []
+        t_group = 0.0
+        t_put = 0.0
+        active_layer_group: str | None = None
+
+        for idx_tensor, (k, v) in enumerate(weights, start=1):
             cpu_v = v.detach().cpu()
             del v
-            if "layers." in k:
-                # Extract layer part: model.layers.12.self_attn... -> model.layers.12
-                parts = k.split(".")
-                idx = parts.index("layers")
-                group_name = ".".join(parts[: idx + 2])
-            else:
-                group_name = "other"
+            if idx_tensor % 32 == 0:
+                try:
+                    import torch_tpu
+
+                    torch_tpu._internal.sync.synchronize(wait=True)
+                except Exception:
+                    pass
+            group_name = _layer_chunk_name(k)
+            if (
+                active_layer_group is not None
+                and group_name != active_layer_group
+                and active_layer_group.startswith("layers_")
+                and active_layer_group in grouped_weights
+            ):
+                ref, dt_g, dt_p = _flush_group(active_layer_group, grouped_weights.pop(active_layer_group))
+                chunk_refs.append(ref)
+                t_group += dt_g
+                t_put += dt_p
+            if group_name.startswith("layers_"):
+                active_layer_group = group_name
             grouped_weights.setdefault(group_name, []).append((k, cpu_v))
+
         try:
             import torch_tpu
 
             torch_tpu._internal.sync.synchronize(wait=True)
         except Exception:
             pass
-        t_offload = time.perf_counter() - t_offload_start
+        t_offload = (time.perf_counter() - t_offload_start) - t_group - t_put
 
-        # Time grouping and flattening (pop groups as we flatten to avoid holding 2x CPU copies)
-        t_group_start = time.perf_counter()
-        grouped_dict = {}
         for group_name in list(grouped_weights.keys()):
-            group_items = grouped_weights.pop(group_name)
-            by_dtype = {}
-            for k, cpu_v in group_items:
-                by_dtype.setdefault(cpu_v.dtype, []).append((k, cpu_v))
-            del group_items
-
-            flat_tensors = {}
-            metadata = {}
-            for dtype, items in by_dtype.items():
-                flat_cpu = torch.cat([v.view(-1) for _, v in items])
-                if dtype == torch.bfloat16:
-                    flat_tensors[dtype] = flat_cpu.view(torch.int16).numpy()
-                else:
-                    flat_tensors[dtype] = flat_cpu.numpy()
-                metadata[dtype] = [(k, v.shape, v.numel()) for k, v in items]
-                del items
-            del by_dtype
-
-            grouped_dict[group_name] = {"flat_tensors": flat_tensors, "metadata": metadata}
-
-        state_dict = {"grouped": grouped_dict}
-        t_group = time.perf_counter() - t_group_start
-
-        # Time Ray Put upload
-        t_put_start = time.perf_counter()
-        ref = ray.put(state_dict)
-        del grouped_dict, state_dict
-        t_put = time.perf_counter() - t_put_start
+            ref, dt_g, dt_p = _flush_group(group_name, grouped_weights.pop(group_name))
+            chunk_refs.append(ref)
+            t_group += dt_g
+            t_put += dt_p
 
         # Time Registry update
         t_reg_start = time.perf_counter()
-        await self.registry.set_weights.remote(step_key, [ref])
-        del ref
+        await self.registry.set_weights.remote(step_key, chunk_refs)
+        del chunk_refs
         gc.collect()
         t_reg = time.perf_counter() - t_reg_start
 
@@ -529,6 +566,14 @@ async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
         for replica in manager.replicas
     ]
     results = await asyncio.gather(*futures)
+
+    cache_and_step_futures = []
+    for replica in manager.replicas:
+        cache_and_step_futures.append(replica.server_handle.clear_kv_cache.remote())
+        if global_steps is not None:
+            cache_and_step_futures.append(replica.server_handle.set_global_steps.remote(global_steps))
+    if cache_and_step_futures:
+        await asyncio.gather(*cache_and_step_futures)
 
     # Release the state_dict ObjectRef from TPUWeightRegistry immediately after all
     # rollout replicas have loaded the weights so it does not stay pinned in the
