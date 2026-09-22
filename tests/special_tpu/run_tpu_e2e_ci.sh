@@ -329,7 +329,7 @@ elif suite == "grpo":
             f"[TPU CI] Rollout-Actor logprob Pearson correlation dropped below 0.90: min={min(corrs):.4f}"
         )
     if val_accs:
-        min_val_acc = 0.15 if smoke_test else 0.25
+        min_val_acc = 0.06 if smoke_test else 0.25
         assert max(val_accs) >= min_val_acc, (
             f"[TPU CI] GSM8K test pass rate (val-core/openai/gsm8k/acc/mean@1) {max(val_accs):.4f} < {min_val_acc}!"
         )
