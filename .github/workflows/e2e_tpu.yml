@@ -57,6 +57,7 @@ on:
       - "verl/workers/rollout/vllm_rollout/**"
       - "verl/workers/utils/**"
   pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - ".github/workflows/e2e_tpu.yml"
       - "examples/tpu/**"
@@ -118,22 +119,30 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Set up Google Cloud SDK & gke-gcloud-auth-plugin
+      - name: Set up Google Cloud SDK (when running outside GKE)
+        if: ${{ env.GCP_SA_KEY != '' || env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: "gke-gcloud-auth-plugin,kubectl"
 
-      - name: Install Ray Job Submission CLI
+      - name: Install Ray Job Submission CLI & kubectl
         run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -sLO https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/kubectl
+          fi
           python3 -m pip install --upgrade pip
           python3 -m pip install --quiet "ray[default]"
 
       - name: Connect to GKE TPU Cluster
         run: |
-          export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
-          export REGION="us-central2"
-          export PROJECT="tpu-pytorch"
-          gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
+          if [[ -z "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+            export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
+            export REGION="us-central2"
+            export PROJECT="tpu-pytorch"
+            gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
+          fi
           kubectl get nodes -o wide
 
       - name: Run GSM8K E2E SFT on TPU v6e-8 (TorchTitan FSDP2)
@@ -165,22 +174,30 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Set up Google Cloud SDK & gke-gcloud-auth-plugin
+      - name: Set up Google Cloud SDK (when running outside GKE)
+        if: ${{ env.GCP_SA_KEY != '' || env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: "gke-gcloud-auth-plugin,kubectl"
 
-      - name: Install Ray Job Submission CLI
+      - name: Install Ray Job Submission CLI & kubectl
         run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -sLO https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/kubectl
+          fi
           python3 -m pip install --upgrade pip
           python3 -m pip install --quiet "ray[default]"
 
       - name: Connect to GKE TPU Cluster
         run: |
-          export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
-          export REGION="us-central2"
-          export PROJECT="tpu-pytorch"
-          gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
+          if [[ -z "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+            export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
+            export REGION="us-central2"
+            export PROJECT="tpu-pytorch"
+            gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
+          fi
           kubectl get nodes -o wide
 
       - name: Reset KubeRay TPU Pods & Run GSM8K E2E GRPO on TPU v6e-8 x2 Slices

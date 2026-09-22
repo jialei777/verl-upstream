@@ -34,21 +34,37 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
 PF_PID=""
+CURRENT_RAY_JOB_ID=""
 cleanup() {
+    if [[ -n "${CURRENT_RAY_JOB_ID}" && -n "${RAY_ADDRESS:-}" ]]; then
+        echo "[TPU CI] Stopping active Ray job ${CURRENT_RAY_JOB_ID}..."
+        ray job stop --address "${RAY_ADDRESS}" "${CURRENT_RAY_JOB_ID}" >/dev/null 2>&1 || true
+        CURRENT_RAY_JOB_ID=""
+    fi
     if [[ -n "${PF_PID}" ]] && kill -0 "${PF_PID}" 2>/dev/null; then
         kill "${PF_PID}" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 connect_gke_cluster() {
     echo "=================================================================="
     echo "[TPU CI] Connecting to GKE cluster: ${CLUSTER_NAME} (${REGION}, ${PROJECT})"
     echo "=================================================================="
-    gcloud container clusters get-credentials "${CLUSTER_NAME}" \
-        --region "${REGION}" \
-        --project "${PROJECT}" \
-        --dns-endpoint
+    if [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+        unset KUBECONFIG
+        if ! command -v kubectl >/dev/null 2>&1; then
+            curl -sLO https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/kubectl
+        fi
+        echo "[TPU CI] Running inside GKE pod; using in-cluster Kubernetes service account."
+    else
+        gcloud container clusters get-credentials "${CLUSTER_NAME}" \
+            --region "${REGION}" \
+            --project "${PROJECT}" \
+            --dns-endpoint
+    fi
 
     if ! kubectl get raycluster "${RAY_CLUSTER_NAME}" -n "${RAY_NAMESPACE}" >/dev/null 2>&1; then
         echo "[TPU CI] RayCluster ${RAY_CLUSTER_NAME} not found; applying manifest..."
@@ -88,13 +104,13 @@ ensure_clean_tpu_cluster() {
     while (( SECONDS < deadline )); do
         local tpu_usage
         tpu_usage="$(kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- ray status 2>/dev/null \
-            | grep -oE '[0-9.]+/[0-9.]+ TPU$' | head -n 1 || true)"
+            | awk '/[0-9.]+\/[0-9.]+ TPU([[:space:]]|$)/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print $0; exit}' || true)"
         echo "[TPU CI] Ray TPU status: ${tpu_usage:-<initializing>}"
         if [[ "${tpu_usage}" == "0.0/${EXPECTED_TPU_CHIPS} TPU" ]]; then
             return 0
         fi
-        # If TPUs are held by a leftover process from a previous run, force-reset pods once
-        if [[ -n "${tpu_usage}" && "${tpu_usage}" == */"${EXPECTED_TPU_CHIPS} TPU" && "${tpu_usage}" != 0.0/* && "${force_reset}" == "0" ]]; then
+        # If TPUs are held by a leftover process or placement group from a previous run, force-reset pods once
+        if [[ -n "${tpu_usage}" && "${tpu_usage}" != "0.0/${EXPECTED_TPU_CHIPS} TPU" && "${force_reset}" == "0" ]]; then
             echo "[TPU CI] Detected held TPUs (${tpu_usage}); recycling cluster pods..."
             ensure_clean_tpu_cluster 1
             return 0
@@ -186,6 +202,7 @@ print(json.dumps({
         --runtime-env-json "${runtime_env}" \
         --no-wait \
         -- bash "${script_path}" ${extra_args}
+    CURRENT_RAY_JOB_ID="${sub_id}"
 
     # Poll status via kubectl exec so transient port-forward drops never kill the CI run
     local deadline=$((SECONDS + timeout_mins * 60))
@@ -205,6 +222,7 @@ print(json.dumps({
         fi
         sleep 15
     done
+    CURRENT_RAY_JOB_ID=""
 
     echo "[TPU CI] Fetching full job logs for ${sub_id}..."
     kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- \
