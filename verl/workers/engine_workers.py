@@ -29,6 +29,7 @@ from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
+from verl.plugin.platform import get_platform
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
@@ -39,7 +40,7 @@ from verl.utils.distributed import initialize_global_process_group_ray, set_numa
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.metric.utils import Metric
+from verl.utils.metric.utils import Metric, convert_tensors_to_scalars
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
@@ -192,11 +193,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # perform all gather in dp group to ensure that it's correct.
         # Here each metric in metrics can be a list (micro-batch metrics) or a singleton
         # we should always sum the loss of each micro-batch as we scale by global_bsz/global_token
-        loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
         dp_group = self.engine.get_data_parallel_group()
-        if dp_group is not None:
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
-        loss = loss.item()
+        # Backends that only run collectives inside their traced graph (see
+        # PlatformBase.supports_eager_collectives) cannot reduce here; their per-rank metrics are
+        # merged on the driver instead, see concat_tensordict_with_none_bsz.
+        eager_collectives = get_platform().supports_eager_collectives()
+        if eager_collectives:
+            loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
+            if dp_group is not None:
+                torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+            loss = loss.item()
+        else:
+            loss = torch.sum(torch.tensor(convert_tensors_to_scalars(output.pop("loss")))).item()
 
         # For grad_norm, we do not perform all reduce because it is already been done when clipping grad
         grad_norm = metrics.pop("grad_norm", None)
@@ -205,7 +213,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         lr = metrics.pop("lr", None)
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
-        if dp_group is not None:
+        if not eager_collectives:
+            final_metrics = convert_tensors_to_scalars(metrics)
+        elif dp_group is not None:
             final_metrics = allgather_dict_into_dict(data=metrics, group=dp_group)
         else:
             final_metrics = metrics
@@ -233,6 +243,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
             if forward_only:
                 final_metrics["mfu"] /= 3.0
+        if not eager_collectives:
+            # the metrics added above may still hold device tensors, and this dict is about to
+            # cross the Ray boundary
+            final_metrics = convert_tensors_to_scalars(final_metrics)
         # model outputs
         model_output = output.pop("model_output", {})
         # We only return final_metrics
@@ -326,11 +340,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            if isinstance(val[0], Metric):
+                                output[key] = Metric.aggregate_dp(val)
+                            elif isinstance(val[0], list | tuple):
+                                output[key] = list(chain.from_iterable(val))
+                            else:
+                                # one scalar per dp rank (metrics merged on the driver)
+                                output[key] = sum(val) / len(val)
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()

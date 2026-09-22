@@ -237,9 +237,25 @@ def concat_tensordict_with_none_bsz(data: list[TensorDict]):
     Note:
         This is used internally by concat_tensordict when handling
         TensorDicts that contain only non-tensor metadata.
+
+        Platforms that cannot run collectives eagerly do not all-gather their metrics inside the
+        worker (see ``PlatformBase.supports_eager_collectives``), so the per-rank dictionaries are
+        merged here instead, producing the same ``{key: [value_per_rank]}`` layout that
+        ``allgather_dict_into_dict`` produces on the other platforms.
     """
+    from verl.plugin.platform import get_platform
+
     for d in data:
         assert len(d.batch_size) == 0
+
+    if len(data) > 1 and "metrics" in data[0] and not get_platform().supports_eager_collectives():
+        all_metrics = [get(d, "metrics") for d in data]
+        if all(isinstance(m, dict) for m in all_metrics):
+            merged_metrics = {}
+            for key in all_metrics[0]:
+                merged_metrics[key] = [metrics[key] for metrics in all_metrics if key in metrics]
+            return get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": merged_metrics})
+
     # directly return the first meta info
     return data[0]
 

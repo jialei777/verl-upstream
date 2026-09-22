@@ -32,12 +32,15 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from verl.plugin.platform import get_platform
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler, OrchestrationMode
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.logger import log_with_rank
+from verl.utils.metric import reduce_metrics
+from verl.utils.ray_utils import merge_platform_ray_init_kwargs
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions
 from verl.utils.tracking import Tracking
 from verl.workers.engine_workers import TrainingWorker
@@ -274,6 +277,11 @@ class SFTTrainer:
 
         # Calculate which epoch we're starting from for sampler.set_epoch()
         start_epoch = global_step // self.steps_per_epoch
+        # platforms that cannot all-reduce their metrics inside the worker return one value per
+        # data parallel rank, reduce them here instead
+        reduce_worker_metrics = (
+            reduce_metrics if not get_platform().supports_eager_collectives() else (lambda metrics: metrics)
+        )
 
         meta_info = {
             "use_remove_padding": self.config.model.use_remove_padding,
@@ -337,14 +345,14 @@ class SFTTrainer:
                 if global_step == self.end_profile_step:
                     self.training_client.stop_profile()
 
-                metrics = tu.get(output, "metrics")
+                metrics = reduce_worker_metrics(tu.get(output, "metrics"))
 
                 # TODO: we can actual accumulate metrics for N steps and perform aggregate metrics
                 metrics["train/loss"] = metrics.pop("loss")
-                metrics["train/grad_norm"] = metrics.pop("grad_norm")
-                metrics["train/lr"] = metrics.pop("lr")
-                metrics["train/mfu"] = metrics.pop("mfu")
-                metrics["train/global_tokens"] = torch.sum(torch.tensor(batch_seqlens, device=self.device_name)).item()
+                metrics["train/grad_norm"] = metrics.pop("grad_norm", 0.0)
+                metrics["train/lr"] = metrics.pop("lr", 0.0)
+                metrics["train/mfu"] = metrics.pop("mfu", 0.0)
+                metrics["train/global_tokens"] = sum(batch_seqlens)
                 total_tokens += metrics["train/global_tokens"]
                 metrics["train/total_tokens(B)"] = total_tokens / 1e9
                 tracking.log(data=metrics, step=global_step)
@@ -361,10 +369,13 @@ class SFTTrainer:
                         val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
                         output = self.training_client.infer_batch(val_data)
                         output = output.get()
-                        metrics = tu.get(output, "metrics")
+                        metrics = reduce_worker_metrics(tu.get(output, "metrics"))
                         val_losses.append(metrics["loss"])
 
-                    val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                    if not val_losses:
+                        logger.warning("No validation batch was run, check data.val_max_samples.")
+                    # a handful of python floats, reduce them on the host
+                    val_loss = torch.mean(torch.tensor(val_losses or [0.0], dtype=torch.float32))
 
                     metric = {"val/loss": val_loss.detach().item()}
                     tracking.log(data=metric, step=global_step)
@@ -379,10 +390,19 @@ class SFTTrainer:
                     return
 
 
+def _run_trainer(config):
+    SFTTrainer(config=config).fit()
+
+
 def run_sft(config):
-    ray.init()
-    trainer = SFTTrainer(config=config)
-    trainer.fit()
+    ray.init(**merge_platform_ray_init_kwargs())
+
+    if get_platform().requires_remote_driver():
+        # the device runtime has to be initialized from a node that owns devices, which the Ray
+        # driver process is not guaranteed to be
+        ray.get(ray.remote(_run_trainer).options(num_cpus=1).remote(config))
+    else:
+        _run_trainer(config)
 
 
 @hydra.main(config_path="config", config_name="sft_trainer_engine", version_base=None)

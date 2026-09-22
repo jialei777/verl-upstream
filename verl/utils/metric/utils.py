@@ -22,6 +22,25 @@ import numpy as np
 import torch
 
 
+def convert_tensors_to_scalars(value: Any) -> Any:
+    """Recursively replace tensors inside a metric container by host-side values.
+
+    Metrics are shipped to the driver through Ray. Letting a device tensor make that trip forces
+    the receiving process to touch the producing device's allocator, which is not possible for
+    every backend, so scalars are converted with ``.item()`` and larger tensors are moved to the
+    host. Anything that is not a tensor or a container is returned unchanged.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.item() if value.numel() == 1 else value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: convert_tensors_to_scalars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [convert_tensors_to_scalars(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(convert_tensors_to_scalars(v) for v in value)
+    return value
+
+
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.

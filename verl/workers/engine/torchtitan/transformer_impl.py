@@ -51,7 +51,18 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.tpu_utils import (
+    TPU_PADDED_VALUES_ATTR,
+    bucket_length,
+    compute_global_batch_num_tokens,
+    synchronize_tpu_loss,
+    unwrap_metadata,
+)
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
+from verl.workers.engine.torchtitan.tpu_utils import (
+    monkey_patch_varlen_attention_tpu,
+    pad_packed_inputs_for_tpu,
+)
 from verl.workers.engine.torchtitan.utils import (
     NoOpDataLoader,
     derive_torchtitan_name_and_flavor,
@@ -91,6 +102,11 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+is_tpu = device_name == "tpu"
+
+if is_tpu:
+    # torch_tpu has no flash attention kernel to dispatch the varlen attention to
+    monkey_patch_varlen_attention_tpu()
 
 
 class TorchTitanEngine(BaseEngine):
@@ -133,7 +149,13 @@ class TorchTitanEngine(BaseEngine):
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
 
+        optimizer_kwargs = {}
+        if is_tpu:
+            # torch_tpu has no fused optimizer kernels, foreach is the fastest available there
+            optimizer_kwargs["implementation"] = "foreach"
+
         optimizer = OptimizersContainer.Config(
+            **optimizer_kwargs,
             param_groups=[
                 ParamGroupConfig(
                     pattern=r".*",
@@ -158,6 +180,19 @@ class TorchTitanEngine(BaseEngine):
             decay_type=self.optimizer_config.decay_type,
             min_lr_factor=self.optimizer_config.min_lr_factor,
         )
+        if is_tpu and self.engine_config.tensor_parallel_size > 1:
+            # With tensor_parallel_degree > 1 TorchTitan routes the model through
+            # model.parallelize(), which turns the logits into a DTensor that has to be
+            # reassembled before the loss. On TPU that backward path intermittently produces
+            # non-finite gradients, and optimizer_step() silently skips those updates: the run
+            # reports success while the policy never trains.
+            logger.warning(
+                "tensor_parallel_size=%d is not supported on TPU: it produces non-finite "
+                "gradients, which optimizer_step() skips, so the policy will not train. "
+                "Set tensor_parallel_size=1 and shard over data_parallel_shard_size instead.",
+                self.engine_config.tensor_parallel_size,
+            )
+
         parallelism = ParallelismConfig(
             data_parallel_replicate_degree=self.engine_config.data_parallel_replicate_size,
             data_parallel_shard_degree=self.engine_config.data_parallel_shard_size,
@@ -166,7 +201,7 @@ class TorchTitanEngine(BaseEngine):
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend=self.engine_config.spmd_backend,
+            spmd_backend="default" if is_tpu else self.engine_config.spmd_backend,
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -174,11 +209,15 @@ class TorchTitanEngine(BaseEngine):
             initial_load_model_only=True,
             initial_load_path=model_config.path,
         )
-        compile_config = CompileConfig(enable=self.engine_config.use_torch_compile)
+        compile_config = CompileConfig(
+            enable=self.engine_config.use_torch_compile,
+            backend="tpu" if is_tpu else "inductor",
+        )
         training_kwargs = {}
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
-        if self.engine_config.offload_policy or self.engine_config.forward_only:
+        # CPU offload relies on pinned-memory copies that torch_tpu does not implement
+        if (self.engine_config.offload_policy or self.engine_config.forward_only) and not is_tpu:
             training = TrainingConfig(enable_cpu_offload=True, **training_kwargs)
         else:
             training = TrainingConfig(**training_kwargs)
@@ -214,6 +253,10 @@ class TorchTitanEngine(BaseEngine):
         self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
+
+        if is_tpu and torch.distributed.is_initialized():
+            # every rank has to reach the same point before the first collective is traced
+            torch.distributed.barrier()
 
         # Re-enable FSDP's gradient division for verl's loss scaling.
         # TorchTitan disables gradient division by default (for global token normalization),
@@ -286,6 +329,11 @@ class TorchTitanEngine(BaseEngine):
         else:
             self.optimizer = None
             self.lr_scheduler = None
+            if is_tpu:
+                # a forward-only (reference) model shares the chip with the policy, drop the
+                # optimizer state TorchTitan would otherwise keep alive
+                self.trainer.optimizers = None
+                self.trainer.lr_schedulers = None
 
         self.to(
             device="cpu",
@@ -362,11 +410,15 @@ class TorchTitanEngine(BaseEngine):
         tu.assign_non_tensor(data, sp_size=self.engine_config.tensor_parallel_size)
 
         # Compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
         dp_group = self.get_data_parallel_group()
-        if dp_group is not None:
-            torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+        if is_tpu:
+            batch_num_tokens = compute_global_batch_num_tokens(data, dp_group, self.engine_config.tensor_parallel_size)
+        else:
+            batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+            if dp_group is not None:
+                torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            batch_num_tokens = batch_num_tokens.item()
+        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens)
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
@@ -387,6 +439,9 @@ class TorchTitanEngine(BaseEngine):
             with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 if not forward_only:
+                    if is_tpu:
+                        # cut the graph so forward and backward are compiled separately
+                        synchronize_tpu_loss(loss)
                     loss.backward()
             output_lst.append(output)
 
@@ -428,17 +483,21 @@ class TorchTitanEngine(BaseEngine):
 
     def optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
+        # torch._foreach_norm (the foreach=True path) is unreliable on the TPU backend: it
+        # returns inf even when every gradient is exactly zero, and a non-finite grad_norm makes
+        # this method skip the update, silently freezing the policy. Use the per-tensor path.
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.module for p in m.parameters()],
             self.config.training.max_norm,
-            foreach=True,
+            foreach=not is_tpu,
             pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             ep_enabled=self.parallel_dims.ep_enabled,
         )
 
-        # if grad_norm is not finite, skip the update
+        # if grad_norm is not finite, skip the update. This is silent by design, so say it loudly:
+        # a run where it fires on every step reports success while the policy never changes.
         if not torch.isfinite(grad_norm):
-            logger.warning(f"grad_norm is not finite: {grad_norm}")
+            logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
@@ -712,7 +771,7 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
-@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu"])
+@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu", "tpu"])
 class TorchTitanEngineWithLMHead(TorchTitanEngine):
     """TorchTitan engine implementation for language models with LM head."""
 
@@ -726,7 +785,16 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         position_ids = micro_batch["position_ids"]
         output_args = {}
 
-        if use_remove_padding:
+        if use_remove_padding and is_tpu:
+            # pad the packed sequence to a bucket so XLA sees a handful of shapes over a run
+            input_ids, position_ids, labels, attention_mask, orig_seq_len = pad_packed_inputs_for_tpu(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                micro_batch=micro_batch,
+                device=get_device_id(),
+            )
+            output_args["orig_seq_len"] = orig_seq_len
+        elif use_remove_padding:
             input_ids = input_ids.values().unsqueeze(0)
             if position_ids.dim() == 3:
                 position_ids = position_ids.values().unsqueeze(1)
@@ -744,7 +812,9 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
-            max_seq_len = max(input_ids.offsets().diff())
+            max_seq_len = int(max(input_ids.offsets().diff()))
+            if is_tpu:
+                max_seq_len = bucket_length(max_seq_len)
 
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
             input_ids = torch.nested.to_padded_tensor(
@@ -786,15 +856,26 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         # TODO(jessicazhong): multimodal is not yet supported for Torchtitan engine
         extra_inputs.update(multi_modal_inputs)
         output_args["labels"] = labels
+
+        if is_tpu:
+            # non-contiguous inputs make the TPU backend insert a copy per step
+            input_ids = input_ids.contiguous()
+            extra_inputs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_inputs.items()}
+            extra_kwargs = {k: v.contiguous() if isinstance(v, torch.Tensor) else v for k, v in extra_kwargs.items()}
+
         return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
-        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
-        pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        # On TPU the micro batch is not moved to the device as a whole, so its metadata can come
+        # back wrapped in a singleton tensor or a per-rank list; normalize it to plain values.
+        unwrap = unwrap_metadata if is_tpu else (lambda value: value)
+
+        use_remove_padding = unwrap(tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True))
+        pad_mode = unwrap(tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING))
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
-        temperature = micro_batch["temperature"]
-        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+        temperature = unwrap(micro_batch["temperature"])
+        calculate_entropy = unwrap(tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False))
         labels = output_args["labels"]
         model_output = {}
 
@@ -827,11 +908,30 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 else:
                     entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
 
-            log_probs = torch.nested.nested_tensor_from_jagged(log_probs.squeeze(0), cu_seqlens)
-            if calculate_entropy:
-                entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+            padded_log_probs = log_probs.squeeze(0)
+            orig_seq_len = output_args.get("orig_seq_len")
+            if orig_seq_len is None:
+                log_probs = torch.nested.nested_tensor_from_jagged(padded_log_probs, cu_seqlens)
+                if calculate_entropy:
+                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+            else:
+                # The inputs were bucket-padded (TPU). Hand the rest of verl the unpadded nested
+                # tensor it expects, but keep the padded device copy attached for the loss, which
+                # has to stay shape-stable.
+                cu_seqlens_cpu = cu_seqlens.detach().cpu()
+                unpadded_log_probs = padded_log_probs.detach().cpu()[:orig_seq_len]
+                log_probs = torch.nested.nested_tensor_from_jagged(unpadded_log_probs, cu_seqlens_cpu)
+                setattr(log_probs, TPU_PADDED_VALUES_ATTR, padded_log_probs)
+                if calculate_entropy:
+                    unpadded_entropy = entropy_rmpad.detach().cpu()[:orig_seq_len]
+                    entropy = torch.nested.nested_tensor_from_jagged(unpadded_entropy, cu_seqlens_cpu)
+                    setattr(entropy, TPU_PADDED_VALUES_ATTR, entropy_rmpad)
         else:
-            logits.div_(temperature)
+            if is_tpu:
+                # in-place division on an XLA tensor forces a copy of the whole logits buffer
+                logits = logits / temperature
+            else:
+                logits.div_(temperature)
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:
                     entropy = verl_F.entropy_from_logits(logits)
@@ -857,7 +957,10 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
-        micro_batch = micro_batch.to(get_device_id())
+        if not is_tpu:
+            # on TPU only the tensors the model consumes are transferred, and they are bucketed
+            # first, see prepare_model_inputs
+            micro_batch = micro_batch.to(get_device_id())
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
@@ -873,6 +976,12 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            for value in model_output.values():
+                # the padded copy is only needed by the loss above, do not keep the device buffer
+                # alive in the output
+                if hasattr(value, TPU_PADDED_VALUES_ATTR):
+                    delattr(value, TPU_PADDED_VALUES_ATTR)
 
             # Detach before this lands in forward_backward_batch's output_lst; see detach_tree.
             output = {
