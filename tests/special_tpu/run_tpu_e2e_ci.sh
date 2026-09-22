@@ -35,6 +35,45 @@ cd "${REPO_ROOT}"
 
 PF_PID=""
 CURRENT_RAY_JOB_ID=""
+LOCK_NAME="tpu-ci-cluster-lock"
+LOCK_OWNER="${GITHUB_RUN_ID:-local}-$$-$(hostname)"
+HAVE_CLUSTER_LOCK="0"
+
+release_cluster_lock() {
+    if [[ "${HAVE_CLUSTER_LOCK}" == "1" ]]; then
+        kubectl delete configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" >/dev/null 2>&1 || true
+        HAVE_CLUSTER_LOCK="0"
+    fi
+}
+
+acquire_cluster_lock() {
+    local wait_deadline=$((SECONDS + 3600))
+    while (( SECONDS < wait_deadline )); do
+        local now_ts
+        now_ts="$(date +%s)"
+        if kubectl create configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" \
+            --from-literal="owner=${LOCK_OWNER}" \
+            --from-literal="timestamp=${now_ts}" >/dev/null 2>&1; then
+            HAVE_CLUSTER_LOCK="1"
+            echo "[TPU CI] Acquired exclusive TPU cluster lock (${LOCK_NAME}, owner=${LOCK_OWNER})."
+            return 0
+        fi
+        local holder holder_ts
+        holder="$(kubectl get configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" -o jsonpath='{.data.owner}' 2>/dev/null || echo 'unknown')"
+        holder_ts="$(kubectl get configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" -o jsonpath='{.data.timestamp}' 2>/dev/null || echo '0')"
+        # Reclaim stale lock older than 45 minutes (2700s)
+        if [[ "${holder_ts}" =~ ^[0-9]+$ ]] && (( now_ts - holder_ts > 2700 )); then
+            echo "[TPU CI] Reclaiming stale cluster lock from ${holder} (age $((now_ts - holder_ts))s)..."
+            kubectl delete configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" >/dev/null 2>&1 || true
+            continue
+        fi
+        echo "[TPU CI] TPU cluster is busy (locked by ${holder}); queued and waiting 15s..."
+        sleep 15
+    done
+    echo "[TPU CI] ERROR: Timed out waiting for exclusive TPU cluster lock." >&2
+    exit 1
+}
+
 cleanup() {
     if [[ -n "${CURRENT_RAY_JOB_ID}" && -n "${RAY_ADDRESS:-}" ]]; then
         echo "[TPU CI] Stopping active Ray job ${CURRENT_RAY_JOB_ID}..."
@@ -44,6 +83,7 @@ cleanup() {
     if [[ -n "${PF_PID}" ]] && kill -0 "${PF_PID}" 2>/dev/null; then
         kill "${PF_PID}" 2>/dev/null || true
     fi
+    release_cluster_lock
 }
 trap cleanup EXIT INT TERM
 
@@ -155,7 +195,7 @@ submit_and_verify_ray_job() {
     local script_path="$2"
     local timeout_mins="$3"
 
-    ensure_clean_tpu_cluster 0
+    ensure_clean_tpu_cluster "${FORCE_POD_RESET:-0}"
     start_port_forward
 
     local head_pod
@@ -308,6 +348,7 @@ PY
 }
 
 connect_gke_cluster
+acquire_cluster_lock
 
 case "${MODE}" in
     sft)

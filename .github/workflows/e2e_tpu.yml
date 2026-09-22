@@ -73,11 +73,13 @@ on:
       - "verl/workers/rollout/vllm_rollout/**"
       - "verl/workers/utils/**"
 
-# Serialize runs targeting the same GKE TPU cluster so SFT and GRPO jobs
-# never contend for the 16 TPU v6e chips on `jialeic-ci-v6e8-2s-spot`.
+# Scope concurrency per PR/branch so a new commit on the SAME PR cancels its own stale
+# run, while multiple different PRs (#19, #20, #21...) NEVER cancel each other and
+# instead queue in strict FIFO order on the single GKE runner (`replicas: 1`) and
+# Kubernetes cluster lock (`tpu-ci-cluster-lock`).
 concurrency:
-  group: tpu-ci-jialeic-ci-v6e8-2s-spot
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/tpu-main') }}
+  group: e2e-tpu-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/tpu-main') && github.ref != 'refs/heads/tpu_sft' }}
 
 permissions:
   contents: read
@@ -95,11 +97,10 @@ env:
   GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
 jobs:
-  e2e_sft_tpu:
-    name: E2E TPU v6e SFT (Qwen3-0.6B TorchTitan FSDP2)
-    if: ${{ (github.event_name != 'workflow_dispatch') || github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'sft' }}
+  e2e_tpu:
+    name: E2E TPU v6e SFT & GRPO (Qwen3-0.6B TorchTitan FSDP2 + vLLM V1)
     runs-on: ${{ github.event.inputs.runner_type || vars.TPU_CI_RUNNER || 'self-hosted' }}
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -146,61 +147,11 @@ jobs:
           kubectl get nodes -o wide
 
       - name: Run GSM8K E2E SFT on TPU v6e-8 (TorchTitan FSDP2)
+        if: ${{ (github.event_name != 'workflow_dispatch') || github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'sft' }}
         run: |
           bash tests/special_tpu/run_tpu_e2e_ci.sh sft
 
-  e2e_grpo_tpu:
-    name: E2E TPU v6e GRPO (Qwen3-0.6B TorchTitan + vLLM V1 Separate Async)
-    needs: [e2e_sft_tpu]
-    if: ${{ !cancelled() && (needs.e2e_sft_tpu.result == 'success' || needs.e2e_sft_tpu.result == 'skipped') && ((github.event_name != 'workflow_dispatch') || github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'grpo') }}
-    runs-on: ${{ github.event.inputs.runner_type || vars.TPU_CI_RUNNER || 'self-hosted' }}
-    timeout-minutes: 45
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
-        with:
-          python-version: "3.11"
-
-      - name: Authenticate to Google Cloud (Service Account Key or Workload Identity)
-        if: ${{ env.GCP_SA_KEY != '' || env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Set up Google Cloud SDK (when running outside GKE)
-        if: ${{ env.GCP_SA_KEY != '' || env.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          install_components: "gke-gcloud-auth-plugin,kubectl"
-
-      - name: Install Ray Job Submission CLI & kubectl
-        run: |
-          if ! command -v kubectl >/dev/null 2>&1; then
-            curl -sLO https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
-            chmod +x kubectl
-            mv kubectl /usr/local/bin/kubectl
-          fi
-          python3 -m pip install --upgrade pip
-          python3 -m pip install --quiet "ray[default]"
-
-      - name: Connect to GKE TPU Cluster
-        run: |
-          if [[ -z "${KUBERNETES_SERVICE_HOST:-}" ]]; then
-            export CLUSTER_NAME="jialeic-ci-v6e8-2s-spot"
-            export REGION="us-central2"
-            export PROJECT="tpu-pytorch"
-            gcloud container clusters get-credentials $CLUSTER_NAME --region $REGION --project $PROJECT --dns-endpoint
-          fi
-          kubectl get nodes -o wide
-
       - name: Reset KubeRay TPU Pods & Run GSM8K E2E GRPO on TPU v6e-8 x2 Slices
+        if: ${{ (github.event_name != 'workflow_dispatch') || github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'grpo' }}
         run: |
-          kubectl delete pod -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" --wait=true --timeout=180s || true
-          bash tests/special_tpu/run_tpu_e2e_ci.sh grpo
+          FORCE_POD_RESET=1 bash tests/special_tpu/run_tpu_e2e_ci.sh grpo

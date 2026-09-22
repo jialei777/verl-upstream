@@ -41,7 +41,7 @@ spec:
             - name: LABELS
               value: "self-hosted,linux,x64,tpu,tpu-v6e8-2s"
             - name: EPHEMERAL
-              value: "false"
+              value: ""
             - name: ACCESS_TOKEN
               valueFrom:
                 secretKeyRef:
