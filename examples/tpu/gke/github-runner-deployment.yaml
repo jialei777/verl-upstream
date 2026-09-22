@@ -1,0 +1,58 @@
+# Optional Self-Hosted GitHub Actions Runner Deployment on GKE (`jialeic-ci-v6e8-2s-spot`)
+#
+# Runs a lightweight runner pod on the CPU `default-pool` of `jialeic-ci-v6e8-2s-spot`
+# using the `ray-ksa` ServiceAccount (Workload Identity -> `ray-tpu-gsa@tpu-pytorch.iam.gserviceaccount.com`).
+#
+# Usage:
+#   1. Create secret with your GitHub Personal Access Token (PAT) or Runner Registration Token:
+#      kubectl create secret generic github-runner-secret \
+#        --from-literal=ACCESS_TOKEN="<YOUR_GITHUB_PAT>"
+#   2. Update REPO_URL below if pointing to a fork, then apply:
+#      kubectl apply -f examples/tpu/gke/github-runner-deployment.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-tpu-ci-runner
+  namespace: default
+  labels:
+    app: github-tpu-ci-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-tpu-ci-runner
+  template:
+    metadata:
+      labels:
+        app: github-tpu-ci-runner
+    spec:
+      serviceAccountName: ray-ksa
+      containers:
+        - name: runner
+          image: myoung34/github-runner:latest
+          env:
+            - name: REPO_URL
+              value: "https://github.com/verl-project/verl"
+            - name: RUNNER_SCOPE
+              value: "repo"
+            - name: RUNNER_NAME
+              value: "gke-jialeic-ci-v6e8-2s-spot"
+            - name: LABELS
+              value: "self-hosted,linux,x64,tpu,tpu-v6e8-2s"
+            - name: EPHEMERAL
+              value: ""
+            - name: ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-runner-secret
+                  key: ACCESS_TOKEN
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool
