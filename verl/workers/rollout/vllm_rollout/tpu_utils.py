@@ -53,10 +53,7 @@ except ImportError:
 
 # Fallback imports for TPU vLLM platforms
 try:
-    try:
-        from vllm_torchtpu.executors import ray_distributed_executor
-    except ImportError:
-        from tpu_inference.executors import ray_distributed_executor
+    from vllm_torchtpu.executors import ray_distributed_executor
 except ImportError:
     ray_distributed_executor = None
 
@@ -72,18 +69,12 @@ except ImportError:
     vllm_envs = None
 
 try:
-    try:
-        import vllm_torchtpu.envs as tpu_envs
-    except ImportError:
-        import tpu_inference.envs as tpu_envs
+    import vllm_torchtpu.envs as tpu_envs
 except ImportError:
     tpu_envs = None
 
 try:
-    try:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-    except ImportError:
-        from tpu_inference.worker.tpu_worker import TPUWorker
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
 except ImportError:
     TPUWorker = None
 
@@ -125,12 +116,9 @@ try:
     from vllm_torchtpu.platforms.tpu_platform import get_distributed_init_method
 except ImportError:
     try:
-        from tpu_inference.platforms.tpu_platform import get_distributed_init_method
+        from vllm.utils.network_utils import get_distributed_init_method
     except ImportError:
-        try:
-            from vllm.utils.network_utils import get_distributed_init_method
-        except ImportError:
-            get_distributed_init_method = None
+        get_distributed_init_method = None
 
 try:
     from vllm.platforms import current_platform
@@ -244,36 +232,6 @@ def patch_vllm_for_tpu() -> None:
                             _allow(attr.default)
                     except Exception:
                         pass
-    except Exception:
-        pass
-
-    try:
-        import tpu_inference.worker.tpu_worker as tw
-
-        if hasattr(tw, "TPUWorker") and not getattr(tw.TPUWorker, "_patched_dynamo", False):
-            orig_determine = tw.TPUWorker.determine_available_memory
-
-            def patched_determine(self, *args, **kwargs):
-                patch_vllm_for_tpu()
-                return orig_determine(self, *args, **kwargs)
-
-            tw.TPUWorker.determine_available_memory = patched_determine
-            tw.TPUWorker._patched_dynamo = True
-    except Exception:
-        pass
-
-    try:
-        import tpu_inference.runner.tpu_runner as tr
-
-        if hasattr(tr, "TPUModelRunner") and not getattr(tr.TPUModelRunner, "_patched_dynamo", False):
-            orig_profile = tr.TPUModelRunner.profile_run
-
-            def patched_profile(self, *args, **kwargs):
-                patch_vllm_for_tpu()
-                return orig_profile(self, *args, **kwargs)
-
-            tr.TPUModelRunner.profile_run = patched_profile
-            tr.TPUModelRunner._patched_dynamo = True
     except Exception:
         pass
 
@@ -1112,12 +1070,9 @@ try:
     from vllm_torchtpu.platforms.tpu_platform import get_env_vars_to_copy
 except ImportError:
     try:
-        from tpu_inference.platforms.tpu_platform import get_env_vars_to_copy
+        from vllm.ray.ray_env import get_env_vars_to_copy
     except ImportError:
-        try:
-            from vllm.ray.ray_env import get_env_vars_to_copy
-        except ImportError:
-            get_env_vars_to_copy = None
+        get_env_vars_to_copy = None
 
 
 def is_tpu_vllm_run() -> bool:
@@ -1387,10 +1342,7 @@ def prepare_tpu_server_args(args: dict):
     os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     try:
-        try:
-            import vllm_torchtpu.envs as tpu_envs
-        except ImportError:
-            import tpu_inference.envs as tpu_envs
+        import vllm_torchtpu.envs as tpu_envs
 
         tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
         if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
