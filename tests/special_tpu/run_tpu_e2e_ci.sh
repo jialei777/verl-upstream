@@ -88,7 +88,7 @@ ensure_clean_tpu_cluster() {
     while (( SECONDS < deadline )); do
         local tpu_usage
         tpu_usage="$(kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- ray status 2>/dev/null \
-            | grep -oE '[0-9.]+/[0-9.]+ TPU' || true)"
+            | grep -oE '[0-9.]+/[0-9.]+ TPU$' | head -n 1 || true)"
         echo "[TPU CI] Ray TPU status: ${tpu_usage:-<initializing>}"
         if [[ "${tpu_usage}" == "0.0/${EXPECTED_TPU_CHIPS} TPU" ]]; then
             return 0
