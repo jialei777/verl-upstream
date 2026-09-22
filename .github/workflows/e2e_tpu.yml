@@ -119,7 +119,6 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up Google Cloud SDK & gke-gcloud-auth-plugin
-        if: ${{ secrets.GCP_SA_KEY != '' || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: "gke-gcloud-auth-plugin,kubectl"
@@ -167,7 +166,6 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up Google Cloud SDK & gke-gcloud-auth-plugin
-        if: ${{ secrets.GCP_SA_KEY != '' || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: "gke-gcloud-auth-plugin,kubectl"
