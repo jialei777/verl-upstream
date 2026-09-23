@@ -267,14 +267,14 @@ class vLLMColocateWorkerExtension:
             for model in self._iter_all_models():
                 restore_moe_expert_maps(model)
 
-        if self._is_qat_model:
+        if getattr(self, "_is_qat_model", False):
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
             from verl.utils.qat import prepare_qat_for_load_weights
 
             for model in self._iter_all_models():
                 prepare_qat_for_load_weights(model, device=self.device)
             logger.info("QAT: prepare_qat_for_load_weights completed")
-        elif self._is_modelopt_qat:
+        elif getattr(self, "_is_modelopt_qat", False):
             from verl.utils.modelopt.vllm_modelopt_patch import prepare_modelopt_for_weight_reload
 
             prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
@@ -289,15 +289,32 @@ class vLLMColocateWorkerExtension:
             quant_reload_states = [
                 (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
             ]
+        elif (
+            (isinstance(getattr(self, "device", None), torch.device) and self.device.type == "tpu")
+            or (isinstance(getattr(self, "device", None), str) and self.device.startswith("tpu"))
+            or os.environ.get("VERL_PLATFORM") == "tpu"
+        ):
+            from verl.checkpoint_engine.tpu_checkpoint_engine import TPUStreamingWeightLoader
+
+            tpu_rank = getattr(self, "rank", None)
+            if tpu_rank is None:
+                tpu_rank = int(os.environ.get("RANK", 0))
+            vllm_model = self.get_model() if hasattr(self, "get_model") else self.model_runner.model
+            self._tpu_weight_loader = TPUStreamingWeightLoader(vllm_model, rank=tpu_rank)
         else:
             # TODO(wuxibin): not need anymore for newer vllm version.
             for model in self._iter_all_models():
                 patch_vllm_moe_model_weight_loader(model)
 
         # =========================== step 2: receive weights and update ===========================
+        worker_device = getattr(self, "device", None)
+        if isinstance(worker_device, str):
+            worker_device = torch.device(worker_device)
+        elif worker_device is None and os.environ.get("VERL_PLATFORM") == "tpu":
+            worker_device = torch.device("tpu")
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
-            device=self.device,
+            device=worker_device,
             use_shm=use_shm,
         )
         # LoRA adapters need a single complete tensor dict per ``add_lora``, but
@@ -327,14 +344,14 @@ class vLLMColocateWorkerExtension:
         receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         # =========================== step 3: process weights after loading ===========================
-        if self._is_qat_model:
+        if getattr(self, "_is_qat_model", False):
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
             from verl.utils.qat import manual_process_weights_after_loading
 
             for model in self._iter_all_models():
                 manual_process_weights_after_loading(model)
             logger.info("QAT: process_weights_after_loading completed")
-        elif self._is_modelopt_qat:
+        elif getattr(self, "_is_modelopt_qat", False):
             from verl.utils.modelopt.vllm_modelopt_patch import modelopt_process_weights_after_loading
 
             modelopt_process_weights_after_loading(self.model_runner.model)
@@ -346,6 +363,9 @@ class vLLMColocateWorkerExtension:
 
             for model, reload_state in quant_reload_states:
                 process_quanted_weights_after_loading(model, reload_state)
+        elif getattr(self, "_tpu_weight_loader", None) is not None:
+            self._tpu_weight_loader.finalize()
+            self._tpu_weight_loader = None
         else:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -385,6 +405,10 @@ class vLLMColocateWorkerExtension:
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
+            if getattr(self, "_tpu_weight_loader", None) is not None:
+                self._tpu_weight_loader.load_bucket(weights)
+                return
+
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -424,6 +448,14 @@ class vLLMColocateWorkerExtension:
         """
         replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
         job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
+        if job_id == "0":
+            try:
+                import ray
+
+                if ray.is_initialized():
+                    job_id = ray.get_runtime_context().get_job_id()
+            except Exception:
+                pass
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         parallel_config = getattr(vllm_config, "parallel_config", None)
         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)

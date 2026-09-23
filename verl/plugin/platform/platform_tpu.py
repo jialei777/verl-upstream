@@ -277,6 +277,9 @@ class PlatformTPU(PlatformCUDA):
                 logger.warning(f"torch.tpu.is_available() check failed: {e}")
         return False
 
+    def is_ipc_supported(self) -> bool:
+        return False
+
     def is_platform_available(self, use_smi_check=False) -> bool:
         if os.environ.get("VERL_PLATFORM") == "tpu":
             return True
