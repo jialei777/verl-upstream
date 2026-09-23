@@ -164,6 +164,101 @@ def validate_and_sanitize_tensors(
     return sanitized
 
 
+# Fused projection layout on the rollout side.
+#
+# vLLM packs q/k/v into a single `qkv_proj` buffer and gate/up into a single
+# `gate_up_proj` buffer. Crucially the packing is per-rank: rank r's buffer is
+#     [q_shard_r ; k_shard_r ; v_shard_r]
+# i.e. SHARD-then-CONCAT (QKVParallelLinear._get_shard_offset_mapping uses the
+# *local* num_heads). It is NOT a contiguous window onto the global
+# [Q_all ; K_all ; V_all].
+#
+# Raiden splits a registered tensor into `tp_size` equal row blocks and hands
+# block r to rollout rank r (see the ["tp", ""] sharding spec built in
+# tpu_utils.py). So registering the plain global concatenation delivers the
+# wrong rows to every rank while keeping the shapes identical -- a silent
+# corruption that norm-based parity cannot detect.
+#
+# We cannot instead register q/k/v as three sub-views of the destination
+# buffer: tpu_sync rejects any bound tensor whose storage_offset is non-zero or
+# that does not span its entire base storage
+# (third_party/tpu_raiden/tpu_sync/frameworks/torch/torch_tpu_utils.cc:39-44,
+# 85-90). The bind would throw.
+#
+# So we permute on the sender: emit the shards already in destination-rank
+# order, so that Raiden's naive even split is exactly right.
+
+FUSED_PROJECTIONS = [
+    # (target_suffix, source_suffixes, is_qkv)
+    (
+        ".self_attn.qkv_proj.weight",
+        [".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight"],
+        True,
+    ),
+    (".mlp.gate_up_proj.weight", [".mlp.gate_proj.weight", ".mlp.up_proj.weight"], False),
+]
+
+
+def compute_kv_replicas(total_num_kv_heads: int, tp_size: int) -> int:
+    """Mirror QKVParallelLinear.__init__ (vllm/model_executor/layers/linear.py:1047-1052).
+
+    When tp_size exceeds the KV head count, vLLM replicates each KV head across
+    `tp_size // total_num_kv_heads` ranks instead of sharding it further.
+    """
+    if total_num_kv_heads <= 0:
+        return 1
+    return max(1, tp_size // total_num_kv_heads) if tp_size >= total_num_kv_heads else 1
+
+
+def fuse_destination_ordered(
+    parts: List[torch.Tensor],
+    tp_size: int,
+    kv_replicas: int = 1,
+    is_qkv: bool = False,
+    name: str = "",
+) -> torch.Tensor:
+    """Concatenate per-rank shards in destination order.
+
+    Returns cat([p0_shard_0, p1_shard_0, ..., p0_shard_1, p1_shard_1, ...]) so
+    that row block r of the result equals the local fused buffer rollout rank r
+    expects. For tp_size == 1 this degenerates to a plain global concatenation,
+    which is why the bug is invisible at TP=1.
+
+    Args:
+      parts: source projections in vLLM's packing order (q, k, v) or (gate, up).
+      tp_size: rollout tensor_model_parallel_size.
+      kv_replicas: QKVParallelLinear.num_kv_head_replicas. Ignored unless is_qkv.
+      is_qkv: whether parts[1:] are KV projections subject to GQA replication.
+      name: tensor name, used only for error messages.
+
+    Raises:
+      ValueError: if any projection is not evenly divisible by its shard count.
+        The previous implementation truncated silently via integer division.
+    """
+    kv_shards = max(1, tp_size // kv_replicas) if is_qkv else tp_size
+
+    blocks = []
+    for rank in range(tp_size):
+        for i, part in enumerate(parts):
+            if is_qkv and i > 0:
+                n_shards, shard_rank = kv_shards, rank // kv_replicas
+            else:
+                n_shards, shard_rank = tp_size, rank
+
+            rows = part.shape[0]
+            if rows % n_shards != 0:
+                raise ValueError(
+                    f"Cannot shard fused projection {name!r}: part {i} has {rows} rows "
+                    f"which is not divisible by {n_shards} shards "
+                    f"(tp_size={tp_size}, kv_replicas={kv_replicas})."
+                )
+            size = rows // n_shards
+            blocks.append(part[shard_rank * size : (shard_rank + 1) * size])
+
+    return torch.cat(blocks, dim=0)
+
+
+
 def setup_raiden_controller() -> tuple[Any, Any, str]:
     """Start embedded RaidenControllerServer on the head node and record its address in TPUWeightRegistry."""
     from tpu_sync.rpc import raiden_controller
@@ -196,7 +291,25 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self.backend = "raiden"
         self.verify_parity = kwargs.get("verify_parity", False)
         self.parallelism = kwargs.get("parallelism", 8)
+
+        # Destination geometry. The trainer registers fused projections in
+        # destination-rank order, so it must know the rollout TP layout BEFORE
+        # the sampler comes up (update_raiden_weights calls send_weights first,
+        # then initializes the sampler). It therefore cannot be discovered via
+        # the registry and must be supplied by config.
+        self.rollout_tp_size = int(kwargs.get("rollout_tp_size", 1))
+        head_dim = kwargs.get("head_dim", None)
+        self.head_dim = int(head_dim) if head_dim else None
+        if self.rollout_tp_size > 1 and self.head_dim is None:
+            logger.warning(
+                "RaidenCheckpointEngine: rollout_tp_size=%d but head_dim was not provided. "
+                "Fusing qkv_proj requires head_dim to derive num_kv_head_replicas; "
+                "send_weights will fail. Set engine_kwargs.raiden.head_dim.",
+                self.rollout_tp_size,
+            )
+
         self._trainer_raiden_ws = None
+
         self._trainer_chunks = []
         self._controller_addr = None
         if torch.distributed.is_initialized():
@@ -252,25 +365,49 @@ class RaidenCheckpointEngine(CheckpointEngine):
         # Materialize weights into dictionary in a single pass and filter tied embeddings
         weight_dict = dict(filter_tied_embeddings(weights.items() if hasattr(weights, "items") else weights))
 
-        # Pack un-fused QKV and MLP projections to match vLLM's MergedColumnParallelLinear modules if present
-        FUSION_RULES = [
-            (".self_attn.qkv_proj.weight", [".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight"]),
-            (".mlp.gate_up_proj.weight", [".mlp.gate_proj.weight", ".mlp.up_proj.weight"]),
-        ]
-
+        # Pack un-fused QKV and MLP projections to match vLLM's fused modules.
+        #
+        # The shards are emitted in DESTINATION-RANK order (see
+        # fuse_destination_ordered) so that Raiden's even row split delivers
+        # [q_shard_r ; k_shard_r ; v_shard_r] to rollout rank r, which is the
+        # layout QKVParallelLinear actually expects. A plain global
+        # cat([Q_all, K_all, V_all]) produces the identical shape but the wrong
+        # rows on every rank when tp_size > 1.
+        tp_size = self.rollout_tp_size
         packed_weights = {}
         consumed_keys = set()
-        for target_suffix, src_suffixes in FUSION_RULES:
+        for target_suffix, src_suffixes, is_qkv in FUSED_PROJECTIONS:
             primary_src = src_suffixes[0]
             for k in list(weight_dict.keys()):
-                if primary_src in k:
-                    layer_src_keys = [k.replace(primary_src, s) for s in src_suffixes]
-                    if all(src_k in weight_dict for src_k in layer_src_keys):
-                        target_key = k.replace(primary_src, target_suffix)
-                        packed_weights[target_key] = torch.cat(
-                            [_unwrap_tensor(weight_dict[src_k]) for src_k in layer_src_keys], dim=0
+                if primary_src not in k:
+                    continue
+                layer_src_keys = [k.replace(primary_src, s) for s in src_suffixes]
+                if not all(src_k in weight_dict for src_k in layer_src_keys):
+                    continue
+
+                target_key = k.replace(primary_src, target_suffix)
+                parts = [_unwrap_tensor(weight_dict[src_k]) for src_k in layer_src_keys]
+
+                kv_replicas = 1
+                if is_qkv:
+                    if self.head_dim is None:
+                        raise RuntimeError(
+                            "RaidenCheckpointEngine needs head_dim to fuse qkv_proj correctly "
+                            "under tensor parallelism. Pass engine_kwargs.raiden.head_dim, or "
+                            "set rollout_tp_size=1."
                         )
-                        consumed_keys.update(layer_src_keys)
+                    total_num_kv_heads = parts[1].shape[0] // self.head_dim
+                    kv_replicas = compute_kv_replicas(total_num_kv_heads, tp_size)
+
+                packed_weights[target_key] = fuse_destination_ordered(
+                    parts,
+                    tp_size=tp_size,
+                    kv_replicas=kv_replicas,
+                    is_qkv=is_qkv,
+                    name=target_key,
+                )
+                consumed_keys.update(layer_src_keys)
+
 
         # Retain all remaining model weights that were not part of the fused projection layers
         # (e.g. embed_tokens, o_proj, down_proj, layernorms, etc.), unwrapped to raw local tensors
