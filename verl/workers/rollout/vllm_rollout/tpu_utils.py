@@ -33,7 +33,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from verl.utils.device import get_resource_name
 
 # --- Google TPU specific global constants ---
-TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
+TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry_v3"
 TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
 TPU_ROLLOUT_BASE_PORT = 8070
 TPU_HOST_BOUNDS_VAL = "2,4,1"
@@ -494,10 +494,15 @@ def patch_vllm_for_tpu() -> None:
 
         try:
             if TPUWorker is not None:
+                from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
+
+                if vLLMColocateWorkerExtension not in TPUWorker.__bases__:
+                    TPUWorker.__bases__ = (*TPUWorker.__bases__, vLLMColocateWorkerExtension)
                 TPUWorker.reset_encoder_cache = dummy_reset_encoder_cache
                 TPUWorker.load_weights_from_ray_registry = load_weights_from_ray_registry
                 logger.info(
-                    "Patched TPUWorker class with dummy_reset_encoder_cache and load_weights_from_ray_registry."
+                    "Patched TPUWorker class with vLLMColocateWorkerExtension, "
+                    "dummy_reset_encoder_cache, and load_weights_from_ray_registry."
                 )
         except Exception as e:
             logger.warning(f"Failed to patch TPUWorker class directly: {e}")
@@ -702,12 +707,22 @@ def patch_vllm_for_tpu() -> None:
             self.__class__.load_weights_from_state_dict_on_worker = lambda self, sd: load_weights_from_ray_registry(
                 self, 0
             )
+            self.__class__.update_weights_from_ipc = lambda self, *a, **kw: self.worker.update_weights_from_ipc(
+                *a, **kw
+            )
             self.__class__.reset_encoder_cache = dummy_reset_encoder_cache
 
             torch.set_grad_enabled(False)
 
             res = original_init_worker(self, *args, **kwargs)
             if hasattr(self, "worker") and self.worker is not None:
+                from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
+
+                if vLLMColocateWorkerExtension not in self.worker.__class__.__bases__:
+                    self.worker.__class__.__bases__ = (
+                        *self.worker.__class__.__bases__,
+                        vLLMColocateWorkerExtension,
+                    )
                 self.worker.reset_encoder_cache = dummy_reset_encoder_cache
                 self.worker.__class__.reset_encoder_cache = dummy_reset_encoder_cache
             return res
@@ -928,6 +943,10 @@ def patch_vllm_for_tpu() -> None:
                     args["TORCH_TPU_TOPOLOGY"] = topology
                     args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
                     args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
+                    args["VERL_REPLICA_RANK"] = os.environ.get("VERL_REPLICA_RANK", "0")
+                    args["VERL_RAY_JOB_ID"] = (
+                        os.environ.get("VERL_RAY_JOB_ID") or ray.get_runtime_context().get_job_id()
+                    )
                     if total_chips > 4 or num_nodes > 1:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
@@ -1385,11 +1404,13 @@ async def launch_tpu_vllm_servers(replica) -> None:
         **{var: "1" for var in get_platform().ray_noset_envvars()},
         **platform_env_vars,
         **tpu_env_vars,
+        "VERL_REPLICA_RANK": str(replica.replica_rank),
+        "VERL_RAY_JOB_ID": ray.get_runtime_context().get_job_id(),
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
 
-    flags_to_copy = set()
+    flags_to_copy = {"VERL_REPLICA_RANK", "VERL_RAY_JOB_ID"}
     for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
         base_value = platform_env_vars.get(flag_var) or tpu_env_vars.get(flag_var)
         extra_value = os.environ.get(f"VERL_TPU_EXTRA_{flag_var}")

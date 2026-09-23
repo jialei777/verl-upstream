@@ -901,7 +901,7 @@ class vLLMHttpServer:
     async def release_kv_cache(self):
         """Free the kv_cache pool for the duration of a weight sync."""
         # TODO: use the real release_kv_cache() method after vllm supports it (vllm#44890/46438)
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if is_tpu_vllm_run() or self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
@@ -910,7 +910,7 @@ class vLLMHttpServer:
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
-        if self.node_rank != 0 or not self.config.free_cache_engine:
+        if is_tpu_vllm_run() or self.node_rank != 0 or not self.config.free_cache_engine:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return

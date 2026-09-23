@@ -19,7 +19,6 @@ from typing import Any, AsyncGenerator, Generator
 import ray
 import torch
 
-from verl.plugin.platform import get_platform
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -319,18 +318,18 @@ class CheckpointEngineWorker(Worker):
         *args,
         **kwargs,
     ) -> None:
+        from verl.plugin.platform import get_platform
+
+        if get_platform().device_name == "tpu":
+            from verl.plugin.platform.platform_tpu import DummyTpuDeviceModule
+
+            get_platform()._device_module = DummyTpuDeviceModule()
         super().__init__()
+
         self.rollout_config = rollout_config
         self.model_config = model_config
 
         self.server_adapter: BaseRollout = server_adapter
-        if get_platform().device_name == "tpu":
-            self.checkpoint_engine = None
-            self.server_adapter = None
-            self.replica_rank = kwargs.get("replica_rank", 0)
-            self.extra_rollout_args = args
-            self.extra_rollout_kwargs = kwargs
-            return
 
         backend = self.rollout_config.checkpoint_engine.backend
         if backend == "delta_sharded" and self.rollout_config.name not in {"sglang", "vllm"}:
@@ -535,11 +534,6 @@ class CheckpointEngineManager:
         if self.backend == "naive":
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
             return {}
-
-        if self.backend == "tpu":
-            from .tpu_checkpoint_engine import update_tpu_weights
-
-            return await update_tpu_weights(self, global_steps=global_steps)
 
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()

@@ -91,8 +91,9 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
 
     import torch.distributed
 
-    # On TPU platforms, import torch_tpu to register the TPU communication backend with torch.distributed.
-    if get_platform().device_name == "tpu":
+    # On TPU platforms, import torch_tpu to register the TPU communication backend with torch.distributed,
+    # unless explicitly initializing a CPU-only gloo group (e.g. inside CheckpointEngineWorker).
+    if get_platform().device_name == "tpu" and backend != "cpu:gloo":
         import torch_tpu  # noqa: F401
 
     timeout = timedelta(seconds=timeout_second) if timeout_second is not None else None
