@@ -101,8 +101,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
-if device_name == "tpu":
-    monkey_patch_varlen_attention_tpu()
+# TPU handled out-of-tree by verl-hardware-plugin
+pass
 
 
 class TorchTitanEngine(BaseEngine):
@@ -146,7 +146,7 @@ class TorchTitanEngine(BaseEngine):
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
 
         # Use foreach optimizer implementation on TPU.
-        impl = "foreach" if get_platform().device_name == "tpu" else "fused"
+        impl = "fused"
 
         optimizer = OptimizersContainer.Config(
             implementation=impl,
@@ -199,7 +199,7 @@ class TorchTitanEngine(BaseEngine):
             pipeline_parallel_degree=self.engine_config.pipeline_parallel_size,
             context_parallel_degree=self.engine_config.context_parallel_size,
             expert_parallel_degree=self.engine_config.expert_parallel_size,
-            spmd_backend="default" if device_name == "tpu" else self.engine_config.spmd_backend,
+            spmd_backend=self.engine_config.spmd_backend,
         )
         checkpoint = CheckpointManager.Config(
             enable=True,
@@ -210,7 +210,7 @@ class TorchTitanEngine(BaseEngine):
         # Set compile backend to 'tpu' when running on TPU.
         compile_config = CompileConfig(
             enable=self.engine_config.use_torch_compile,
-            backend="tpu" if device_name == "tpu" else "inductor",
+            backend="inductor",
         )
 
         training_kwargs = {}
@@ -434,8 +434,7 @@ class TorchTitanEngine(BaseEngine):
             with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 if not forward_only:
-                    if get_device_name() == "tpu":
-                        synchronize_tpu_loss(loss)
+                    pass
                     loss.backward()
             output_lst.append(output)
 
@@ -484,7 +483,7 @@ class TorchTitanEngine(BaseEngine):
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.module for p in m.parameters()],
             self.config.training.max_norm,
-            foreach=get_device_name() != "tpu",
+            foreach=True,
             pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             ep_enabled=self.parallel_dims.ep_enabled,
         )
@@ -767,7 +766,7 @@ class EngineTrainModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
-@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu", "tpu"])
+@EngineRegistry.register(model_type="language_model", backend=["torchtitan"], device=["cuda", "npu"])
 class TorchTitanEngineWithLMHead(TorchTitanEngine):
     """TorchTitan engine implementation for language models with LM head."""
 
@@ -783,6 +782,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         if use_remove_padding:
             if get_device_name() == "tpu":
+                raise RuntimeError("In-tree TorchTitanEngineWithLMHead.prepare_model_inputs called on TPU!")
                 input_ids, position_ids, labels, attention_mask, orig_seq_len = pad_packed_inputs_for_tpu(
                     input_ids=input_ids,
                     position_ids=position_ids,
