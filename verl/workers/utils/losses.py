@@ -23,7 +23,125 @@ from verl.utils.device import get_device_name
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
-from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor, tpu_no_padding_2_padding
+import os
+from typing import Any
+from verl.utils.device import get_device_id
+_DEFAULT_TPU_SEQ_BUCKET_SIZE = 256
+def get_tpu_seq_bucket_size() -> int:
+    """Returns the token bucketing multiple for TPU sequence packing (default 256)."""
+    return int(os.getenv("VERL_TPU_SEQ_BUCKET_SIZE", "256"))
+
+
+def bucket_length(length: int, bucket_size: int | None = None) -> int:
+    """Rounds a positive sequence length up to the nearest multiple of `bucket_size`."""
+    if bucket_size is None:
+        bucket_size = get_tpu_seq_bucket_size()
+    if bucket_size <= 1:
+        return max(1, int(length))
+    return max(bucket_size, ((int(length) + bucket_size - 1) // bucket_size) * bucket_size)
+
+
+
+def tpu_no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
+    """Extracts and pads response tokens from a bucketed 1D tensor using static-shape index gather on TPU."""
+    from verl.utils import tensordict_utils as tu
+    from verl.workers.utils.padding import no_padding_2_padding
+
+    padded_values = getattr(tensor, "_tpu_padded_values", None)
+    if padded_values is None:
+        return no_padding_2_padding(tensor, data)
+
+    prompt_ids = data["prompts"]
+    response_ids = data["responses"]
+    if not (getattr(prompt_ids, "is_nested", False) and getattr(response_ids, "is_nested", False)):
+        return no_padding_2_padding(tensor, data)
+
+    prompt_lens = prompt_ids.offsets().diff().cpu()
+    response_lens = response_ids.offsets().diff().cpu()
+    seq_offsets = (prompt_lens + response_lens).cumsum(dim=0)
+
+    max_response_len = tu.get_non_tensor_data(data=data, key="max_response_len", default=-1)
+    if max_response_len < 0:
+        max_response_len = bucket_length(int(response_lens.max().item()))
+    else:
+        max_response_len = bucket_length(int(max_response_len))
+        tu.assign_non_tensor_data(data, "max_response_len", max_response_len)
+
+    bsz = int(response_lens.shape[0])
+    col_idx = torch.arange(max_response_len, dtype=torch.int64).unsqueeze(0)  # [1, max_response_len]
+    starts = (seq_offsets - response_lens - 1).to(torch.int64).unsqueeze(1)  # [bsz, 1]
+    valid_mask_cpu = col_idx < response_lens.unsqueeze(1)  # [bsz, max_response_len]
+    gather_idx_cpu = torch.where(valid_mask_cpu, starts + col_idx, torch.zeros_like(col_idx)).clamp(
+        min=0, max=max(0, int(padded_values.shape[0]) - 1)
+    )
+
+    device = padded_values.device
+    gather_idx = gather_idx_cpu.to(device=device)
+    valid_mask = valid_mask_cpu.to(device=device, dtype=padded_values.dtype)
+    values_2d = padded_values.unsqueeze(0).expand(bsz, -1)
+    return torch.gather(values_2d, 1, gather_idx) * valid_mask
+
+
+def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) -> torch.Tensor:
+    """Safely converts a NestedTensor to a padded dense tensor on TPU using CPU-side assembly.
+
+    Assembling the small padded response tensors on CPU avoids compiling a new
+    `tt_jit_jagged_to_padded_dense_forward` HLO executable for every unbucketed jagged length.
+    """
+    from verl.utils.device import get_device_id
+
+    if not getattr(nt, "is_nested", False):
+        if isinstance(nt, torch.Tensor) and nt.device.type == "cpu":
+            return nt.to(device=get_device_id())
+        return nt
+    target_device = get_device_id() if nt.device.type == "cpu" else nt.device
+    values_cpu = nt.values().detach().cpu()
+    offsets_cpu = nt.offsets().detach().cpu()
+    batch_size = int(offsets_cpu.shape[0]) - 1
+    if batch_size <= 0:
+        return torch.empty(output_size if output_size is not None else (0,), device=target_device, dtype=nt.dtype)
+    lengths = offsets_cpu.diff().tolist()
+    trailing_dims = tuple(values_cpu.shape[1:])
+    if output_size is None:
+        max_len = bucket_length(max(lengths))
+        output_size = (batch_size, max_len, *trailing_dims)
+    out_cpu = torch.full(output_size, padding, dtype=values_cpu.dtype)
+    for i in range(batch_size):
+        start = int(offsets_cpu[i].item())
+        length = int(lengths[i])
+        if length > 0:
+            out_cpu[i, :length] = values_cpu[start : start + length]
+    return out_cpu.to(device=target_device)
+
+
+def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:
+    """Selects fields from a TensorDict and converts NestedTensors to bucket-padded dense tensors on TPU."""
+    from verl.utils import tensordict_utils as tu
+    from verl.utils.device import get_device_id
+
+    max_response_len = tu.get_non_tensor_data(data=data, key="max_response_len", default=-1)
+    if max_response_len is not None and int(max_response_len) > 0:
+        max_response_len = bucket_length(int(max_response_len))
+    else:
+        max_response_len = None
+
+    target_device = get_device_id()
+    padded_dict = {}
+    for k in fields:
+        if k in data.keys():
+            val = data[k]
+            if getattr(val, "is_nested", False):
+                output_size = None
+                if max_response_len is not None:
+                    trailing_dims = tuple(val.values().shape[1:])
+                    output_size = (int(data.batch_size[0]), max_response_len, *trailing_dims)
+                padded_dict[k] = safe_to_padded_tensor(val, output_size=output_size)
+            elif isinstance(val, torch.Tensor) and val.device.type == "cpu":
+                padded_dict[k] = val.to(device=target_device)
+            else:
+                padded_dict[k] = val
+    return TensorDict(padded_dict, batch_size=data.batch_size)
+
 from verl.workers.utils.padding import no_padding_2_padding
 
 
