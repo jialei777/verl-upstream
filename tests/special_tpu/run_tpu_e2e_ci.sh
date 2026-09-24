@@ -105,10 +105,18 @@ connect_gke_cluster() {
             --project "${PROJECT}" \
             --dns-endpoint
     fi
+}
 
-    if ! kubectl get raycluster "${RAY_CLUSTER_NAME}" -n "${RAY_NAMESPACE}" >/dev/null 2>&1; then
-        echo "[TPU CI] RayCluster ${RAY_CLUSTER_NAME} not found; applying manifest..."
-        kubectl apply -n "${RAY_NAMESPACE}" -f examples/tpu/gke/ray-tpu-v6e8-2slice.yaml
+apply_ray_cluster_manifest() {
+    # Runs under the cluster lock. `kubectl apply` is a no-op ("unchanged") unless the
+    # manifest differs from the live RayCluster; KubeRay does not roll existing pods on
+    # spec changes, so restart them when the RayCluster was created/configured.
+    local out
+    out="$(kubectl apply -n "${RAY_NAMESPACE}" -f examples/tpu/gke/ray-tpu-v6e8-2slice.yaml)"
+    echo "${out}"
+    if grep -Eq "raycluster.*/${RAY_CLUSTER_NAME} (configured|created)" <<<"${out}"; then
+        echo "[TPU CI] RayCluster spec changed; restarting KubeRay pods..."
+        kubectl delete pod -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" --wait=true --timeout=180s || true
     fi
 }
 
@@ -350,6 +358,7 @@ PY
 
 connect_gke_cluster
 acquire_cluster_lock
+apply_ray_cluster_manifest
 
 case "${MODE}" in
     sft)
