@@ -130,7 +130,3 @@ logs
 log
 outputs
 .history
-
-# wheels
-*.whl
-examples/tpu/gke/vllm-torchtpu/

@@ -442,6 +442,7 @@ class CheckpointEngineManager:
         if self.backend == "raiden":
             try:
                 from .raiden_checkpoint_engine import setup_raiden_controller
+
                 self.raiden_controller, self.raiden_server, self.raiden_address = setup_raiden_controller()
             except Exception as e:
                 raise RuntimeError(f"Failed to start embedded RaidenControllerServer on Headnode: {e}") from e

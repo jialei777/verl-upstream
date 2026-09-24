@@ -28,8 +28,8 @@ from typing import Any
 
 import numpy as np
 import ray
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import torch
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl.utils.device import get_resource_name
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension as _BaseWorkerExtension
@@ -73,11 +73,6 @@ def _resolve_tpu_topology_bounds(
 
 
 # -------------------------------------------
-
-try:
-    import tpu_sync
-except ImportError:
-    pass
 
 try:
     from verl.checkpoint_engine.tpu_checkpoint_engine import load_weights_on_worker
@@ -227,12 +222,13 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             logging.getLogger(__name__).warning("Raiden Sampler: could not locate vllm_model to bind parameters.")
             return False
 
+        from tpu_sync.rpc import raiden_service_pb2
+
         from verl.checkpoint_engine.raiden_checkpoint_engine import (
             create_torch_weight_synchronizer,
             filter_tied_embeddings,
             validate_and_sanitize_tensors,
         )
-        from tpu_sync.rpc import raiden_service_pb2
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
@@ -248,6 +244,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         # is called, so physical allocations are already materialized before C++ DMA binding.
         try:
             from torch_tpu._internal import sync as torch_tpu_sync
+
             torch_tpu_sync.synchronize(wait=True)
         except Exception as e:
             logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
@@ -256,8 +253,8 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         logging.getLogger(__name__).info(
             f"Raiden Sampler Rank {rank_val}: binding {len(valid_params)} tensors to WeightSynchronizer "
-            f"(sample tensor: name={valid_params[0][0]}, device={valid_params[0][1].device}, dtype={valid_params[0][1].dtype}, "
-            f"total numel={sum(t.numel() for _, t in valid_params)})"
+            f"(sample: name={valid_params[0][0]}, device={valid_params[0][1].device}, "
+            f"dtype={valid_params[0][1].dtype}, total numel={sum(t.numel() for _, t in valid_params)})"
         )
 
         self._raiden_ws = create_torch_weight_synchronizer(
@@ -272,15 +269,18 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         # instead of ad-hoc worker-side polling of TPUWeightRegistry. The manager already starts the
         # RaidenController and can pass the controller address and tensor metadata directly during init.
         from verl.checkpoint_engine.tpu_weight_registry import get_tpu_weight_registry
+
         registry = get_tpu_weight_registry()
 
         controller_addr, global_shapes_map = None, {}
         for _ in range(30):
             try:
-                addr, shapes = ray.get([
-                    registry.get_controller_address.remote(),
-                    registry.get_global_shapes.remote(),
-                ])
+                addr, shapes = ray.get(
+                    [
+                        registry.get_controller_address.remote(),
+                        registry.get_global_shapes.remote(),
+                    ]
+                )
                 if addr and shapes:
                     controller_addr, global_shapes_map = addr, shapes
                     break
@@ -289,11 +289,14 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             time.sleep(0.5)
 
         if not controller_addr:
-            raise RuntimeError(f"Raiden Sampler Rank {rank_val}: No RaidenController address found in TPUWeightRegistry after timeout")
+            raise RuntimeError(
+                f"Raiden Sampler Rank {rank_val}: No RaidenController address found in TPUWeightRegistry after timeout"
+            )
 
         # Determine tensor parallel size from vLLM V1 config
         worker = getattr(self, "worker", self)
-        tp_size = getattr(getattr(getattr(worker, "vllm_config", None), "parallel_config", None), "tensor_parallel_size", None)
+        parallel_config = getattr(getattr(worker, "vllm_config", None), "parallel_config", None)
+        tp_size = getattr(parallel_config, "tensor_parallel_size", None)
         if not tp_size or tp_size <= 0:
             raise RuntimeError(
                 f"Raiden Sampler Rank {rank_val}: Unable to determine tensor_parallel_size (tp_size) "
@@ -348,11 +351,14 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                 mesh_axes=["fsdp", "tp"],
             )
             logging.getLogger(__name__).info(
-                f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic tensors and registered directly with "
-                f"RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
+                f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic tensors and registered "
+                f"directly with RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], "
+                f"data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
             )
         except Exception as e:
-            logging.getLogger(__name__).error(f"Raiden Sampler Rank {rank_val} failed to register with RaidenController: {e}")
+            logging.getLogger(__name__).error(
+                f"Raiden Sampler Rank {rank_val} failed to register with RaidenController: {e}"
+            )
             raise
 
         return True
@@ -361,7 +367,9 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
     def install_raiden_weights(self) -> int:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA."""
         if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
-            logging.getLogger(__name__).warning("Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized.")
+            logging.getLogger(__name__).warning(
+                "Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized."
+            )
             return 0
 
         t_start = time.perf_counter()
@@ -378,6 +386,7 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         t_sync_start = time.perf_counter()
         try:
             from torch_tpu._internal import sync as torch_tpu_sync
+
             torch_tpu_sync.synchronize(wait=True)
         except Exception as e:
             logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
@@ -385,8 +394,8 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         t_total = time.perf_counter() - t_start
 
         print(
-            f"[RAIDEN TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: install_raiden_weights completed in {t_total:.4f}s "
-            f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)",
+            f"[RAIDEN TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: "
+            f"install_raiden_weights completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)",
             flush=True,
         )
         logging.getLogger(__name__).info(
@@ -403,8 +412,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         if vllm_model is None:
             return {"error": "No model found on worker"}
 
-        import torch
-
         if not hasattr(self, "_sorted_vllm_params") or not self._sorted_vllm_params:
             raise RuntimeError(
                 f"get_model_weights_stats is only supported for Raiden after initialization, "
@@ -414,10 +421,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         rank_val = getattr(self, "rank", 0)
 
         from verl.checkpoint_engine.raiden_checkpoint_engine import compute_tensor_stats
+
         res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = rank_val
 
         return res
+
 
 def _patched_run_engine_core(*args, **kwargs):
     try:

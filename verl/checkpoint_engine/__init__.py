@@ -96,4 +96,3 @@ try:
     __all__ += ["RaidenCheckpointEngine"]
 except ImportError:
     RaidenCheckpointEngine = None
-

@@ -88,6 +88,7 @@ class TPUWeightRegistry:
         self.stats.clear()
         self.global_shapes.clear()
 
+
 def get_tpu_weight_registry():
     """Gets or creates the singleton detached TPUWeightRegistry actor in the 'verl' namespace."""
     try:
@@ -96,10 +97,7 @@ def get_tpu_weight_registry():
         pass
 
     try:
-        return TPUWeightRegistry.options(
-            name="TPUWeightRegistry", namespace="verl", lifetime="detached"
-        ).remote()
+        return TPUWeightRegistry.options(name="TPUWeightRegistry", namespace="verl", lifetime="detached").remote()
     except ValueError:
         # Handled race condition: another worker created it concurrently
         return ray.get_actor("TPUWeightRegistry", namespace="verl")
-
