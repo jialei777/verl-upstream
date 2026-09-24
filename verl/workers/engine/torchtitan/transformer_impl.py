@@ -862,12 +862,6 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         return input_ids, extra_inputs, extra_kwargs, output_args
 
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict, return_model_output: bool = True):
-        """Computes log_probs (and optionally entropy) from logits.
-
-        On TPU, when ``return_model_output`` is False (standard training), the unpadded CPU nested
-        copies are skipped: the loss functions only read ``_tpu_padded_values`` and the caller
-        discards ``model_output``, so the synchronous device-to-host transfer is pure overhead.
-        """
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_remove_padding = unwrap_metadata(use_remove_padding)
 
@@ -964,10 +958,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         if device_name != "tpu":
             micro_batch = micro_batch.to(get_device_id())
 
-        # Standard training (train_batch) discards model_output, so only materialize it for
-        # forward-only passes or when the caller explicitly opts in (e.g. TinkerTrainingWorker
-        # sets return_model_output=True because it returns per-token log-probs after backward).
-        # Mirrors FSDPEngine.forward_backward_batch.
+        # Mirrors FSDPEngine: keep model_output for forward-only or when the caller opts in (e.g. Tinker).
         return_model_output = tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False)
         return_model_output = forward_only or bool(unwrap_metadata(return_model_output))
 
@@ -977,10 +968,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
 
             model_output = self.prepare_model_outputs(
-                logits=logits,
-                output_args=output_args,
-                micro_batch=micro_batch,
-                return_model_output=return_model_output,
+                logits=logits, output_args=output_args, micro_batch=micro_batch, return_model_output=return_model_output
             )
 
             if loss_function is not None:
