@@ -60,6 +60,7 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     pad_packed_inputs_for_tpu,
     synchronize_tpu_loss,
     unwrap_metadata,
+    vocab_parallel_entropy_from_logits,
     vocab_parallel_logprobs_from_logits,
 )
 from verl.workers.engine.torchtitan.utils import (
@@ -466,10 +467,18 @@ class TorchTitanEngine(BaseEngine):
             pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
         if isinstance(pred, DTensor):
-            if get_device_name() == "tpu" and self.parallel_dims.tp_enabled:
+            if get_device_name() == "tpu" and self._is_vocab_sharded_logits(pred):
+                # Keep Shard(-1) logits; prepare_model_outputs computes vocab-parallel log-probs.
                 return pred
             pred = pred.full_tensor()
         return pred
+
+    def _is_vocab_sharded_logits(self, pred: DTensor) -> bool:
+        """True iff ``pred`` is ``Shard(-1)`` on the 1-D TP mesh (loss-parallel output layout)."""
+        if not self.parallel_dims.tp_enabled or pred.device_mesh.ndim != 1 or len(pred.placements) != 1:
+            return False
+        placement = pred.placements[0]
+        return placement.is_shard() and placement.dim in (-1, pred.ndim - 1)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -881,20 +890,26 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         labels = output_args["labels"]
         model_output = {}
 
+        if isinstance(logits, DTensor) and not use_remove_padding:
+            # The vocab-parallel fast path only covers the packed (remove-padding) layout.
+            logits = logits.full_tensor()
+
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
         if use_remove_padding:
             labels = labels.squeeze(0)
             if isinstance(logits, DTensor):
-                tp_mesh = self.parallel_dims.get_optional_mesh("tp")
-                tp_group = tp_mesh.get_group() if tp_mesh is not None else None
+                # TP > 1 on TPU: logits stay Shard(-1) over the vocab. Compute log-probs/entropy with
+                # [S, 1] all_reduces and purely local backward instead of full_tensor(), whose backward
+                # all_gather on the full [S, V] gradient produced NaN grads on torch_tpu.
+                tp_group = self.parallel_dims.get_mesh("tp").get_group()
                 log_probs = vocab_parallel_logprobs_from_logits(
-                    logits=logits.squeeze(0),
-                    labels=labels,
-                    temperature=temperature,
-                    tp_group=tp_group,
+                    logits=logits.squeeze(0), labels=labels, temperature=temperature, tp_group=tp_group
                 )
-                logits_rmpad = logits.to_local().squeeze(0) / temperature
+                if calculate_entropy:
+                    entropy_rmpad = vocab_parallel_entropy_from_logits(
+                        logits=logits.squeeze(0), temperature=temperature, tp_group=tp_group
+                    )
             else:
                 logits_rmpad = logits.squeeze(0)
                 # PyTorch's autograd doesn't allow in-place modification of views when gradients need to flow back
@@ -909,17 +924,19 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     inplace_backward=inplace_backward,
                 )
 
-            if calculate_entropy:
-                if not self.engine_config.entropy_checkpointing:
-                    if self.engine_config.entropy_from_logits_with_chunking:
-                        entropy_rmpad = self.compute_entropy_from_logits(
-                            logits_rmpad,
-                            chunk_size=self.engine_config.entropy_from_logits_chunk_size,
-                        )  # ((total_nnz / sp) + pad)
+                if calculate_entropy:
+                    if not self.engine_config.entropy_checkpointing:
+                        if self.engine_config.entropy_from_logits_with_chunking:
+                            entropy_rmpad = self.compute_entropy_from_logits(
+                                logits_rmpad,
+                                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+                            )  # ((total_nnz / sp) + pad)
+                        else:
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
                     else:
-                        entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
-                else:
-                    entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
+                        entropy_rmpad = torch.utils.checkpoint.checkpoint(
+                            self.compute_entropy_from_logits, logits_rmpad
+                        )
 
             padded_log_probs = log_probs.squeeze(0)
             orig_seq_len = output_args.get("orig_seq_len")

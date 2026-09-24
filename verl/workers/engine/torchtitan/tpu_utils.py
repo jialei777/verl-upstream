@@ -316,63 +316,115 @@ def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:
     return TensorDict(padded_dict, batch_size=data.batch_size)
 
 
+def _vocab_shard_start(global_vocab: int, tp_size: int, tp_rank: int) -> int:
+    """First global vocab id owned by `tp_rank` under DTensor `Shard(-1)` (torch.chunk) semantics."""
+    chunk = (int(global_vocab) + tp_size - 1) // tp_size
+    return min(tp_rank * chunk, int(global_vocab))
+
+
+def _vocab_parallel_log_normalizer(
+    logits_fp32: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns the global ``(max, log_sum_exp)`` over a vocab-sharded last dim, each ``[..., 1]``."""
+    max_logits = torch.max(logits_fp32, dim=-1, keepdim=True).values
+    torch.distributed.all_reduce(max_logits, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+    sum_exp = torch.sum(torch.exp(logits_fp32 - max_logits), dim=-1, keepdim=True)
+    torch.distributed.all_reduce(sum_exp, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    return max_logits, torch.log(sum_exp)
+
+
 class _VocabParallelLogprobsFn(torch.autograd.Function):
-    """Computes log-probabilities from Shard(-1) vocab-parallel logits without full-vocab backward all_gather."""
+    """Token log-probs from ``Shard(-1)`` vocab-parallel logits without a full-vocab all_gather.
+
+    Forward issues three ``[S, 1]`` all_reduces (max, sum-exp, target logit). Backward is purely
+    local, ``d logp_y / d z = (onehot(y) - softmax(z)) / T``, so no collective is dispatched on the
+    ``[S, V]`` gradient (the ``full_tensor()`` backward all_gather that produced NaN grads on TPU).
+    Softmax is recomputed from the saved local logits and the ``[S, 1]`` normalizer instead of being
+    stored, so peak memory matches a regular log-softmax.
+    """
 
     @staticmethod
-    def forward(
-        ctx,
-        local_logits: torch.Tensor,
-        labels: torch.Tensor,
-        temperature: float,
-        tp_group: torch.distributed.ProcessGroup,
-        tp_rank: int,
-    ) -> torch.Tensor:
-        orig_dtype = local_logits.dtype
-        logits_fp32 = local_logits.float()
-        if temperature != 1.0:
-            logits_fp32 = logits_fp32 / float(temperature)
+    def forward(ctx, local_logits, labels, temperature, tp_group, vocab_start):
+        logits_fp32 = local_logits.float() / float(temperature)
+        local_vocab = int(logits_fp32.size(-1))
+        max_logits, log_z = _vocab_parallel_log_normalizer(logits_fp32, tp_group)
 
-        vocab_per_rank = int(logits_fp32.size(-1))
-        vocab_start = tp_rank * vocab_per_rank
-        vocab_end = vocab_start + vocab_per_rank
+        target_mask = (labels >= vocab_start) & (labels < vocab_start + local_vocab)
+        local_labels = torch.where(target_mask, labels - vocab_start, torch.zeros_like(labels))
+        local_labels = local_labels.clamp(0, local_vocab - 1)
+        target_logits = torch.gather(logits_fp32, dim=-1, index=local_labels.unsqueeze(-1)).squeeze(-1)
+        target_logits = torch.where(target_mask, target_logits, torch.zeros_like(target_logits))
+        torch.distributed.all_reduce(target_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group)
 
-        # 1. Global max logit across TP group
-        max_logits = torch.max(logits_fp32, dim=-1, keepdim=True).values
-        torch.distributed.all_reduce(max_logits, op=torch.distributed.ReduceOp.MAX, group=tp_group)
-
-        # 2. Shifted exponentials and global partition function Z
-        shifted_logits = logits_fp32 - max_logits
-        exp_logits = torch.exp(shifted_logits)
-        sum_exp = torch.sum(exp_logits, dim=-1, keepdim=True)
-        torch.distributed.all_reduce(sum_exp, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-
-        # 3. Target logit on the owning TP shard
-        target_mask = (labels >= vocab_start) & (labels < vocab_end)
-        local_labels = torch.where(target_mask, labels - vocab_start, torch.zeros_like(labels)).clamp(
-            0, vocab_per_rank - 1
-        )
-        gathered_shifted = torch.gather(shifted_logits, dim=-1, index=local_labels.unsqueeze(-1)).squeeze(-1)
-        target_shifted = torch.where(target_mask, gathered_shifted, torch.zeros_like(gathered_shifted))
-        torch.distributed.all_reduce(target_shifted, op=torch.distributed.ReduceOp.SUM, group=tp_group)
-
-        log_probs = target_shifted - torch.log(sum_exp.squeeze(-1))
-        softmax_local = (exp_logits / sum_exp).to(orig_dtype)
-        ctx.save_for_backward(softmax_local, local_labels, target_mask)
+        ctx.save_for_backward(local_logits, max_logits, log_z, local_labels, target_mask)
         ctx.temperature = float(temperature)
-        return log_probs.to(orig_dtype)
+        # Keep log-probs in fp32 (like the non-TP path); bf16 would add ~1e-2 noise to PPO ratios.
+        return target_logits - max_logits.squeeze(-1) - log_z.squeeze(-1)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        softmax_local, local_labels, target_mask = ctx.saved_tensors
-        grad_logits = -softmax_local.clone()
-        one_hot_update = target_mask.to(grad_logits.dtype).unsqueeze(-1)
-        grad_logits.scatter_add_(-1, local_labels.unsqueeze(-1), one_hot_update)
-        scale = grad_output.unsqueeze(-1).to(grad_logits.dtype)
-        if ctx.temperature != 1.0:
-            scale = scale / ctx.temperature
-        grad_logits.mul_(scale)
-        return grad_logits, None, None, None, None
+    def backward(ctx, grad_output):
+        local_logits, max_logits, log_z, local_labels, target_mask = ctx.saved_tensors
+        temperature = ctx.temperature
+        softmax = torch.exp(local_logits.float() / temperature - max_logits - log_z)
+        grad_logits = -softmax
+        grad_logits.scatter_add_(-1, local_labels.unsqueeze(-1), target_mask.to(grad_logits.dtype).unsqueeze(-1))
+        grad_logits.mul_(grad_output.float().unsqueeze(-1) / temperature)
+        return grad_logits.to(local_logits.dtype), None, None, None, None
+
+
+class _VocabParallelEntropyFn(torch.autograd.Function):
+    """Softmax entropy from ``Shard(-1)`` vocab-parallel logits; local backward, no full-vocab gather.
+
+    ``H = log Z - sum_i p_i (z_i - m)`` needs one extra ``[S, 1]`` all_reduce over the local
+    ``sum_i p_i (z_i - m)``. Backward uses ``dH / dz_k = -p_k (log p_k + H) / T``, all local.
+    """
+
+    @staticmethod
+    def forward(ctx, local_logits, temperature, tp_group):
+        logits_fp32 = local_logits.float() / float(temperature)
+        max_logits, log_z = _vocab_parallel_log_normalizer(logits_fp32, tp_group)
+        shifted = logits_fp32 - max_logits
+        weighted = torch.sum(torch.exp(shifted - log_z) * shifted, dim=-1, keepdim=True)
+        torch.distributed.all_reduce(weighted, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+        entropy = (log_z - weighted).squeeze(-1)
+
+        ctx.save_for_backward(local_logits, max_logits, log_z, entropy)
+        ctx.temperature = float(temperature)
+        return entropy
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        local_logits, max_logits, log_z, entropy = ctx.saved_tensors
+        temperature = ctx.temperature
+        log_p = local_logits.float() / temperature - max_logits - log_z
+        grad_logits = -torch.exp(log_p) * (log_p + entropy.unsqueeze(-1))
+        grad_logits.mul_(grad_output.float().unsqueeze(-1) / temperature)
+        return grad_logits.to(local_logits.dtype), None, None
+
+
+def _resolve_vocab_parallel_args(logits, tp_group, global_vocab):
+    """Returns ``(local_logits, tp_group, vocab_start)`` for a Shard(-1) DTensor or a local shard."""
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(logits, DTensor):
+        if tp_group is None:
+            tp_group = logits.device_mesh.get_group()
+        global_vocab = int(logits.shape[-1])
+        local_logits = logits.to_local()
+    else:
+        assert tp_group is not None and global_vocab is not None, (
+            "tp_group and global_vocab are required when passing a local logits shard"
+        )
+        local_logits = logits
+    tp_size = torch.distributed.get_world_size(tp_group)
+    tp_rank = torch.distributed.get_rank(tp_group)
+    vocab_start = _vocab_shard_start(global_vocab, tp_size, tp_rank)
+    expected_local = min(int(global_vocab), vocab_start + (int(global_vocab) + tp_size - 1) // tp_size) - vocab_start
+    assert int(local_logits.shape[-1]) == expected_local, (
+        f"local vocab shard {local_logits.shape[-1]} != expected {expected_local} "
+        f"(global_vocab={global_vocab}, tp_size={tp_size}, tp_rank={tp_rank})"
+    )
+    return local_logits, tp_group, vocab_start
 
 
 def vocab_parallel_logprobs_from_logits(
@@ -380,18 +432,27 @@ def vocab_parallel_logprobs_from_logits(
     labels: torch.Tensor,
     temperature: float = 1.0,
     tp_group: torch.distributed.ProcessGroup | None = None,
+    global_vocab: int | None = None,
 ) -> torch.Tensor:
-    """Computes token logprobs directly from a Shard(-1) DTensor on TPU without calling full_tensor()."""
-    from torch.distributed.tensor import DTensor
+    """Computes fp32 token log-probs from vocab-sharded logits without calling ``full_tensor()``.
 
-    if isinstance(logits, DTensor):
-        if tp_group is None:
-            tp_mesh = logits.device_mesh
-            tp_group = tp_mesh.get_group()
-        tp_rank = torch.distributed.get_rank(tp_group)
-        local_logits = logits.to_local()
-    else:
-        assert tp_group is not None
-        tp_rank = torch.distributed.get_rank(tp_group)
-        local_logits = logits
-    return _VocabParallelLogprobsFn.apply(local_logits, labels, temperature, tp_group, tp_rank)
+    Args:
+        logits: ``Shard(-1)`` DTensor on a 1-D TP mesh, or this rank's local ``[..., V_local]`` shard.
+        labels: Global vocab ids, shape ``logits.shape[:-1]``.
+        temperature: Softmax temperature applied to the logits.
+        tp_group: TP process group (defaults to the DTensor's mesh group).
+        global_vocab: Full vocab size; required only when ``logits`` is a local shard.
+    """
+    local_logits, tp_group, vocab_start = _resolve_vocab_parallel_args(logits, tp_group, global_vocab)
+    return _VocabParallelLogprobsFn.apply(local_logits, labels, temperature, tp_group, vocab_start)
+
+
+def vocab_parallel_entropy_from_logits(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    global_vocab: int | None = None,
+) -> torch.Tensor:
+    """Computes fp32 softmax entropy from vocab-sharded logits without calling ``full_tensor()``."""
+    local_logits, tp_group, _ = _resolve_vocab_parallel_args(logits, tp_group, global_vocab)
+    return _VocabParallelEntropyFn.apply(local_logits, temperature, tp_group)
