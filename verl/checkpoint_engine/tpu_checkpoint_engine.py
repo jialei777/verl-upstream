@@ -48,6 +48,34 @@ _FUSED_PROJECTIONS = {
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
 
+# Streamed send_weights: decoder layers are flattened and ray.put in buckets of this many layers
+# (so peak host memory is one bucket rather than the whole model), and every rank blocks on the
+# TPU every N yielded tensors so lazily-executed FSDP all-gather buffers cannot pile up in HBM.
+_LAYERS_PER_SEND_CHUNK = 4
+_SYNC_EVERY_N_TENSORS = 32
+
+
+def _tpu_synchronize() -> None:
+    """Blocks until all queued TPU work on this process has executed (no-op off TPU)."""
+    try:
+        import torch_tpu
+
+        torch_tpu._internal.sync.synchronize(wait=True)
+    except Exception:
+        pass
+
+
+def _layer_chunk_name(param_name: str, layers_per_chunk: int = _LAYERS_PER_SEND_CHUNK) -> str:
+    """Maps ``model.layers.<i>.*`` to its ``layers_<start>_<end>`` send bucket; other params to ``other``."""
+    parts = param_name.split(".")
+    if "layers" in parts:
+        idx = parts.index("layers")
+        if idx + 1 < len(parts) and parts[idx + 1].isdigit():
+            chunk_start = (int(parts[idx + 1]) // layers_per_chunk) * layers_per_chunk
+            return f"layers_{chunk_start}_{chunk_start + layers_per_chunk - 1}"
+    return "other"
+
+
 # =====================================================================
 # Namespace & Formatting Utilities
 # =====================================================================
@@ -387,23 +415,7 @@ class TPUCheckpointEngine(CheckpointEngine):
 
         t_start = time.perf_counter()
 
-        try:
-            import torch_tpu
-
-            torch_tpu._internal.sync.synchronize(wait=True)
-        except Exception:
-            pass
-
-        def _layer_chunk_name(param_name: str) -> str:
-            if "layers." in param_name:
-                parts = param_name.split(".")
-                idx = parts.index("layers")
-                if idx + 1 < len(parts) and parts[idx + 1].isdigit():
-                    layer_idx = int(parts[idx + 1])
-                    chunk_start = (layer_idx // 4) * 4
-                    return f"layers_{chunk_start}_{chunk_start + 3}"
-                return ".".join(parts[: idx + 2])
-            return "other"
+        _tpu_synchronize()
 
         def _flush_group(group_name: str, group_items: list[tuple[str, torch.Tensor]]) -> tuple[Any, float, float]:
             t_g0 = time.perf_counter()
@@ -437,19 +449,9 @@ class TPUCheckpointEngine(CheckpointEngine):
             # synchronizing periodically so lazy all-gather buffers do not accumulate on 4B+ models.
             for idx_tensor, (_k, v) in enumerate(weights, start=1):
                 del v
-                if idx_tensor % 32 == 0:
-                    try:
-                        import torch_tpu
-
-                        torch_tpu._internal.sync.synchronize(wait=True)
-                    except Exception:
-                        pass
-            try:
-                import torch_tpu
-
-                torch_tpu._internal.sync.synchronize(wait=True)
-            except Exception:
-                pass
+                if idx_tensor % _SYNC_EVERY_N_TENSORS == 0:
+                    _tpu_synchronize()
+            _tpu_synchronize()
             gc.collect()
             return
 
@@ -467,18 +469,14 @@ class TPUCheckpointEngine(CheckpointEngine):
         for idx_tensor, (k, v) in enumerate(weights, start=1):
             cpu_v = v.detach().cpu()
             del v
-            if idx_tensor % 32 == 0:
-                try:
-                    import torch_tpu
-
-                    torch_tpu._internal.sync.synchronize(wait=True)
-                except Exception:
-                    pass
+            if idx_tensor % _SYNC_EVERY_N_TENSORS == 0:
+                _tpu_synchronize()
             group_name = _layer_chunk_name(k)
+            # Weights arrive in layer order, so once the generator moves past a layer bucket it can
+            # be flattened and ray.put immediately instead of holding the whole model on host.
             if (
                 active_layer_group is not None
                 and group_name != active_layer_group
-                and active_layer_group.startswith("layers_")
                 and active_layer_group in grouped_weights
             ):
                 ref, dt_g, dt_p = _flush_group(active_layer_group, grouped_weights.pop(active_layer_group))
@@ -489,12 +487,7 @@ class TPUCheckpointEngine(CheckpointEngine):
                 active_layer_group = group_name
             grouped_weights.setdefault(group_name, []).append((k, cpu_v))
 
-        try:
-            import torch_tpu
-
-            torch_tpu._internal.sync.synchronize(wait=True)
-        except Exception:
-            pass
+        _tpu_synchronize()
         t_offload = (time.perf_counter() - t_offload_start) - t_group - t_put
 
         for group_name in list(grouped_weights.keys()):
@@ -567,13 +560,14 @@ async def update_tpu_weights(manager, global_steps: int | None = None) -> dict:
     ]
     results = await asyncio.gather(*futures)
 
-    cache_and_step_futures = []
-    for replica in manager.replicas:
-        cache_and_step_futures.append(replica.server_handle.clear_kv_cache.remote())
-        if global_steps is not None:
-            cache_and_step_futures.append(replica.server_handle.set_global_steps.remote(global_steps))
-    if cache_and_step_futures:
-        await asyncio.gather(*cache_and_step_futures)
+    # Mirror vLLMRollout.update_weights: drop prefix-cache entries computed with the old weights and
+    # stamp the new weight version so trajectory staleness is measured against the synced step.
+    cache_and_step_futures = [replica.clear_kv_cache() for replica in manager.replicas]
+    if global_steps is not None:
+        cache_and_step_futures += [
+            server.set_global_steps.remote(global_steps) for replica in manager.replicas for server in replica.servers
+        ]
+    await asyncio.gather(*cache_and_step_futures)
 
     # Release the state_dict ObjectRef from TPUWeightRegistry immediately after all
     # rollout replicas have loaded the weights so it does not stay pinned in the

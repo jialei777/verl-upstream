@@ -75,7 +75,7 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 # runs verl's decoupled regime with one batch in flight, so rollouts come from theta_{t-1} while
 # old_log_probs are recomputed under theta_t. Without IS weights the reward peaks around step 50
 # and then collapses (grad_norm 0.4 -> 363, rollout/training logprob correlation 0.98 -> 0.28).
-# See run_qwen3_0_6b_torchtitan.sh for the full derivation.
+# See run_qwen3_0_6b_torchtitan.sh (jialei777/verl-upstream#28) for the full derivation.
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
