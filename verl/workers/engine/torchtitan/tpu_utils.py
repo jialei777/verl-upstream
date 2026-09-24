@@ -260,6 +260,9 @@ def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) ->
 
     Assembling the small padded response tensors on CPU avoids compiling a new
     `tt_jit_jagged_to_padded_dense_forward` HLO executable for every unbucketed jagged length.
+
+    Supports NJTs whose ragged dimension is not dim 1 (e.g. 3D mrope `position_ids` of logical
+    shape ``[bsz, 4, j]`` with ``_ragged_idx == 2``), matching `torch.nested.to_padded_tensor`.
     """
     from verl.utils.device import get_device_id
 
@@ -270,21 +273,53 @@ def safe_to_padded_tensor(nt: Any, padding: Any = 0, output_size: Any = None) ->
     target_device = get_device_id() if nt.device.type == "cpu" else nt.device
     values_cpu = nt.values().detach().cpu()
     offsets_cpu = nt.offsets().detach().cpu()
+    # Ragged dim inside `values()` (the batch dim is folded into it): 0 for the usual [bsz, j, ...].
+    ragged_dim = int(getattr(nt, "_ragged_idx", 1)) - 1
     batch_size = int(offsets_cpu.shape[0]) - 1
     if batch_size <= 0:
         return torch.empty(output_size if output_size is not None else (0,), device=target_device, dtype=nt.dtype)
     lengths = offsets_cpu.diff().tolist()
-    trailing_dims = tuple(values_cpu.shape[1:])
     if output_size is None:
-        max_len = bucket_length(max(lengths))
-        output_size = (batch_size, max_len, *trailing_dims)
+        per_sample_shape = list(values_cpu.shape)
+        per_sample_shape[ragged_dim] = bucket_length(max(lengths))
+        output_size = (batch_size, *per_sample_shape)
     out_cpu = torch.full(output_size, padding, dtype=values_cpu.dtype)
     for i in range(batch_size):
         start = int(offsets_cpu[i].item())
         length = int(lengths[i])
         if length > 0:
-            out_cpu[i, :length] = values_cpu[start : start + length]
+            out_cpu[i].narrow(ragged_dim, 0, length).copy_(values_cpu.narrow(ragged_dim, start, length))
     return out_cpu.to(device=target_device)
+
+
+def build_packed_gather_index(
+    seq_lens: torch.Tensor, padded_seq_len: int, bucket_size: int | None = None
+) -> tuple[torch.Tensor, int]:
+    """Builds CPU indices that re-pack a right-padded ``[bsz, padded_seq_len]`` layout into 1D packed order.
+
+    Used by the TPU ``use_remove_padding=False`` path: the model runs on dense, bucketed
+    ``[bsz, padded_seq_len]`` inputs, and ``flat_logits.index_select(0, gather_idx)`` then yields
+    the same bucket-padded packed layout the remove-padding path produces, with a static shape.
+
+    Args:
+        seq_lens: Per-sample valid lengths, shape ``[bsz]``.
+        padded_seq_len: Padded (bucketed) per-sample length of the dense layout.
+        bucket_size: Bucket multiple for the packed length (defaults to `get_tpu_seq_bucket_size`).
+
+    Returns:
+        ``(gather_idx, total_tokens)`` where ``gather_idx`` has length
+        ``bucket_length(total_tokens)`` and its tail beyond ``total_tokens`` points at index 0.
+    """
+    seq_lens = seq_lens.detach().cpu().to(torch.int64)
+    total_tokens = int(seq_lens.sum().item())
+    packed_len = bucket_length(total_tokens, bucket_size)
+    batch_idx = torch.repeat_interleave(torch.arange(seq_lens.shape[0], dtype=torch.int64), seq_lens)
+    seq_starts = torch.repeat_interleave(torch.cumsum(seq_lens, dim=0) - seq_lens, seq_lens)
+    col_idx = torch.arange(total_tokens, dtype=torch.int64) - seq_starts
+    gather_idx = batch_idx * int(padded_seq_len) + col_idx
+    if packed_len > total_tokens:
+        gather_idx = F.pad(gather_idx, (0, packed_len - total_tokens), value=0)
+    return gather_idx, total_tokens
 
 
 def select_and_to_padded_tensor(data: TensorDict, *fields: str) -> TensorDict:

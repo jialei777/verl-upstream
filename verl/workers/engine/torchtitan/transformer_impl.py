@@ -55,6 +55,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
     bucket_length,
+    build_packed_gather_index,
     compute_global_batch_num_tokens,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
@@ -816,8 +817,22 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             if get_device_name() == "tpu":
                 max_seq_len = bucket_length(max_seq_len)
 
-            to_padded_fn = safe_to_padded_tensor if get_device_name() == "tpu" else torch.nested.to_padded_tensor
+            is_tpu = get_device_name() == "tpu"
+            to_padded_fn = safe_to_padded_tensor if is_tpu else torch.nested.to_padded_tensor
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
+            if is_tpu:
+                # Map the dense [bsz, max_seq_len] logits back to the bucketed 1D packed layout with a
+                # static-shape index_select in prepare_model_outputs, so the TPU remove-padding output
+                # path (and the `_tpu_padded_values` contract of the losses) is reused instead of
+                # running jagged `torch.nested.narrow` on device.
+                packed_gather_idx, orig_seq_len = build_packed_gather_index(
+                    input_ids.offsets().diff(), padded_seq_len=max_seq_len
+                )
+                labels = labels.detach().cpu()
+                labels = torch.nn.functional.pad(labels, (0, int(packed_gather_idx.shape[0]) - orig_seq_len), value=0)
+                labels = labels.unsqueeze(0).to(device=get_device_id())
+                output_args["packed_gather_idx"] = packed_gather_idx.to(device=get_device_id())
+                output_args["orig_seq_len"] = orig_seq_len
             input_ids = to_padded_fn(input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len))
 
             if position_ids.dim() == 3:
@@ -876,6 +891,13 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         labels = output_args["labels"]
         model_output = {}
+
+        packed_gather_idx = output_args.get("packed_gather_idx")
+        if packed_gather_idx is not None:
+            # TPU use_remove_padding=False: re-pack dense [bsz, max_seq_len, vocab] logits into the
+            # bucketed [1, packed_len, vocab] layout (static shape), then reuse the remove-padding branch.
+            logits = logits.reshape(-1, logits.shape[-1]).index_select(0, packed_gather_idx).unsqueeze(0)
+            use_remove_padding = True
 
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
