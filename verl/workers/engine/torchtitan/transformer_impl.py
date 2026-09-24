@@ -861,7 +861,13 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
-    def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict, forward_only=True):
+    def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict, return_model_output: bool = True):
+        """Computes log_probs (and optionally entropy) from logits.
+
+        On TPU, when ``return_model_output`` is False (standard training), the unpadded CPU nested
+        copies are skipped: the loss functions only read ``_tpu_padded_values`` and the caller
+        discards ``model_output``, so the synchronous device-to-host transfer is pure overhead.
+        """
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_remove_padding = unwrap_metadata(use_remove_padding)
 
@@ -910,7 +916,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             padded_log_probs = log_probs.squeeze(0)
             orig_seq_len = output_args.get("orig_seq_len")
             if orig_seq_len is not None:
-                if forward_only:
+                if return_model_output:
                     cu_seqlens_cpu = cu_seqlens.detach().cpu()
                     unpadded_log_probs = padded_log_probs.detach().cpu()[:orig_seq_len]
                     log_probs = torch.nested.nested_tensor_from_jagged(unpadded_log_probs, cu_seqlens_cpu)
@@ -918,7 +924,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     log_probs = padded_log_probs
                 log_probs._tpu_padded_values = padded_log_probs
                 if calculate_entropy:
-                    if forward_only:
+                    if return_model_output:
                         unpadded_entropy = entropy_rmpad.detach().cpu()[:orig_seq_len]
                         entropy = torch.nested.nested_tensor_from_jagged(unpadded_entropy, cu_seqlens_cpu)
                     else:
@@ -958,13 +964,23 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
         if device_name != "tpu":
             micro_batch = micro_batch.to(get_device_id())
 
+        # Standard training (train_batch) discards model_output, so only materialize it for
+        # forward-only passes or when the caller explicitly opts in (e.g. TinkerTrainingWorker
+        # sets return_model_output=True because it returns per-token log-probs after backward).
+        # Mirrors FSDPEngine.forward_backward_batch.
+        return_model_output = tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False)
+        return_model_output = forward_only or bool(unwrap_metadata(return_model_output))
+
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
 
             model_output = self.prepare_model_outputs(
-                logits=logits, output_args=output_args, micro_batch=micro_batch, forward_only=forward_only
+                logits=logits,
+                output_args=output_args,
+                micro_batch=micro_batch,
+                return_model_output=return_model_output,
             )
 
             if loss_function is not None:
@@ -982,7 +998,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
             # Detach before this lands in forward_backward_batch's output_lst; see detach_tree.
             output = {
-                "model_output": detach_tree(model_output) if forward_only else {},
+                "model_output": detach_tree(model_output) if return_model_output else {},
                 "loss": loss.detach().item(),
                 "metrics": metrics,
             }
