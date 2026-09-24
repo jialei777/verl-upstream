@@ -787,7 +787,7 @@ def sanitize_tpu_rollout_log_prob(
     old_log_prob: torch.Tensor,
     rollout_log_prob: torch.Tensor,
     response_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Repairs rollout log probs that the vLLM TPU V0 engine failed to report.
 
     The TPU rollout path does not always return a log prob for every token it emitted. Missing
@@ -795,10 +795,9 @@ def sanitize_tpu_rollout_log_prob(
     ``pi_rollout == 1.0``. Two situations are repaired here:
 
     1. Single-token responses (an immediate EOS). These are affected on essentially every batch.
-    2. Any in-mask token whose log prob came back as exactly ``0.0``. This is a heuristic: a truly
-       sampled token can round to ``0.0`` in fp32 when the distribution is extremely peaked, but at
-       ``temperature=1.0`` over a ~150k vocabulary that is rare compared to the missing-value case.
-       The fraction of repaired tokens is logged as ``rollout_corr/tpu_repaired_rollout_log_prob_frac``.
+    2. Any in-mask token whose log prob came back as exactly ``0.0``. At ``temperature=1.0`` over a
+       ~150k vocabulary a genuinely sampled token cannot have probability exactly 1.0, so an exact
+       zero is a reliable marker of a missing value rather than a real measurement.
 
     Leaving these unrepaired is actively harmful once importance sampling is enabled: the resulting
     ratio is ``exp(old_log_prob - 0.0)``, which for a typical immediate-EOS token (``old_log_prob``
@@ -812,39 +811,11 @@ def sanitize_tpu_rollout_log_prob(
         response_mask: Binary mask for valid response tokens, same shape.
 
     Returns:
-        ``(repaired_rollout_log_prob, repaired_mask)``: ``rollout_log_prob`` with unreported entries
-        replaced by ``old_log_prob``, and the boolean mask of replaced entries.
+        ``rollout_log_prob`` with unreported entries replaced by ``old_log_prob``.
     """
-    valid = response_mask.to(torch.bool)
     is_single_token_response = response_mask.sum(dim=-1, keepdim=True) <= 1
-    repaired = (is_single_token_response | (rollout_log_prob == 0.0)) & valid
-    return torch.where(repaired, old_log_prob.detach(), rollout_log_prob), repaired
-
-
-def compute_tpu_rollout_log_prob_repair_metrics(
-    old_log_prob: torch.Tensor,
-    raw_rollout_log_prob: torch.Tensor,
-    repaired: torch.Tensor,
-    response_mask: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """Diagnostics for :func:`sanitize_tpu_rollout_log_prob`, computed on the *unrepaired* log probs.
-
-    All other off-policy metrics are computed after the repair, where the repaired tokens are forced
-    to match the trainer (ratio 1.0). These metrics keep the raw generator signal visible so that
-    rollout-engine log-prob bugs are not masked when debugging.
-
-    Returns (without the ``rollout_corr/`` prefix):
-        - ``tpu_repaired_rollout_log_prob_frac``: fraction of valid tokens that were repaired.
-        - ``tpu_repaired_first_token_frac``: fraction of repaired tokens at response position 0.
-        - ``tpu_raw_kl``: ``KL(pi_rollout || pi_training)`` direct estimator on the raw log probs.
-    """
-    repaired_f = repaired.float()
-    num_repaired = repaired_f.sum()
-    return {
-        "tpu_repaired_rollout_log_prob_frac": verl_F.masked_mean(repaired_f, response_mask),
-        "tpu_repaired_first_token_frac": repaired_f[:, 0].sum() / num_repaired.clamp(min=1.0),
-        "tpu_raw_kl": verl_F.masked_mean(raw_rollout_log_prob - old_log_prob, response_mask).detach(),
-    }
+    corrupt = (is_single_token_response | (rollout_log_prob == 0.0)) & response_mask.to(torch.bool)
+    return torch.where(corrupt, old_log_prob.detach(), rollout_log_prob)
 
 
 def compute_rollout_correction_and_rejection_mask(
@@ -912,14 +883,14 @@ def compute_rollout_correction_and_rejection_mask(
     from verl.utils.device import get_device_name
 
     metrics: dict[str, float] = {}
-    if get_device_name() == "tpu":
+    if (get_device_name() == "tpu") and rollout_log_prob is not None:
         # TODO: Remove this safeguard once vLLM-TPU reports a log prob for every emitted token.
-        # GPU vLLM does not exhibit the missing-log-prob issue, so this is TPU-only by design.
-        raw_rollout_log_prob = rollout_log_prob
-        rollout_log_prob, repaired = sanitize_tpu_rollout_log_prob(old_log_prob, rollout_log_prob, response_mask)
-        metrics.update(
-            compute_tpu_rollout_log_prob_repair_metrics(old_log_prob, raw_rollout_log_prob, repaired, response_mask)
-        )
+        # Log the raw generator signal before it is overwritten with the trainer's log probs.
+        metrics["tpu_raw_kl"] = verl_F.masked_mean(rollout_log_prob - old_log_prob, response_mask)
+        sanitized_log_prob = sanitize_tpu_rollout_log_prob(old_log_prob, rollout_log_prob, response_mask)
+        repaired = (sanitized_log_prob != rollout_log_prob).float()
+        metrics["tpu_repaired_rollout_log_prob_frac"] = verl_F.masked_mean(repaired, response_mask)
+        rollout_log_prob = sanitized_log_prob
 
     # Step 1: Compute log ratio (log(π_train / π_rollout))
     log_ratio: torch.Tensor = old_log_prob - rollout_log_prob
@@ -1031,9 +1002,8 @@ def compute_offpolicy_metrics(
         from verl.utils.device import get_device_name
 
         if get_device_name() == "tpu":
-            # TODO: Remove once vLLM-TPU reports a log prob for every emitted token (see above).
-            # Idempotent: a no-op when called from compute_rollout_correction_and_rejection_mask.
-            rollout_log_prob, _ = sanitize_tpu_rollout_log_prob(old_log_prob, rollout_log_prob, response_mask)
+            # TODO: Remove once vLLM-TPU reports a log prob for every emitted token.
+            rollout_log_prob = sanitize_tpu_rollout_log_prob(old_log_prob, rollout_log_prob, response_mask)
 
         # 2a. kl: Direct estimator for KL(π_rollout || π_training)
         # This is the standard KL divergence: E[log(π_rollout) - log(π_training)]
