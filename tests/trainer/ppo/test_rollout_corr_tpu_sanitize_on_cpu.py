@@ -72,6 +72,12 @@ def test_rollout_correction_on_tpu_keeps_repaired_tokens_at_unit_weight(monkeypa
     torch.testing.assert_close(weights[0, 0], torch.tensor(1.0))
     torch.testing.assert_close(weights[1, 1], torch.tensor(1.0))
     assert metrics["rollout_corr/tpu_repaired_rollout_log_prob_frac"] == pytest.approx(2 / int(response_mask.sum()))
+    # One of the two repaired tokens sits at response position 0.
+    assert metrics["rollout_corr/tpu_repaired_first_token_frac"] == pytest.approx(0.5)
+    # Raw (pre-repair) KL keeps the generator's unrepaired signal; post-repair KL does not.
+    expected_raw_kl = ((rollout_log_prob - old_log_prob) * response_mask).sum() / response_mask.sum()
+    assert metrics["rollout_corr/tpu_raw_kl"] == pytest.approx(expected_raw_kl.item())
+    assert metrics["rollout_corr/tpu_raw_kl"] != pytest.approx(metrics["rollout_corr/kl"])
 
 
 def test_rollout_correction_off_tpu_is_unchanged(monkeypatch):
@@ -86,6 +92,6 @@ def test_rollout_correction_off_tpu_is_unchanged(monkeypatch):
         rollout_is_threshold=2.0,
     )
 
-    assert "rollout_corr/tpu_repaired_rollout_log_prob_frac" not in metrics
+    assert not any(k.startswith("rollout_corr/tpu_") for k in metrics)
     expected_w00 = torch.exp(old_log_prob[0, 0] - rollout_log_prob[0, 0]).clamp(max=2.0)
     torch.testing.assert_close(weights_proto.batch["rollout_is_weights"][0, 0], expected_w00)
