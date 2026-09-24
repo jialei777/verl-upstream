@@ -209,6 +209,9 @@ def pad_packed_inputs_for_tpu(
     # future consumer that iterates the full packed length. This is a fixed-shape elementwise op,
     # so it does not introduce a new XLA shape.
     same_doc_as_next = seq_ids == torch.roll(seq_ids, shifts=-1, dims=1)
+    # The roll wraps the last position onto the first one; with a single document and no bucket
+    # padding they share a seq id, so exclude it explicitly.
+    same_doc_as_next[:, -1] = False
     labels_cpu = torch.where(same_doc_as_next, labels_cpu, torch.zeros_like(labels_cpu))
 
     # Bucket max_response_len on micro_batch so ppo_loss operates on static bucketed shapes.
