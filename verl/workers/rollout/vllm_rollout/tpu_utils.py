@@ -334,20 +334,14 @@ def patch_vllm_for_tpu() -> None:
                 return 0
 
             if isinstance(state_dict_ref, list) and all(isinstance(r, ray.ObjectRef) for r in state_dict_ref):
-                # Streamed format from TPUCheckpointEngine.send_weights: one (group_name, group_sd)
-                # ObjectRef per layer bucket. Fetch them one at a time and key by chunk index so a
-                # repeated group name can never overwrite (and silently drop) an earlier chunk.
                 grouped_dict = {}
-                for chunk_idx, chunk_ref in enumerate(state_dict_ref):
+                for chunk_ref in state_dict_ref:
                     chunk_obj = ray.get(chunk_ref)
                     if isinstance(chunk_obj, tuple) and len(chunk_obj) == 2:
                         group_name, group_sd = chunk_obj
-                        grouped_dict[f"{chunk_idx:04d}:{group_name}"] = group_sd
+                        grouped_dict[group_name] = group_sd
                     elif isinstance(chunk_obj, dict) and "grouped" in chunk_obj:
-                        for group_name, group_sd in chunk_obj["grouped"].items():
-                            grouped_dict[f"{chunk_idx:04d}:{group_name}"] = group_sd
-                    else:
-                        logger.warning(f"Skipping unexpected TPUWeightRegistry chunk type: {type(chunk_obj)}")
+                        grouped_dict.update(chunk_obj["grouped"])
                     del chunk_obj
                 state_dict_data = {"grouped": grouped_dict}
             else:
