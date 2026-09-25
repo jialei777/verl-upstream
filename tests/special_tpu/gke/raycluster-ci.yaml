@@ -1,0 +1,132 @@
+# Per-run RayCluster template for the verl TPU CI.
+#
+# Rendered by tests/special_tpu/run_tpu_e2e_ci.sh (Python string.Template, dollar-brace
+# placeholders) and applied once per CI suite, then deleted on exit.
+#
+# - Queued through Kueue (`kueue.x-k8s.io/queue-name`): the RayCluster stays suspended
+#   until the `verl-tpu-ci` LocalQueue has free TPU quota, then all pods are created.
+# - RayCluster subslicing: the worker group carries the
+#   `cloud.google.com/gke-tpu-slice-topology` annotation so the KubeRay TPU webhook treats
+#   every replica as a standalone 2x2 single-host slice (v6e-4) carved out of a 2x4 (v6e-8)
+#   node pool. Each replica becomes its own Ray TPU slice (`tpu-group-0`, `tpu-group-1`, ...).
+# - A single-host slice is the smallest multi-chip unit on these node pools: GKE only admits
+#   whole-host TPU requests (4 chips), and libtpu cannot start an ICI session for a 2-chip
+#   subset of a host (START_SESSION fails). A lone chip (no ICI) works, which the 1-chip smoke
+#   test uses via TPU_VISIBLE_CHIPS.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ${RAY_CLUSTER_NAME}
+  namespace: ${RAY_NAMESPACE}
+  labels:
+    kueue.x-k8s.io/queue-name: ${KUEUE_QUEUE}
+    verl-ci/managed: "true"
+    verl-ci/suite: ${SUITE}
+    verl-ci/run-id: "${CI_RUN_ID}"
+  annotations:
+    verl-ci/owner: "${CI_OWNER}"
+spec:
+  enableInTreeAutoscaling: false
+  headGroupSpec:
+    rayStartParams: {}
+    template:
+      metadata:
+        annotations:
+          gke-gcsfuse/volumes: "true"
+      spec:
+        serviceAccountName: ray-ksa
+        nodeSelector:
+          cloud.google.com/gke-nodepool: default-pool
+        containers:
+          - name: ray-head
+            image: ${IMAGE}
+            imagePullPolicy: IfNotPresent
+            env:
+              - name: RAY_TRAIN_V2_ENABLED
+                value: "1"
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-secret
+                    key: hf_token
+                    optional: true
+            ports:
+              - containerPort: 8265  # Dashboard / job submission
+              - containerPort: 10001 # Client
+              - containerPort: 6379  # GCS
+            resources:
+              limits:
+                cpu: "${HEAD_CPU}"
+                memory: "${HEAD_MEMORY}"
+              requests:
+                cpu: "${HEAD_CPU}"
+                memory: "${HEAD_MEMORY}"
+            volumeMounts:
+              - name: gcs-volume
+                mountPath: /data
+        volumes:
+          - name: gcs-volume
+            csi:
+              driver: gcsfuse.csi.storage.gke.io
+              volumeAttributes:
+                bucketName: torchprime
+                mountOptions: "implicit-dirs"
+  workerGroupSpecs:
+    - groupName: tpu-group
+      replicas: ${WORKER_REPLICAS}
+      minReplicas: ${WORKER_REPLICAS}
+      maxReplicas: ${WORKER_REPLICAS}
+      numOfHosts: 1
+      rayStartParams: {}
+      template:
+        metadata:
+          annotations:
+            gke-gcsfuse/volumes: "true"
+            cloud.google.com/gke-tpu-slice-topology: 2x2
+        spec:
+          serviceAccountName: ray-ksa
+          nodeSelector:
+            cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+            cloud.google.com/gke-tpu-topology: 2x4  # parent slice shape (v6e-8 node pool)
+          containers:
+            - name: ray-worker
+              image: ${IMAGE}
+              imagePullPolicy: IfNotPresent
+              env:
+                # The KubeRay TPU webhook derives these from the parent 2x4 nodeSelector
+                # (8 chips); override them to describe the 2x2 single-host subslice.
+                - name: TORCH_TPU_TOPOLOGY
+                  value: "2,2,1"
+                - name: TORCH_TPU_SLICEBUILDER_ADDRESSES
+                  value: "localhost:8471,localhost:8472,localhost:8473,localhost:8474"
+                - name: RAY_TRAIN_V2_ENABLED
+                  value: "1"
+                - name: RAY_memory_monitor_refresh_ms
+                  value: "0"
+                - name: RAY_memory_usage_threshold
+                  value: "0.99"
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-secret
+                      key: hf_token
+                      optional: true
+              resources:
+                limits:
+                  cpu: "${WORKER_CPU}"
+                  memory: "${WORKER_MEMORY}"
+                  google.com/tpu: "4"
+                requests:
+                  cpu: "${WORKER_CPU}"
+                  memory: "${WORKER_MEMORY}"
+                  google.com/tpu: "4"
+              volumeMounts:
+                - name: gcs-volume
+                  mountPath: /data
+          volumes:
+            - name: gcs-volume
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: torchprime
+                  mountOptions: "implicit-dirs"

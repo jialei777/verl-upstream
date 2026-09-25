@@ -18,7 +18,10 @@ metadata:
   labels:
     app: github-tpu-ci-runner
 spec:
-  replicas: 1
+  # One runner per TPU CI suite (smoke / sft / grpo) so the jobs of a workflow run in
+  # parallel. Runners only submit work; TPU contention across runs is resolved by the
+  # Kueue LocalQueue `verl-tpu-ci` (see tests/special_tpu/gke/kueue-tpu-ci.yaml).
+  replicas: 3
   selector:
     matchLabels:
       app: github-tpu-ci-runner
@@ -36,8 +39,11 @@ spec:
               value: "https://github.com/verl-project/verl"
             - name: RUNNER_SCOPE
               value: "repo"
-            - name: RUNNER_NAME
+            # Unique runner name per replica: <prefix>-<random suffix>.
+            - name: RUNNER_NAME_PREFIX
               value: "gke-jialeic-ci-v6e8-2s-spot"
+            - name: RANDOM_RUNNER_SUFFIX
+              value: "true"
             - name: LABELS
               value: "self-hosted,linux,x64,tpu,tpu-v6e8-2s"
             - name: EPHEMERAL

@@ -13,84 +13,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# End-to-End CI Runner for TPU v6e on GKE KubeRay (SFT & GRPO)
+# End-to-End CI Runner for TPU v6e on GKE KubeRay.
+#
+# Every invocation owns the full lifecycle of its own RayCluster:
+#   1. provision  - render tests/special_tpu/gke/raycluster-ci.yaml into a uniquely named,
+#                   Kueue-queued RayCluster whose TPU workers are single-host v6e-4 (2x2)
+#                   subslices of the v6e-8 (2x4) node pools. Kueue keeps it suspended until
+#                   TPU quota is free, so concurrent CI runs queue (FIFO) instead of fighting
+#                   for TPU hosts.
+#   2. run        - submit the suite as a Ray job and verify its metrics.
+#   3. tear down  - delete the RayCluster on exit, whether the suite passed, failed, timed
+#                   out or was cancelled.
+#
+# Suites:
+#   smoke - 1 x v6e-4 subslice, 1 chip used: torch_tpu import / to(device) / matmul / autograd.
+#   sft   - 1 x v6e-4 subslice, 4 chips: Qwen3-0.6B GSM8K SFT (TorchTitan FSDP2).
+#   grpo  - 2 x v6e-4 subslices, 8 chips: Qwen3-0.6B GSM8K GRPO, 4-chip trainer on
+#           tpu-group-0 + 4-chip vLLM rollout on tpu-group-1.
+# Note: multi-chip ICI sessions smaller than a full v6e host (e.g. 2 chips) are rejected by
+# libtpu (START_SESSION failed), so a single host (4 chips) is the smallest multi-chip unit.
 #
 # Usage:
-#   bash tests/special_tpu/run_tpu_e2e_ci.sh [sft|grpo|all]
+#   bash tests/special_tpu/run_tpu_e2e_ci.sh <smoke|sft|grpo>
+#   bash tests/special_tpu/run_tpu_e2e_ci.sh teardown [suite]   # delete this run's clusters
 
 set -euo pipefail
 
-MODE="${1:-all}"
+MODE="${1:?usage: $0 <smoke|sft|grpo|teardown> [suite]}"
 export CLUSTER_NAME="${CLUSTER_NAME:-jialeic-ci-v6e8-2s-spot}"
 export REGION="${REGION:-us-central2}"
 export PROJECT="${PROJECT:-tpu-pytorch}"
-export RAY_CLUSTER_NAME="${RAY_CLUSTER_NAME:-ray-tpu-v6e-cluster}"
 export RAY_NAMESPACE="${RAY_NAMESPACE:-default}"
+export KUEUE_QUEUE="${KUEUE_QUEUE:-verl-tpu-ci}"
+export TPU_CI_IMAGE="${TPU_CI_IMAGE:-us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260924-ray256-v4}"
 export SMOKE_TEST="${SMOKE_TEST:-1}"
-export EXPECTED_TPU_CHIPS="${EXPECTED_TPU_CHIPS:-16.0}"
-export PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-28265}"
+export PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-$((28000 + RANDOM % 1000))}"
+# Maximum time to wait in the Kueue queue before giving up.
+export QUEUE_TIMEOUT_MINS="${QUEUE_TIMEOUT_MINS:-120}"
+# CI RayClusters older than this are considered leaked (e.g. runner pod crashed) and reaped.
+export STALE_CLUSTER_SECONDS="${STALE_CLUSTER_SECONDS:-10800}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+RUN_ID="${GITHUB_RUN_ID:-local$(date +%s)}"
+RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+
 PF_PID=""
 CURRENT_RAY_JOB_ID=""
-LOCK_NAME="tpu-ci-cluster-lock"
-LOCK_OWNER="${GITHUB_RUN_ID:-local}-$$-$(hostname)"
-HAVE_CLUSTER_LOCK="0"
+RAY_CLUSTER_NAME=""
+HEAD_POD=""
+WORKER_REPLICAS=1
 
-release_cluster_lock() {
-    if [[ "${HAVE_CLUSTER_LOCK}" == "1" ]]; then
-        kubectl delete configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" >/dev/null 2>&1 || true
-        HAVE_CLUSTER_LOCK="0"
-    fi
+log() {
+    echo "[TPU CI $(date +%H:%M:%S)] $*"
 }
-
-acquire_cluster_lock() {
-    local wait_deadline=$((SECONDS + 3600))
-    while (( SECONDS < wait_deadline )); do
-        local now_ts
-        now_ts="$(date +%s)"
-        if kubectl create configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" \
-            --from-literal="owner=${LOCK_OWNER}" \
-            --from-literal="timestamp=${now_ts}" >/dev/null 2>&1; then
-            HAVE_CLUSTER_LOCK="1"
-            echo "[TPU CI] Acquired exclusive TPU cluster lock (${LOCK_NAME}, owner=${LOCK_OWNER})."
-            return 0
-        fi
-        local holder holder_ts
-        holder="$(kubectl get configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" -o jsonpath='{.data.owner}' 2>/dev/null || echo 'unknown')"
-        holder_ts="$(kubectl get configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" -o jsonpath='{.data.timestamp}' 2>/dev/null || echo '0')"
-        # Reclaim stale lock older than 45 minutes (2700s)
-        if [[ "${holder_ts}" =~ ^[0-9]+$ ]] && (( now_ts - holder_ts > 2700 )); then
-            echo "[TPU CI] Reclaiming stale cluster lock from ${holder} (age $((now_ts - holder_ts))s)..."
-            kubectl delete configmap "${LOCK_NAME}" -n "${RAY_NAMESPACE}" >/dev/null 2>&1 || true
-            continue
-        fi
-        echo "[TPU CI] TPU cluster is busy (locked by ${holder}); queued and waiting 15s..."
-        sleep 15
-    done
-    echo "[TPU CI] ERROR: Timed out waiting for exclusive TPU cluster lock." >&2
-    exit 1
-}
-
-cleanup() {
-    if [[ -n "${CURRENT_RAY_JOB_ID}" && -n "${RAY_ADDRESS:-}" ]]; then
-        echo "[TPU CI] Stopping active Ray job ${CURRENT_RAY_JOB_ID}..."
-        ray job stop --address "${RAY_ADDRESS}" "${CURRENT_RAY_JOB_ID}" >/dev/null 2>&1 || true
-        CURRENT_RAY_JOB_ID=""
-    fi
-    if [[ -n "${PF_PID}" ]] && kill -0 "${PF_PID}" 2>/dev/null; then
-        kill "${PF_PID}" 2>/dev/null || true
-    fi
-    release_cluster_lock
-}
-trap cleanup EXIT INT TERM
 
 connect_gke_cluster() {
-    echo "=================================================================="
-    echo "[TPU CI] Connecting to GKE cluster: ${CLUSTER_NAME} (${REGION}, ${PROJECT})"
-    echo "=================================================================="
     if [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]]; then
         unset KUBECONFIG
         if ! command -v kubectl >/dev/null 2>&1; then
@@ -98,8 +77,9 @@ connect_gke_cluster() {
             chmod +x kubectl
             mv kubectl /usr/local/bin/kubectl
         fi
-        echo "[TPU CI] Running inside GKE pod; using in-cluster Kubernetes service account."
+        log "Running inside GKE pod; using in-cluster Kubernetes service account."
     else
+        log "Connecting to GKE cluster ${CLUSTER_NAME} (${REGION}, ${PROJECT})"
         gcloud container clusters get-credentials "${CLUSTER_NAME}" \
             --region "${REGION}" \
             --project "${PROJECT}" \
@@ -107,274 +87,313 @@ connect_gke_cluster() {
     fi
 }
 
-apply_ray_cluster_manifest() {
-    # Runs under the cluster lock. `kubectl apply` is a no-op ("unchanged") unless the
-    # manifest differs from the live RayCluster; KubeRay does not roll existing pods on
-    # spec changes, so restart them when the RayCluster was created/configured.
-    local out
-    out="$(kubectl apply -n "${RAY_NAMESPACE}" -f examples/tpu/gke/ray-tpu-v6e8-2slice.yaml)"
-    echo "${out}"
-    if grep -Eq "raycluster.*/${RAY_CLUSTER_NAME} (configured|created)" <<<"${out}"; then
-        echo "[TPU CI] RayCluster spec changed; restarting KubeRay pods..."
-        kubectl delete pod -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" --wait=true --timeout=180s || true
-    fi
+delete_ray_clusters() {
+    # Delete CI RayClusters matching a label selector without blocking on pod termination.
+    local selector="$1"
+    kubectl delete raycluster -n "${RAY_NAMESPACE}" -l "${selector}" --wait=false --ignore-not-found || true
 }
 
-ensure_clean_tpu_cluster() {
-    local force_reset="${1:-0}"
+cleanup() {
+    local exit_code=$?
+    set +e
+    if [[ -n "${CURRENT_RAY_JOB_ID}" && -n "${HEAD_POD}" ]]; then
+        log "Stopping active Ray job ${CURRENT_RAY_JOB_ID}..."
+        kubectl exec -n "${RAY_NAMESPACE}" "${HEAD_POD}" -c ray-head -- \
+            ray job stop --address http://127.0.0.1:8265 "${CURRENT_RAY_JOB_ID}" >/dev/null 2>&1
+        CURRENT_RAY_JOB_ID=""
+    fi
+    if [[ -n "${PF_PID}" ]] && kill -0 "${PF_PID}" 2>/dev/null; then
+        kill "${PF_PID}" 2>/dev/null
+    fi
+    if [[ -n "${RAY_CLUSTER_NAME}" ]]; then
+        log "Tearing down RayCluster ${RAY_CLUSTER_NAME} (exit code ${exit_code})..."
+        kubectl delete raycluster -n "${RAY_NAMESPACE}" "${RAY_CLUSTER_NAME}" --wait=false --ignore-not-found
+        RAY_CLUSTER_NAME=""
+    fi
+    exit "${exit_code}"
+}
 
-    if [[ "${force_reset}" == "1" ]]; then
-        echo "[TPU CI] Resetting KubeRay cluster pods to ensure clean TPU state..."
-        kubectl delete pod -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" --wait=true --timeout=180s || true
-        sleep 5
+ensure_kueue_queue() {
+    # Idempotent: creates/updates the ResourceFlavors, ClusterQueue and LocalQueue.
+    kubectl apply -f tests/special_tpu/gke/kueue-tpu-ci.yaml
+}
+
+reap_stale_clusters() {
+    local stale
+    stale="$(kubectl get raycluster -n "${RAY_NAMESPACE}" -l verl-ci/managed=true -o json | python3 -c '
+import datetime, json, sys
+max_age = int(sys.argv[1])
+now = datetime.datetime.now(datetime.timezone.utc)
+for item in json.load(sys.stdin)["items"]:
+    created = datetime.datetime.fromisoformat(item["metadata"]["creationTimestamp"].replace("Z", "+00:00"))
+    if (now - created).total_seconds() > max_age:
+        print(item["metadata"]["name"])
+' "${STALE_CLUSTER_SECONDS}")"
+    for name in ${stale}; do
+        log "Reaping leaked CI RayCluster ${name} (older than ${STALE_CLUSTER_SECONDS}s)..."
+        kubectl delete raycluster -n "${RAY_NAMESPACE}" "${name}" --wait=false --ignore-not-found || true
+    done
+}
+
+provision_ray_cluster() {
+    local suite="$1" replicas="$2" head_cpu="$3" head_mem="$4" worker_cpu="$5" worker_mem="$6"
+    WORKER_REPLICAS="${replicas}"
+    # Keep the name short: KubeRay derives pod/service names from it (63-char limit).
+    RAY_CLUSTER_NAME="$(echo "verl-ci-${suite}-${RUN_ID}-${RUN_ATTEMPT}" | tr '[:upper:]_' '[:lower:]-' | cut -c1-40 | sed 's/-*$//')"
+
+    log "Provisioning RayCluster ${RAY_CLUSTER_NAME} (${replicas} x v6e-4 subslice, queue=${KUEUE_QUEUE}, image=${TPU_CI_IMAGE})"
+    RAY_CLUSTER_NAME="${RAY_CLUSTER_NAME}" SUITE="${suite}" HEAD_CPU="${head_cpu}" HEAD_MEMORY="${head_mem}" \
+        WORKER_CPU="${worker_cpu}" WORKER_MEMORY="${worker_mem}" WORKER_REPLICAS="${replicas}" CI_RUN_ID="${RUN_ID}" \
+        CI_OWNER="${GITHUB_REPOSITORY:-local}/${GITHUB_REF_NAME:-$(hostname)}#${RUN_ID}" \
+        python3 - tests/special_tpu/gke/raycluster-ci.yaml <<'PY' | kubectl apply -f -
+import os
+import string
+import sys
+
+keys = ["RAY_CLUSTER_NAME", "RAY_NAMESPACE", "KUEUE_QUEUE", "SUITE", "CI_OWNER", "CI_RUN_ID", "HEAD_CPU",
+        "HEAD_MEMORY", "WORKER_CPU", "WORKER_MEMORY", "WORKER_REPLICAS"]
+values = {k: os.environ[k] for k in keys}
+values["IMAGE"] = os.environ["TPU_CI_IMAGE"]
+print(string.Template(open(sys.argv[1]).read()).substitute(values))
+PY
+}
+
+wait_for_ray_cluster() {
+    # 1. Wait for Kueue admission (RayCluster un-suspended).
+    local deadline=$((SECONDS + QUEUE_TIMEOUT_MINS * 60))
+    local last_report=-1000
+    while (( SECONDS < deadline )); do
+        local suspended
+        suspended="$(kubectl get raycluster -n "${RAY_NAMESPACE}" "${RAY_CLUSTER_NAME}" -o jsonpath='{.spec.suspend}')"
+        if [[ "${suspended}" != "true" ]]; then
+            log "RayCluster ${RAY_CLUSTER_NAME} admitted by Kueue."
+            break
+        fi
+        if (( SECONDS - last_report >= 60 )); then
+            log "Queued in Kueue (${KUEUE_QUEUE}); waiting for TPU quota. Queue state:"
+            kubectl get localqueue -n "${RAY_NAMESPACE}" "${KUEUE_QUEUE}" --no-headers 2>/dev/null || true
+            kubectl get raycluster -n "${RAY_NAMESPACE}" -l verl-ci/managed=true \
+                -o custom-columns=NAME:.metadata.name,SUSPENDED:.spec.suspend,STATE:.status.state --no-headers || true
+            last_report=${SECONDS}
+        fi
+        sleep 10
+    done
+    if [[ "$(kubectl get raycluster -n "${RAY_NAMESPACE}" "${RAY_CLUSTER_NAME}" -o jsonpath='{.spec.suspend}')" == "true" ]]; then
+        log "ERROR: RayCluster not admitted within ${QUEUE_TIMEOUT_MINS} minutes." >&2
+        exit 1
     fi
 
-    echo "[TPU CI] Waiting for 1 head pod + 4 TPU worker pods to reach Running/Ready..."
-    local deadline=$((SECONDS + 900))
+    # 2. Wait for head + TPU worker pods to be Running and all containers ready.
+    local want_pods=$((1 + WORKER_REPLICAS))
+    local want_tpu="0.0/$((4 * WORKER_REPLICAS)).0 TPU"
+    deadline=$((SECONDS + 900))
     while (( SECONDS < deadline )); do
         local ready_pods
         ready_pods="$(kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" --no-headers 2>/dev/null \
-            | awk '$2 == "2/2" && $3 == "Running" {count++} END {print count+0}')"
-        if [[ "${ready_pods}" -ge 5 ]]; then
-            echo "[TPU CI] All 5 KubeRay pods (1 head + 4 TPU workers) are 2/2 Running."
+            | awk '{split($2, r, "/"); if (r[1] == r[2] && $3 == "Running") c++} END {print c+0}')"
+        if [[ "${ready_pods}" -ge "${want_pods}" ]]; then
             break
         fi
-        echo "[TPU CI] Ready pods: ${ready_pods}/5. Waiting 10s..."
+        log "Ready pods: ${ready_pods}/${want_pods} (1 head + ${WORKER_REPLICAS} TPU worker(s))."
         sleep 10
     done
+    kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" -o wide
 
-    local head_pod
-    head_pod="$(kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME},ray.io/node-type=head" \
+    HEAD_POD="$(kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME},ray.io/node-type=head" \
         -o jsonpath='{.items[0].metadata.name}')"
 
-    echo "[TPU CI] Waiting for Ray cluster (${head_pod}) to register 0.0/${EXPECTED_TPU_CHIPS} TPU..."
+    # 3. Wait for the TPU workers to register their chips with Ray.
     deadline=$((SECONDS + 300))
     while (( SECONDS < deadline )); do
         local tpu_usage
-        tpu_usage="$(kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- ray status 2>/dev/null \
+        tpu_usage="$(kubectl exec -n "${RAY_NAMESPACE}" "${HEAD_POD}" -c ray-head -- ray status 2>/dev/null \
             | awk '/[0-9.]+\/[0-9.]+ TPU([[:space:]]|$)/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0); print $0; exit}' || true)"
-        echo "[TPU CI] Ray TPU status: ${tpu_usage:-<initializing>}"
-        if [[ "${tpu_usage}" == "0.0/${EXPECTED_TPU_CHIPS} TPU" ]]; then
-            return 0
-        fi
-        # If TPUs are held by a leftover process or placement group from a previous run, force-reset pods once
-        if [[ -n "${tpu_usage}" && "${tpu_usage}" != "0.0/${EXPECTED_TPU_CHIPS} TPU" && "${force_reset}" == "0" ]]; then
-            echo "[TPU CI] Detected held TPUs (${tpu_usage}); recycling cluster pods..."
-            ensure_clean_tpu_cluster 1
+        log "Ray TPU status: ${tpu_usage:-<initializing>} (want ${want_tpu})"
+        if [[ "${tpu_usage}" == "${want_tpu}" ]]; then
             return 0
         fi
         sleep 10
     done
-
-    echo "[TPU CI] ERROR: Timed out waiting for 0.0/${EXPECTED_TPU_CHIPS} TPU." >&2
-    kubectl get pods -n "${RAY_NAMESPACE}" -o wide >&2
+    log "ERROR: Ray cluster ${RAY_CLUSTER_NAME} did not register $((4 * WORKER_REPLICAS)) TPU chips." >&2
+    kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" -o wide >&2
     exit 1
 }
 
-start_port_forward() {
-    cleanup
-    # Check if we are running inside the same Kubernetes cluster and can reach the service directly
-    if curl -sf "http://${RAY_CLUSTER_NAME}-head-svc.${RAY_NAMESPACE}.svc.cluster.local:8265/api/version" >/dev/null 2>&1; then
-        export RAY_ADDRESS="http://${RAY_CLUSTER_NAME}-head-svc.${RAY_NAMESPACE}.svc.cluster.local:8265"
-        echo "[TPU CI] Using in-cluster Ray head service: ${RAY_ADDRESS}"
-        return 0
-    fi
+connect_ray_dashboard() {
+    local svc="${RAY_CLUSTER_NAME}-head-svc"
+    local deadline=$((SECONDS + 60))
+    # Runner pods live in the same GKE cluster: talk to the head service directly.
+    while (( SECONDS < deadline )); do
+        if curl -sf "http://${svc}.${RAY_NAMESPACE}.svc.cluster.local:8265/api/version" >/dev/null 2>&1; then
+            export RAY_ADDRESS="http://${svc}.${RAY_NAMESPACE}.svc.cluster.local:8265"
+            log "Using in-cluster Ray head service: ${RAY_ADDRESS}"
+            return 0
+        fi
+        if [[ -z "${KUBERNETES_SERVICE_HOST:-}" ]]; then
+            break
+        fi
+        sleep 5
+    done
 
-    echo "[TPU CI] Starting port-forward to svc/${RAY_CLUSTER_NAME}-head-svc on localhost:${PORT_FORWARD_PORT}..."
-    kubectl port-forward -n "${RAY_NAMESPACE}" "svc/${RAY_CLUSTER_NAME}-head-svc" "${PORT_FORWARD_PORT}:8265" >/dev/null 2>&1 &
+    log "Starting port-forward to svc/${svc} on localhost:${PORT_FORWARD_PORT}..."
+    kubectl port-forward -n "${RAY_NAMESPACE}" "svc/${svc}" "${PORT_FORWARD_PORT}:8265" >/dev/null 2>&1 &
     PF_PID=$!
-
-    local deadline=$((SECONDS + 30))
+    deadline=$((SECONDS + 60))
     while (( SECONDS < deadline )); do
         if curl -sf "http://127.0.0.1:${PORT_FORWARD_PORT}/api/version" >/dev/null 2>&1; then
             export RAY_ADDRESS="http://127.0.0.1:${PORT_FORWARD_PORT}"
-            echo "[TPU CI] Port-forward established at ${RAY_ADDRESS}"
+            log "Port-forward established at ${RAY_ADDRESS}"
             return 0
         fi
         sleep 1
     done
-
-    echo "[TPU CI] ERROR: Failed to establish port-forward to Ray head service." >&2
+    log "ERROR: Failed to reach the Ray head service." >&2
     exit 1
 }
 
 submit_and_verify_ray_job() {
     local suite_name="$1"
-    local script_path="$2"
-    local timeout_mins="$3"
-
-    ensure_clean_tpu_cluster "${FORCE_POD_RESET:-0}"
-    start_port_forward
-
-    local head_pod
-    head_pod="$(kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME},ray.io/node-type=head" \
-        -o jsonpath='{.items[0].metadata.name}')"
+    local timeout_mins="$2"
+    local suite_env_json="$3"
+    shift 3
+    local entrypoint=("$@")
 
     local sub_id="ci_${suite_name}_$(date +%Y%m%d_%H%M%S)"
     local log_file="/tmp/${sub_id}.log"
 
     local runtime_env
-    runtime_env="$(python3 -c '
+    runtime_env="$(SUITE_ENV="${suite_env_json}" python3 -c '
 import json, os
+env_vars = {
+    "PYTHONPATH": ".",
+    "PYTHONUNBUFFERED": "1",
+    "VERL_PLATFORM": "tpu",
+    "SMOKE_TEST": os.environ.get("SMOKE_TEST", "1"),
+    "RAY_memory_monitor_refresh_ms": "0",
+    "RAY_memory_usage_threshold": "0.99",
+    "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
+    "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
+}
+env_vars.update(json.loads(os.environ["SUITE_ENV"]))
 print(json.dumps({
     "excludes": [".git", "logs", "*.log", "*.pt", "*.bin", "__pycache__", ".ruff_cache", ".mypy_cache"],
-    "env_vars": {
-        "PYTHONPATH": ".",
-        "PYTHONUNBUFFERED": "1",
-        "VERL_PLATFORM": "tpu",
-        "VLLM_USE_V1": "0",
-        "SMOKE_TEST": os.environ.get("SMOKE_TEST", "1"),
-        "RAY_memory_monitor_refresh_ms": "0",
-        "RAY_memory_usage_threshold": "0.99",
-        "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
-        "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
-    }
+    "env_vars": env_vars,
 }))
 ')"
 
-    local extra_args=""
-    if [[ "${suite_name}" == "grpo" ]]; then
-        # Disable Qwen3 <think> truncation in CI smoke runs so 512-token rollouts emit
-        # "#### <answer>", enabling real GSM8K test pass-rate and non-zero gradient checks
-        # even in 5-step smoke mode.
-        extra_args="+data.apply_chat_template_kwargs.enable_thinking=False trainer.val_before_train=True data.val_max_samples=32 data.train_batch_size=8 actor_rollout_ref.actor.ppo_mini_batch_size=8 actor_rollout_ref.rollout.n=4"
-    fi
-
-    echo "=================================================================="
-    echo "[TPU CI] Submitting ${suite_name^^} job (${sub_id}): ${script_path}"
-    echo "=================================================================="
+    log "Submitting ${suite_name^^} job ${sub_id}: ${entrypoint[*]}"
     ray job submit \
         --address "${RAY_ADDRESS}" \
         --submission-id "${sub_id}" \
         --working-dir "${REPO_ROOT}" \
         --runtime-env-json "${runtime_env}" \
         --no-wait \
-        -- bash "${script_path}" ${extra_args}
+        -- "${entrypoint[@]}"
     CURRENT_RAY_JOB_ID="${sub_id}"
 
-    # Poll status via kubectl exec so transient port-forward drops never kill the CI run
+    # Poll via kubectl exec so transient dashboard/port-forward drops never kill the CI run.
     local deadline=$((SECONDS + timeout_mins * 60))
     local final_status="TIMEOUT"
     while (( SECONDS < deadline )); do
         local status_out
-        status_out="$(kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- \
-            ray job status --address http://127.0.0.1:8265 "${sub_id}" 2>/dev/null || true)"
-        echo "[$(date +%H:%M:%S)] ${sub_id}: ${status_out}"
+        status_out="$(kubectl exec -n "${RAY_NAMESPACE}" "${HEAD_POD}" -c ray-head -- \
+            ray job status --address http://127.0.0.1:8265 "${sub_id}" 2>/dev/null \
+            | grep -E "Job '.*' (succeeded|failed|was stopped)|Status message|Status for job" || true)"
+        log "${sub_id}: $(tail -n 1 <<<"${status_out}")"
         local status_lower="${status_out,,}"
-        if [[ "${status_lower}" == *"succeeded"* ]]; then
+        if [[ "${status_lower}" == *"' succeeded"* || "${status_lower}" == *"': succeeded"* ]]; then
             final_status="SUCCEEDED"
             break
-        elif [[ "${status_lower}" == *"failed"* || "${status_lower}" == *"stopped"* ]]; then
+        elif [[ "${status_lower}" =~ \':?\ (failed|stopped|was\ stopped) ]]; then
             final_status="FAILED"
             break
         fi
-        sleep 15
+        sleep 20
     done
+    if [[ "${final_status}" == "TIMEOUT" ]]; then
+        log "Job ${sub_id} exceeded ${timeout_mins} minutes; stopping it."
+        kubectl exec -n "${RAY_NAMESPACE}" "${HEAD_POD}" -c ray-head -- \
+            ray job stop --address http://127.0.0.1:8265 "${sub_id}" >/dev/null 2>&1 || true
+    fi
     CURRENT_RAY_JOB_ID=""
 
-    echo "[TPU CI] Fetching full job logs for ${sub_id}..."
-    kubectl exec -n "${RAY_NAMESPACE}" "${head_pod}" -c ray-head -- \
+    log "Fetching full job logs for ${sub_id}..."
+    kubectl exec -n "${RAY_NAMESPACE}" "${HEAD_POD}" -c ray-head -- \
         ray job logs --address http://127.0.0.1:8265 "${sub_id}" > "${log_file}" 2>&1 || true
-    tail -n 120 "${log_file}"
+    tail -n 150 "${log_file}"
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+        echo "log_file=${log_file}" >> "${GITHUB_OUTPUT}"
+    fi
 
     if [[ "${final_status}" != "SUCCEEDED" ]]; then
-        echo "[TPU CI] ERROR: Job ${sub_id} ended with status ${final_status}" >&2
+        log "ERROR: Job ${sub_id} ended with status ${final_status}" >&2
         exit 1
     fi
 
-    # Verify training convergence & test pass rate in log output
-    python3 - "${suite_name}" "${log_file}" "${SMOKE_TEST}" <<'PY'
-import math
-import re
-import sys
+    python3 tests/special_tpu/verify_tpu_e2e_log.py "${suite_name}" "${log_file}" "${SMOKE_TEST}"
+    log "${suite_name^^} E2E test PASSED!"
+}
 
-suite, log_path, smoke_test = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-text = open(log_path, encoding="utf-8", errors="replace").read()
-
-steps = re.findall(r"step[:\s]+([1-9][0-9]*)", text, flags=re.IGNORECASE)
-if not steps:
-    print(f"[TPU CI] ERROR: No training steps logged in {suite} output.", file=sys.stderr)
-    sys.exit(1)
-
-if suite == "sft":
-    losses = [float(x) for x in re.findall(r"train/loss[:\s]+([0-9.eE+-]+)", text)]
-    val_losses = [float(x) for x in re.findall(r"val/loss[:\s]+([0-9.eE+-]+)", text)]
-    grad_norms = [float(x) for x in re.findall(r"train/grad_norm[:\s]+([0-9.eE+-]+)", text)]
-    if not losses or not val_losses:
-        print("[TPU CI] ERROR: Missing train/loss or val/loss metrics in SFT output.", file=sys.stderr)
-        sys.exit(1)
-    if any(not math.isfinite(g) for g in grad_norms):
-        print("[TPU CI] ERROR: Non-finite train/grad_norm in SFT output.", file=sys.stderr)
-        sys.exit(1)
-    assert losses[-1] < losses[0] * 0.80, (
-        f"[TPU CI] SFT train/loss did not converge sufficiently: {losses[0]:.4f} -> {losses[-1]:.4f}"
-    )
-    assert val_losses[-1] <= val_losses[0] and val_losses[-1] < 0.85, (
-        f"[TPU CI] SFT val/loss did not converge sufficiently: {val_losses[0]:.4f} -> {val_losses[-1]:.4f}"
-    )
-    print(
-        f"[TPU CI] SFT convergence verified: train/loss {losses[0]:.4f} -> {losses[-1]:.4f}, "
-        f"val/loss {val_losses[0]:.4f} -> {val_losses[-1]:.4f}"
-    )
-elif suite == "grpo":
-    if re.search(r"actor/grad_norm[:\s]+(nan|inf)", text, flags=re.IGNORECASE):
-        print("[TPU CI] ERROR: Non-finite actor/grad_norm detected in GRPO output!", file=sys.stderr)
-        sys.exit(1)
-    grad_norms = [float(x) for x in re.findall(r"actor/grad_norm[:\s]+([0-9.eE+-]+)", text)]
-    rewards = [float(x) for x in re.findall(r"critic/rewards/mean[:\s]+([0-9.eE+-]+)", text)]
-    corrs = [float(x) for x in re.findall(r"training/rollout_actor_probs_pearson_corr[:\s]+([0-9.eE+-]+)", text)]
-    val_accs = [
-        float(x)
-        for x in re.findall(r"val-core/openai/gsm8k/acc/mean@1['\"]?:\s*(?:np\.float64\()?([0-9.eE+-]+)", text)
-    ]
-    if not rewards or not grad_norms:
-        print("[TPU CI] ERROR: Missing critic/rewards/mean or actor/grad_norm in GRPO output.", file=sys.stderr)
-        sys.exit(1)
-    assert max(grad_norms) > 0.0, "[TPU CI] GRPO actor/grad_norm was 0.0 on all steps (no gradient flowed)!"
-    min_reward = 0.10 if smoke_test else 0.15
-    assert max(rewards) >= min_reward, f"[TPU CI] GRPO best training reward {max(rewards):.4f} < 0.15 target!"
-    if corrs:
-        assert min(corrs) >= 0.90, (
-            f"[TPU CI] Rollout-Actor logprob Pearson correlation dropped below 0.90: min={min(corrs):.4f}"
-        )
-    if val_accs:
-        min_val_acc = 0.06 if smoke_test else 0.25
-        assert max(val_accs) >= min_val_acc, (
-            f"[TPU CI] GSM8K test pass rate (val-core/openai/gsm8k/acc/mean@1) {max(val_accs):.4f} < {min_val_acc}!"
-        )
-        if not smoke_test and len(val_accs) >= 2:
-            assert val_accs[-1] > val_accs[0], (
-                f"[TPU CI] GSM8K test pass rate did not improve over full run: {val_accs[0]:.4f} -> {val_accs[-1]:.4f}"
-            )
-    print(
-        f"[TPU CI] GRPO convergence & quality verified: best_reward={max(rewards):.4f}, "
-        f"val_acc={val_accs[-1] if val_accs else 'N/A'}, min_corr={min(corrs) if corrs else 'N/A'}, "
-        f"max_grad_norm={max(grad_norms):.4f}"
-    )
-PY
-
-    echo "[TPU CI] ${suite_name^^} E2E test PASSED!"
+run_suite() {
+    local suite="$1"
+    case "${suite}" in
+        smoke)
+            provision_ray_cluster smoke 1 2 8Gi 32 128Gi
+            wait_for_ray_cluster
+            connect_ray_dashboard
+            submit_and_verify_ray_job smoke 15 '{}' python3 tests/special_tpu/tpu_smoke_test.py
+            ;;
+        sft)
+            provision_ray_cluster sft 1 4 16Gi 96 400Gi
+            wait_for_ray_cluster
+            connect_ray_dashboard
+            submit_and_verify_ray_job sft 30 \
+                '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4"}' \
+                bash examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
+            ;;
+        grpo)
+            # Two v6e-4 subslices: trainer on tpu-group-0, vLLM rollout on tpu-group-1
+            # (see TPUPlatform.auto_assign_accelerator_type).
+            provision_ray_cluster grpo 2 4 16Gi 96 400Gi
+            wait_for_ray_cluster
+            connect_ray_dashboard
+            # Disable Qwen3 <think>: with thinking on, 512-token smoke rollouts are all clipped
+            # before "#### <answer>" and the reward is ~0. 8 prompts x 4 samples per step keeps the
+            # training-reward check stable.
+            submit_and_verify_ray_job grpo 40 \
+                '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4"}' \
+                bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
+                +data.apply_chat_template_kwargs.enable_thinking=False \
+                trainer.val_before_train=True \
+                data.val_max_samples=32 \
+                data.train_batch_size=8 \
+                actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+                actor_rollout_ref.rollout.n=4
+            ;;
+        *)
+            echo "Usage: $0 <smoke|sft|grpo|teardown> [suite]" >&2
+            exit 1
+            ;;
+    esac
 }
 
 connect_gke_cluster
-acquire_cluster_lock
-apply_ray_cluster_manifest
 
-case "${MODE}" in
-    sft)
-        submit_and_verify_ray_job "sft" "examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh" 25
-        ;;
-    grpo)
-        submit_and_verify_ray_job "grpo" "examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh" 35
-        ;;
-    all)
-        submit_and_verify_ray_job "sft" "examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh" 25
-        # Recycle pods between SFT and GRPO so all 16 TPU chips start completely clean
-        ensure_clean_tpu_cluster 1
-        submit_and_verify_ray_job "grpo" "examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh" 35
-        ;;
-    *)
-        echo "Usage: $0 [sft|grpo|all]" >&2
-        exit 1
-        ;;
-esac
+if [[ "${MODE}" == "teardown" ]]; then
+    # Safety net for cancelled workflows: delete every cluster created by this CI run.
+    selector="verl-ci/managed=true,verl-ci/run-id=${RUN_ID}"
+    if [[ -n "${2:-}" ]]; then
+        selector="${selector},verl-ci/suite=${2}"
+    fi
+    log "Deleting RayClusters matching ${selector}"
+    delete_ray_clusters "${selector}"
+    exit 0
+fi
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+ensure_kueue_queue
+reap_stale_clusters
+run_suite "${MODE}"
