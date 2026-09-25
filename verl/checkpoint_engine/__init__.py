@@ -89,3 +89,10 @@ try:
     __all__ += ["TPUCheckpointEngine"]
 except ImportError:
     TPUCheckpointEngine = None
+
+try:
+    from .raiden_checkpoint_engine import RaidenCheckpointEngine
+
+    __all__ += ["RaidenCheckpointEngine"]
+except ImportError:
+    RaidenCheckpointEngine = None
