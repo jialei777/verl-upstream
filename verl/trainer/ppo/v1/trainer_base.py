@@ -248,7 +248,11 @@ class PPOTrainer(ABC):
         lora_rank = self.config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
             lora_rank = self.config.actor_rollout_ref.model.get("lora_rank", 0)
-        self.ref_in_actor = lora_rank > 0 or self.config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        self.ref_in_actor = (
+            self.config.actor_rollout_ref.get("ref_in_actor", False)
+            or lora_rank > 0
+            or self.config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         # 1. define actor and rollout class
         if Role.Actor in self.role_worker_mapping:
@@ -810,7 +814,11 @@ class PPOTrainer(ABC):
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        ref_in_actor = (
+            config.actor_rollout_ref.get("ref_in_actor", False)
+            or lora_rank > 0
+            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        )
 
         if not getattr(self, "_enable_hybrid_replicas", True):
             role = Role.Actor
@@ -1096,7 +1104,7 @@ class PPOTrainer(ABC):
             if self.reward_loop_manager.reward_loop_worker_handles is None:
                 self.checkpoint_manager.sleep_replicas()
                 batch = self._compute_reward_colocate(batch)
-                self.checkpoint_manager.update_weights()
+                self.checkpoint_manager.update_weights(self.global_steps)
 
             # 4. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
@@ -1909,8 +1917,12 @@ class PPOTrainer(ABC):
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
-        min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
-        max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+        min_global_steps = np.array([(tag.get("min_global_steps") or 0) for tag in batch.tags], dtype=int)[
+            non_padding_mask
+        ]
+        max_global_steps = np.array([(tag.get("max_global_steps") or 0) for tag in batch.tags], dtype=int)[
+            non_padding_mask
+        ]
 
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None

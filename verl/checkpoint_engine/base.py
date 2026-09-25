@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, Generator
 import ray
 import torch
 
+from verl.plugin.platform import get_platform
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -323,6 +324,14 @@ class CheckpointEngineWorker(Worker):
         self.model_config = model_config
 
         self.server_adapter: BaseRollout = server_adapter
+        if get_platform().device_name == "tpu":
+            self.checkpoint_engine = None
+            self.server_adapter = None
+            self.replica_rank = kwargs.get("replica_rank", 0)
+            self.extra_rollout_args = args
+            self.extra_rollout_kwargs = kwargs
+            return
+
         backend = self.rollout_config.checkpoint_engine.backend
         if backend == "delta_sharded" and self.rollout_config.name not in {"sglang", "vllm"}:
             raise NotImplementedError(
@@ -352,6 +361,8 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
+        if self.checkpoint_engine is None:
+            return
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
         await self.server_adapter.update_weights(
             weights,
@@ -361,16 +372,22 @@ class CheckpointEngineWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        if self.checkpoint_engine is None:
+            return None
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_replica_rank(self) -> int:
         """Get replica rank from the underlying rollout server adapter."""
+        if self.server_adapter is None:
+            return getattr(self, "replica_rank", 0)
         return self.server_adapter.replica_rank
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def is_leader_rank(self) -> bool:
         """Get leader rank flag from the underlying rollout server adapter."""
+        if self.server_adapter is None:
+            return True
         return self.server_adapter.is_leader_rank
 
 
@@ -418,6 +435,17 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+
+        self.raiden_controller = None
+        self.raiden_server = None
+        self.raiden_address = None
+        if self.backend == "raiden":
+            try:
+                from .raiden_checkpoint_engine import setup_raiden_controller
+
+                self.raiden_controller, self.raiden_server, self.raiden_address = setup_raiden_controller()
+            except Exception as e:
+                raise RuntimeError(f"Failed to start embedded RaidenControllerServer on Headnode: {e}") from e
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -507,7 +535,7 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.resume_kv_cache() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(self, global_steps: int = None, **kwargs):
         """Update weights from actor worker group to rollout replicas.
 
         Args:
@@ -519,10 +547,20 @@ class CheckpointEngineManager:
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
             return {}
 
+        if self.backend == "tpu":
+            from .tpu_checkpoint_engine import update_tpu_weights
+
+            return await update_tpu_weights(self, global_steps=global_steps, **kwargs)
+
+        if self.backend == "raiden":
+            from .raiden_checkpoint_engine import update_raiden_weights
+
+            return await update_raiden_weights(self, global_steps=global_steps, **kwargs)
+
         # 1. abort and save all unfinished requests for partial rollout
         await self.abort_replicas()
 
-        # 2. create a temporay worker group for all replicas
+        # 2. create a temporary worker group for all replicas
         workers = []
         for replica in self.replicas:
             workers.extend(replica.workers)

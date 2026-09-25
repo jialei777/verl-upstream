@@ -222,24 +222,30 @@ def concat_tensordict_with_none_bsz(data: list[TensorDict]):
     """Handle concatenation of TensorDicts with empty batch size.
 
     For TensorDicts that contain only metadata (NonTensorData) with no batch
-    dimension, returns the first TensorDict as the concatenation result.
-
-    Args:
-        data: List of TensorDicts, each with empty batch_size (batch_size=[]).
-
-    Returns:
-        The first TensorDict from the list, as metadata concatenation
-        simply preserves the first instance.
-
-    Raises:
-        AssertionError: If any TensorDict has a non-empty batch_size.
-
-    Note:
-        This is used internally by concat_tensordict when handling
-        TensorDicts that contain only non-tensor metadata.
+    dimension, returns the first TensorDict as the concatenation result (or merges
+    per-rank metrics on the CPU driver when running on TPU).
     """
     for d in data:
         assert len(d.batch_size) == 0
+    if len(data) > 1 and "metrics" in data[0]:
+        from verl.plugin.platform import get_platform
+
+        if get_platform().device_name == "tpu":
+            all_metrics = [get(d, "metrics") for d in data]
+            if all(isinstance(m, dict) for m in all_metrics):
+                merged_metrics = {}
+                for k in all_metrics[0].keys():
+                    vals = []
+                    for m in all_metrics:
+                        if k not in m:
+                            continue
+                        v = m[k]
+                        if isinstance(v, list):
+                            vals.extend(v)
+                        else:
+                            vals.append(v)
+                    merged_metrics[k] = vals
+                return get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": merged_metrics})
     # directly return the first meta info
     return data[0]
 
