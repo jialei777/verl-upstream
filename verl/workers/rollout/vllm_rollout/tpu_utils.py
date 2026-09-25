@@ -36,9 +36,40 @@ from verl.utils.device import get_resource_name
 TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
 TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
 TPU_ROLLOUT_BASE_PORT = 8070
-TPU_HOST_BOUNDS_VAL = "2,4,1"
-TPU_CHIPS_PER_HOST_BOUNDS_VAL = "1,1,1"
-CHIPS_PER_HOST_VAL = "4"
+DEFAULT_TPU_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
+    4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
+}
+
+
+def _resolve_tpu_topology_bounds(
+    total_chips: int, num_nodes: int, fallback_map: dict | None = None
+) -> tuple[str, str, str, str]:
+    """Dynamically resolves (topology, host_bounds, chips_per_host_bounds, chips_per_host) for TPU slices."""
+    topo_map = dict(fallback_map) if fallback_map else {}
+    topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
+
+    topology = os.environ.get("TORCH_TPU_TOPOLOGY") or topo_map.get(total_chips, "1,1,1")
+    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+    chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+    if total_chips <= 4:
+        host_bounds = "1,1,1"
+        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+    else:
+        host_bounds = topology
+        chips_per_host_bounds = "1,1,1"
+
+    return topology, host_bounds, chips_per_host_bounds, chips_per_host
+
+
 # -------------------------------------------
 
 try:
@@ -53,10 +84,7 @@ except ImportError:
 
 # Fallback imports for TPU vLLM platforms
 try:
-    try:
-        from vllm_torchtpu.executors import ray_distributed_executor
-    except ImportError:
-        from tpu_inference.executors import ray_distributed_executor
+    from vllm_torchtpu.executors import ray_distributed_executor
 except ImportError:
     ray_distributed_executor = None
 
@@ -72,18 +100,12 @@ except ImportError:
     vllm_envs = None
 
 try:
-    try:
-        import vllm_torchtpu.envs as tpu_envs
-    except ImportError:
-        import tpu_inference.envs as tpu_envs
+    import vllm_torchtpu.envs as tpu_envs
 except ImportError:
     tpu_envs = None
 
 try:
-    try:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-    except ImportError:
-        from tpu_inference.worker.tpu_worker import TPUWorker
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
 except ImportError:
     TPUWorker = None
 
@@ -125,12 +147,9 @@ try:
     from vllm_torchtpu.platforms.tpu_platform import get_distributed_init_method
 except ImportError:
     try:
-        from tpu_inference.platforms.tpu_platform import get_distributed_init_method
+        from vllm.utils.network_utils import get_distributed_init_method
     except ImportError:
-        try:
-            from vllm.utils.network_utils import get_distributed_init_method
-        except ImportError:
-            get_distributed_init_method = None
+        get_distributed_init_method = None
 
 try:
     from vllm.platforms import current_platform
@@ -247,36 +266,6 @@ def patch_vllm_for_tpu() -> None:
     except Exception:
         pass
 
-    try:
-        import tpu_inference.worker.tpu_worker as tw
-
-        if hasattr(tw, "TPUWorker") and not getattr(tw.TPUWorker, "_patched_dynamo", False):
-            orig_determine = tw.TPUWorker.determine_available_memory
-
-            def patched_determine(self, *args, **kwargs):
-                patch_vllm_for_tpu()
-                return orig_determine(self, *args, **kwargs)
-
-            tw.TPUWorker.determine_available_memory = patched_determine
-            tw.TPUWorker._patched_dynamo = True
-    except Exception:
-        pass
-
-    try:
-        import tpu_inference.runner.tpu_runner as tr
-
-        if hasattr(tr, "TPUModelRunner") and not getattr(tr.TPUModelRunner, "_patched_dynamo", False):
-            orig_profile = tr.TPUModelRunner.profile_run
-
-            def patched_profile(self, *args, **kwargs):
-                patch_vllm_for_tpu()
-                return orig_profile(self, *args, **kwargs)
-
-            tr.TPUModelRunner.profile_run = patched_profile
-            tr.TPUModelRunner._patched_dynamo = True
-    except Exception:
-        pass
-
     def dummy_reset_encoder_cache(*args, **kwargs):
         pass
 
@@ -344,14 +333,26 @@ def patch_vllm_for_tpu() -> None:
                         pass
                 return 0
 
-            if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
-                state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
-            if isinstance(state_dict_ref, str):
-                state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
-            elif isinstance(state_dict_ref, ray.ObjectRef):
-                state_dict_data = ray.get(state_dict_ref)
+            if isinstance(state_dict_ref, list) and all(isinstance(r, ray.ObjectRef) for r in state_dict_ref):
+                grouped_dict = {}
+                for chunk_ref in state_dict_ref:
+                    chunk_obj = ray.get(chunk_ref)
+                    if isinstance(chunk_obj, tuple) and len(chunk_obj) == 2:
+                        group_name, group_sd = chunk_obj
+                        grouped_dict[group_name] = group_sd
+                    elif isinstance(chunk_obj, dict) and "grouped" in chunk_obj:
+                        grouped_dict.update(chunk_obj["grouped"])
+                    del chunk_obj
+                state_dict_data = {"grouped": grouped_dict}
             else:
-                state_dict_data = state_dict_ref
+                if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
+                    state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
+                if isinstance(state_dict_ref, str):
+                    state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
+                elif isinstance(state_dict_ref, ray.ObjectRef):
+                    state_dict_data = ray.get(state_dict_ref)
+                else:
+                    state_dict_data = state_dict_ref
 
             # Convert NumPy arrays back to native PyTorch CPU tensors
             if isinstance(state_dict_data, dict) and "grouped" in state_dict_data:
@@ -550,8 +551,7 @@ def patch_vllm_for_tpu() -> None:
             getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", None),
         )
         if _topo_map is not None:
-            _topo_map[4] = "2,2,1"
-            _topo_map[8] = "2,4,1"
+            _topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -882,26 +882,11 @@ def patch_vllm_for_tpu() -> None:
             logger.info(f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {sb_addresses_str}")
 
             total_chips = len(self.workers)
-            if total_chips == 32:
-                topology = "4,8,1"
-                host_bounds = "4,8,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 8:
-                topology = "2,4,1"
-                host_bounds = "2,4,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 4:
-                topology = "2,2,1"
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "2,2,1" if num_nodes == 1 else "1,1,1"
-                chips_per_host = "4"
-            else:
-                topology = TPU_TOPOLOGY_MAP_local.get(total_chips, "1,1,1")
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
+            topology, host_bounds, chips_per_host_bounds, chips_per_host = _resolve_tpu_topology_bounds(
+                total_chips=total_chips,
+                num_nodes=num_nodes,
+                fallback_map=TPU_TOPOLOGY_MAP_local,
+            )
 
             rank_0_node_id = unique_node_ids[0]
             rank_0_worker_index = node_workers[rank_0_node_id][0]
@@ -1112,12 +1097,9 @@ try:
     from vllm_torchtpu.platforms.tpu_platform import get_env_vars_to_copy
 except ImportError:
     try:
-        from tpu_inference.platforms.tpu_platform import get_env_vars_to_copy
+        from vllm.ray.ray_env import get_env_vars_to_copy
     except ImportError:
-        try:
-            from vllm.ray.ray_env import get_env_vars_to_copy
-        except ImportError:
-            get_env_vars_to_copy = None
+        get_env_vars_to_copy = None
 
 
 def is_tpu_vllm_run() -> bool:
@@ -1387,10 +1369,7 @@ def prepare_tpu_server_args(args: dict):
     os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     try:
-        try:
-            import vllm_torchtpu.envs as tpu_envs
-        except ImportError:
-            import tpu_inference.envs as tpu_envs
+        import vllm_torchtpu.envs as tpu_envs
 
         tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
         if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
