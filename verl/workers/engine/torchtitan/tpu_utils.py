@@ -200,6 +200,17 @@ def pad_packed_inputs_for_tpu(
     causal_mask = idx.unsqueeze(2) >= idx.unsqueeze(1)
     attention_mask_cpu = (same_seq_mask & causal_mask).unsqueeze(1)
 
+    # `labels_cpu` was built with a plain roll over the whole packed buffer, so the label at the
+    # last position of every document is the *first token of the next document* (and the label at
+    # the very last position wraps around to the first token of the buffer). Downstream extraction
+    # (`response_from_nested` / `tpu_no_padding_2_padding`) gathers only
+    # [seq_end - response_len - 1, seq_end - 1), so those positions are already excluded from both
+    # `old_log_probs` and the PPO loss. Zero them anyway so the cross-document leak cannot reach a
+    # future consumer that iterates the full packed length. This is a fixed-shape elementwise op,
+    # so it does not introduce a new XLA shape.
+    same_doc_as_next = seq_ids == torch.roll(seq_ids, shifts=-1, dims=1)
+    labels_cpu = torch.where(same_doc_as_next, labels_cpu, torch.zeros_like(labels_cpu))
+
     # Bucket max_response_len on micro_batch so ppo_loss operates on static bucketed shapes.
     if "responses" in micro_batch.keys() and getattr(micro_batch["responses"], "is_nested", False):
         resp_lens = micro_batch["responses"].offsets().diff().cpu()
