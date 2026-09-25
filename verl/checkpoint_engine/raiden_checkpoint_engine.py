@@ -192,6 +192,7 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self.backend = "raiden"
         self.verify_parity = kwargs.get("verify_parity", False)
         self.parallelism = kwargs.get("parallelism", 8)
+        self.tp_size = kwargs.get("tp_size", kwargs.get("tensor_parallel_size", self.parallelism))
         self._trainer_raiden_ws = None
         self._trainer_chunks = []
         self._controller_addr = None
@@ -251,36 +252,10 @@ class RaidenCheckpointEngine(CheckpointEngine):
         # Materialize weights into dictionary in a single pass and filter tied embeddings
         weight_dict = dict(filter_tied_embeddings(weights.items() if hasattr(weights, "items") else weights))
 
-        # Pack un-fused QKV and MLP projections to match vLLM's MergedColumnParallelLinear modules if present
-        FUSION_RULES = [
-            (
-                ".self_attn.qkv_proj.weight",
-                [".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight"],
-            ),
-            (".mlp.gate_up_proj.weight", [".mlp.gate_proj.weight", ".mlp.up_proj.weight"]),
-        ]
+        # Trainer sends pure canonical un-fused model weights directly
+        unfused_weights = {k: _unwrap_tensor(v) for k, v in weight_dict.items()}
 
-        packed_weights = {}
-        consumed_keys = set()
-        for target_suffix, src_suffixes in FUSION_RULES:
-            primary_src = src_suffixes[0]
-            for k in list(weight_dict.keys()):
-                if primary_src in k:
-                    layer_src_keys = [k.replace(primary_src, s) for s in src_suffixes]
-                    if all(src_k in weight_dict for src_k in layer_src_keys):
-                        target_key = k.replace(primary_src, target_suffix)
-                        packed_weights[target_key] = torch.cat(
-                            [_unwrap_tensor(weight_dict[src_k]) for src_k in layer_src_keys], dim=0
-                        )
-                        consumed_keys.update(layer_src_keys)
-
-        # Retain all remaining model weights that were not part of the fused projection layers
-        # (e.g. embed_tokens, o_proj, down_proj, layernorms, etc.), unwrapped to raw local tensors
-        for k, v in weight_dict.items():
-            if k not in consumed_keys:
-                packed_weights[k] = _unwrap_tensor(v)
-
-        sorted_weights = sorted(packed_weights.items(), key=lambda x: x[0])
+        sorted_weights = sorted(unfused_weights.items(), key=lambda x: x[0])
         valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device("tpu"))
 
         torch_tpu_sync.synchronize(wait=True)
@@ -389,27 +364,19 @@ class RaidenCheckpointEngine(CheckpointEngine):
         )
         logger.info(f"Trainer Rank {self.rank}: D2H DMA transfer completed in {t_d2h:.4f}s")
 
-        # Compute deterministic stats & norms across all sent tensors in background (Rank 0 only)
+        # Compute deterministic stats & norms across all sent tensors directly on main thread (Rank 0 only)
         if compute_stats and self.registry is not None and self.is_master:
             try:
-                loop = asyncio.get_event_loop()
-                loop.run_in_executor(None, self._record_stats_bg, step_key, valid_weights)
-            except Exception as sched_err:
-                logger.warning(f"Failed to schedule stats recording: {sched_err}")
-
-    def _record_stats_bg(self, step_key: int, tensor_items) -> None:
-        """Background worker thread to calculate stats and post per-rank stats to registry."""
-        try:
-            trainer_stats = compute_tensor_stats(tensor_items)
-            trainer_stats["rank"] = self.rank
-            # Record master stats directly in TPUWeightRegistry
-            ray.get(self.registry.set_stats.remote(step_key, trainer_stats))
-            logger.info(
-                f"[RAIDEN PARITY] Successfully stored trainer rank {self.rank} stats for step {step_key}: "
-                f"L1={trainer_stats['l1_norm']:.4f}, numel={trainer_stats['total_numel']}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to record trainer rank {self.rank} stats in TPUWeightRegistry: {e}")
+                trainer_stats = compute_tensor_stats(valid_weights)
+                trainer_stats["rank"] = self.rank
+                # Post master stats to TPUWeightRegistry
+                self.registry.set_stats.remote(step_key, trainer_stats)
+                logger.info(
+                    f"[RAIDEN PARITY] Successfully stored trainer rank {self.rank} stats for step {step_key}: "
+                    f"L1={trainer_stats['l1_norm']:.4f}, numel={trainer_stats['total_numel']}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record trainer rank {self.rank} stats in TPUWeightRegistry: {e}")
 
     @torch.no_grad()
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs):
