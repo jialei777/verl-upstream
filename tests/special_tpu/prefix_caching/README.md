@@ -137,32 +137,4 @@ logs/
         └── 0.jsonl
 ```
 
-`no-ray-job-id` is used when Ray reports a null driver job ID, as it does for this
-standalone example. TP and DP come from the engine log; no trainer topology is
-included. The time suffix is the UTC download time. Each invocation creates a new
-export. Generated artifacts are ignored by Git. No plots or Markdown reports are
-created in the run folder.
-
-`generations/rollout/0.jsonl` contains one record per response: **32 records for
-eight prompts with four responses each**. Each record repeats its prompt in
-`input` and stores the complete logged response in `output`. It also includes
-`step` (test round, currently zero), `uid` (unique to each response),
-`prompt_row`, `sample_index`, `prompt_tokens`, `cached_tokens`, `finish_reason`,
-and `submission_id`. Newlines in responses are escaped inside each JSON line.
-The collector reconstructs these records from the existing `PROMPT` and `OUTPUT`
-log entries, so it also works for jobs completed before the collector was added.
-It checks that all prompt/response records are present and the cache-token totals
-agree with the final `GSM8K_DONE` line.
-
-`input` is the logged user prompt, including the answer-format instruction; it
-does not include the tokenizer's chat-template tokens. The test does not record
-reference answers, reward scores, response token IDs, or token log probabilities,
-so those fields are not invented in the export. `summary.json` contains response
-counts, finish reasons, and the total reported cached tokens.
-
-The archive contains this job's driver/supervisor logs and retained submitted
-scripts. These files must still exist on the execution pod for a full collection.
-The shared `/tmp/hybrid_pool_gsm8k/prefix_on.log` or `prefix_off.log` can be
-overwritten by another run; the collector includes it only when it matches this
-job. Missing submitted scripts or a missing/mismatched shared log are reported
-in the download manifest. `ray-job.log` remains the source for the JSONL export.
+The generated bad response can be observed in `logs/prefix_cache_*/generations/rollout/0.jsonl`
