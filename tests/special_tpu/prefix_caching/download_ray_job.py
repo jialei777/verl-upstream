@@ -8,12 +8,156 @@ import shlex
 import subprocess
 import sys
 import tarfile
+from collections import Counter
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 
-from prefix_cache_log import parse_log
+_PROMPT_END = ' Let\'s think step by step and output the final answer after "####".'
+_MARKER = re.compile(r"^(?:PROMPT|OUTPUT|GSM8K_DONE)(?: [^\n]*)?$", re.MULTILINE)
+_PROMPT = re.compile(r"PROMPT row=(\d+) tokens=(\d+)")
+_OUTPUT = re.compile(r"OUTPUT round=(\d+) row=(\d+) sample=(\d+) cached_tokens=(\d+) finish=(\S+)")
+_DONE = re.compile(r"GSM8K_DONE cached_tokens=(\d+)")
+_ENGINE_LOG = re.compile(
+    r"^(?:\((?:Worker[^ ]*|EngineCore[^ ]*) pid=\d+\)|(?:INFO|WARNING|ERROR) \d\d-\d\d )", re.MULTILINE
+)
+
+
+def _configuration(text):
+    lines = re.findall(r"^GSM8K (.+)$", text, re.MULTILINE)
+    if len(lines) != 1:
+        raise ValueError("Expected exactly one GSM8K configuration line")
+    config = {}
+    for field in lines[0].split():
+        key, separator, value = field.partition("=")
+        if not separator or key in config:
+            raise ValueError(f"Malformed or duplicate GSM8K configuration field: {field}")
+        config[key] = value
+    required = {
+        "model",
+        "prefix_cache",
+        "block_size",
+        "seed",
+        "cacheable_prompts",
+        "temperature",
+        "requested_temperature",
+    }
+    if missing := required - config.keys():
+        raise ValueError(f"Missing GSM8K configuration fields: {sorted(missing)}")
+    if config["prefix_cache"] not in ("True", "False"):
+        raise ValueError("Invalid prefix_cache setting in GSM8K configuration")
+    config["prefix_cache"] = config["prefix_cache"] == "True"
+    try:
+        for key in ("block_size", "seed", "cacheable_prompts"):
+            config[key] = int(config[key])
+        for key in ("temperature", "requested_temperature"):
+            config[key] = float(config[key])
+            if not isfinite(config[key]) or config[key] < 0:
+                raise ValueError(f"Invalid {key}")
+    except ValueError as error:
+        raise ValueError(f"Invalid numeric GSM8K configuration: {error}") from error
+    if config["block_size"] <= 0 or not 0 <= config["cacheable_prompts"] <= 8:
+        raise ValueError("Invalid block size or cacheable prompt count")
+
+    engines = re.findall(r"^.*Initializing a V1 LLM engine .*with config: (.+)$", text, re.MULTILINE)
+    if len(engines) != 1:
+        raise ValueError("Expected exactly one vLLM engine configuration line with TP, PP, and DP sizes")
+    for key in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size"):
+        match = re.search(rf"(?:^|, ){key}=(\d+)(?:,|$)", engines[0])
+        if match is None or int(match[1]) <= 0:
+            raise ValueError(f"Missing or invalid {key} in engine configuration")
+        config[key] = int(match[1])
+    if version := re.search(r"Initializing a V1 LLM engine \(v([^)]*)\)", text):
+        config["vllm_version"] = version[1]
+    return config
+
+
+def parse_log(text):
+    """Return (configuration, generation records, summary), or raise ValueError.
+
+    This accepts the probe's current format: eight prompts, four samples per
+    prompt, and one cold round numbered zero. It removes only the newline added
+    by print() from each answer. The raw job log remains the source of truth;
+    an interleaved engine message in an answer is rejected as ambiguous.
+    """
+    config = _configuration(text)
+    markers = list(_MARKER.finditer(text))
+    expected_count = 8 + 32 + 1
+    if len(markers) != expected_count:
+        raise ValueError(f"Expected 8 prompts, 32 outputs, and GSM8K_DONE; found {len(markers)} record markers")
+
+    prompts = {}
+    records = []
+    for index, marker in enumerate(markers):
+        header = marker[0]
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        if text[marker.end() : marker.end() + 1] != "\n":
+            raise ValueError(f"Incomplete record header: {header}")
+        body = text[marker.end() + 1 : end]
+        if index < 8:
+            match = _PROMPT.fullmatch(header)
+            if match is None or int(match[1]) != index:
+                raise ValueError(f"Expected PROMPT row={index}; got {header}")
+            # Worker warnings may follow the final prompt while generate() runs.
+            # The appended instruction gives an exact end boundary for the prompt.
+            boundary = body.find(_PROMPT_END + "\n")
+            if boundary < 0:
+                raise ValueError(f"Missing complete prompt text for row {index}")
+            prompt = body[: boundary + len(_PROMPT_END)]
+            tokens = int(match[2])
+            if tokens <= 0:
+                raise ValueError(f"Invalid prompt token count for row {index}")
+            prompts[index] = (prompt, tokens)
+        elif index < 40:
+            match = _OUTPUT.fullmatch(header)
+            if match is None:
+                raise ValueError(f"Missing or malformed OUTPUT record: {header}")
+            round_index, row, sample, hits = map(int, match.group(1, 2, 3, 4))
+            expected_row, expected_sample = divmod(index - 8, 4)
+            if (round_index, row, sample) != (0, expected_row, expected_sample):
+                raise ValueError(f"Missing, duplicate, or reordered OUTPUT record: {header}")
+            if not body.endswith("\n") or _ENGINE_LOG.search(body):
+                raise ValueError(f"Incomplete output or interleaved engine log for row {row}, sample {sample}")
+            prompt, tokens = prompts[row]
+            if hits > tokens or hits % config["block_size"] != 0:
+                raise ValueError(f"Invalid cached token count for row {row}, sample {sample}: {hits}")
+            if not config["prefix_cache"] and hits:
+                raise ValueError("Prefix caching is disabled but an output reports cached tokens")
+            records.append(
+                {
+                    "input": prompt,
+                    "output": body[:-1],
+                    "step": round_index,
+                    "prompt_row": row,
+                    "sample_index": sample,
+                    "prompt_tokens": tokens,
+                    "cached_tokens": hits,
+                    "finish_reason": match[5],
+                    "source": "ray_job_logs",
+                }
+            )
+        else:
+            match = _DONE.fullmatch(header)
+            if match is None:
+                raise ValueError("Missing GSM8K_DONE completion marker")
+            total_hits = int(match[1])
+
+    if sum(tokens > config["block_size"] for _, tokens in prompts.values()) != config["cacheable_prompts"]:
+        raise ValueError("Logged cacheable prompt count disagrees with prompt token counts")
+    if sum(record["cached_tokens"] for record in records) != total_hits:
+        raise ValueError("GSM8K_DONE cached token total disagrees with output records")
+    summary = {
+        "num_prompts": len(prompts),
+        "num_outputs": len(records),
+        "samples_per_prompt": 4,
+        "cached_tokens": total_hits,
+        "outputs_with_cache_hits": sum(record["cached_tokens"] > 0 for record in records),
+        "finish_reasons": dict(Counter(record["finish_reason"] for record in records)),
+    }
+    return config, records, summary
+
 
 # Run inside the execution pod using only the standard library. Nothing is
 # written on the pod: the archive is streamed to the local collector.

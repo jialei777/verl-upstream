@@ -1,11 +1,11 @@
 # TPU prefix-caching issue
 
-This manual, standalone vLLM-TPU test can run with prefix caching
-**enabled or disabled** to help investigate incorrect generated responses.
+This is a standalone vLLM-TPU test can run with prefix caching
+**enabled or disabled** to reproduce incorrect generated responses.
 
 The three test scripts are adapted from `vllm-torchtpu/examples/`. Keep them together:
 the shell launcher calls `hybrid_pool_e2e.py`, which imports
-`hybrid_pool_gsm8k.py` for this test.
+`hybrid_pool_gsm8k.py` for this test. `hybrid_pool_e2e.py` is directly copied from `https://github.com/vllm-project/vllm-torchtpu/blob/fb1387ec3e7d46ba62b2de74756dec4d50334575/examples/hybrid_pool_e2e.py`
 
 ## Requirements
 
@@ -14,10 +14,7 @@ the shell launcher calls `hybrid_pool_e2e.py`, which imports
 - A Ray cluster reachable at `http://127.0.0.1:23334`, with the `TPU` and
   `rollout-0` resources requested by the launch command. Set up the dashboard
   connection or port forwarding before submitting the job.
-- A compatible vLLM and vllm-torchtpu environment on the Ray execution node,
-  including the Hugging Face `datasets` package. These scripts do not install
-  the runtime.
-- Access to download `Qwen/Qwen3-0.6B` and the `openai/gsm8k` dataset, or cached
+- Access to download `Qwen/Qwen3-0.6B` and the `gsm8k` dataset, or cached
   copies available to the runtime.
 
 ## Container image
@@ -78,22 +75,24 @@ example, replace that argument with the following to change the log directory:
 --runtime-env-json '{"excludes":["logs/","__pycache__/"],"env_vars":{"E2E_GSM8K_RESULT_DIR":"/tmp/my-prefix-test"}}'
 ```
 
-Set `PYTHON` in the same `env_vars` object to select a different interpreter;
-that interpreter path must exist on the Ray execution node.
-
 ## Download a finished job
+
+`download_ray_job.py` contains both the artifact downloader and the log parser
+in one file. It downloads the job artifacts, validates the prompt/response
+records, and exports them to `generations/rollout/0.jsonl`.
 
 Keep the dashboard port forwarding running. The collector needs local `kubectl`
 access to the same cluster and Python 3.12 or later. It uses the Python standard
 library, so a local Ray, vLLM, or datasets installation is not required for
-downloading. `uv` can select the Python interpreter.
+downloading. The command below uses `uv`'s default Python interpreter, which must
+meet this version requirement.
 
 Run this from the checkout to collect the completed example job:
 
 ```bash
 cd ~/verl-upstream-top-of-main-branch-original
 
-uv run --no-project --python 3.12 \
+uv run --no-project \
   tests/special_tpu/prefix_caching/download_ray_job.py \
   raysubmit_DKk2dPpHaiKwSrYb \
   --address http://127.0.0.1:23334 \
@@ -167,6 +166,3 @@ The shared `/tmp/hybrid_pool_gsm8k/prefix_on.log` or `prefix_off.log` can be
 overwritten by another run; the collector includes it only when it matches this
 job. Missing submitted scripts or a missing/mismatched shared log are reported
 in the download manifest. `ray-job.log` remains the source for the JSONL export.
-
-The downloader uses the [Ray Jobs REST API](https://docs.ray.io/en/latest/cluster/running-applications/job-submission/rest.html)
-for job metadata and output, and `kubectl exec` to read the retained pod files.
