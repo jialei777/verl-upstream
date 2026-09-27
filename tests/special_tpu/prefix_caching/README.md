@@ -1,7 +1,7 @@
 # TPU prefix-caching issue
 
 This is a standalone vLLM-TPU test can run with prefix caching
-**enabled or disabled** to reproduce incorrect generated responses.
+**enabled** to reproduce incorrect generated responses.
 
 The three test scripts are adapted from `vllm-torchtpu/examples/`. Keep them together:
 the shell launcher calls `hybrid_pool_e2e.py`, which imports
