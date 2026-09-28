@@ -526,6 +526,15 @@ async def update_raiden_weights(
     await asyncio.gather(*install_futures)
     t_install = time.perf_counter() - t_install_start
 
+    # Drop prefix/KV cache computed with the old weights and propagate the step, same as the tpu backend.
+    cache_and_step_futures = []
+    for replica in manager.replicas:
+        cache_and_step_futures.append(replica.server_handle.clear_kv_cache.remote())
+        if global_steps is not None:
+            cache_and_step_futures.append(replica.server_handle.set_global_steps.remote(global_steps))
+    if cache_and_step_futures:
+        await asyncio.gather(*cache_and_step_futures)
+
     t_total = time.perf_counter() - t_total_start
 
     # 5. Parity Verification (Optional, default=False)
