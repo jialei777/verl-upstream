@@ -1,61 +1,35 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
+# GRPO | Qwen3-4B | GSM8K | TorchTitan Training (Full FSDP) & vLLM Rollout | TPU v6e-8 x2 Slices
 # V1 PPOTrainer (Separate Async Overlap)
-#
-# By default this runs a realistic 100-step GRPO job whose reward curve actually
-# moves. Set SMOKE_TEST=1 for the 5-step configuration used to validate that the
-# stack comes up (it trains nothing useful).
-#
-# The settings that separate the two modes, and why they matter:
-#
-#   rollout.n              2  -> 8     GRPO estimates the advantage as the spread of
-#                                      rewards *within* a group of samples for the same
-#                                      prompt. With n=2 the group is almost always all-
-#                                      correct or all-wrong, the advantage collapses to
-#                                      zero and no gradient flows.
-#   train_batch_size       4  -> 32    4 prompts/step is far too noisy to show a trend.
-#   max_response_length  512  -> 1024  At 512 the smoke test truncated 87.5% of responses
-#                                      (`response_length/clip_ratio: 0.875`), so the model
-#                                      was cut off before emitting the `#### <answer>`
-#                                      line and scored zero regardless of correctness.
-#   total_training_steps   5  -> 100   Enough steps for the reward curve to move.
-#
-# Parallelism: the actor runs pure FSDP (tensor_parallel_size=1,
-# data_parallel_shard_size=8). Do not re-enable tensor parallelism without re-testing.
-# Under tensor_parallel_size=2 the actor produced non-finite gradients on most steps, and
-# because optimizer_step() silently skips the update when grad_norm is not finite, the job
-# still reported SUCCEEDED while the policy never changed. The same smoke config gives
-# grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and inf / 8.3e37 / 3.8e24 at tp=2.
 
 set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
-export VLLM_USE_V1=1
+export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
-# JAX/XLA Launch Barrier & Compilation Configuration
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536"
-export XLA_FLAGS="--xla_disable_hlo_passes=instruction-fusion,fusion-merger,multi-output-fusion,horizontal-fusion"
+# JAX/XLA Launch Barrier Configuration
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
-    exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_fast_smoke_test}"
+    exp_name="${EXPERIMENT_NAME:-qwen3_4b_fast_smoke_test}"
     TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
     VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-4}"
     VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-8}"
     PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
-    ROLLOUT_N="${ROLLOUT_N:-2}"
-    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
+    ROLLOUT_N="${ROLLOUT_N:-4}"
+    MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-768}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
     TEST_FREQ="${TEST_FREQ:-2}"
     VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 else
-    exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_gsm8k}"
+    exp_name="${EXPERIMENT_NAME:-qwen3_4b_gsm8k_fsdp}"
     TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
     VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
     VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-128}"
@@ -73,7 +47,7 @@ project_name='verl_tpu_grpo'
 
 # Paths
 RAY_DATA_HOME="/data/jialei"
-MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
+MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-4B}"
 
 TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
@@ -86,49 +60,22 @@ export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
 export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
+TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 
-# Sequence budget. max_model_len must cover prompt + response, otherwise vLLM
-# silently truncates the generation and the reward is always zero.
+# Sequence budget
 MAX_PROMPT_LEN=512
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 
-# Actor parallelism. Pure FSDP is the only configuration that has been validated
-# on TPU; see the note at the top of this file before changing these.
+# Actor parallelism (default: Full FSDP across all 8 trainer chips: tp=1, dp_shard=8)
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-8}"
+DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE))
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 
-if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
-    set +x
-    echo "=============================================================================" >&2
-    echo "WARNING: tensor_parallel_size=${TENSOR_PARALLEL_SIZE} is NOT supported on TPU." >&2
-    echo "  Tensor parallelism has not been properly tested with this stack and is known" >&2
-    echo "  to produce non-finite (nan/inf) actor gradients. Because optimizer_step()" >&2
-    echo "  skips the update whenever grad_norm is not finite, the job will still report" >&2
-    echo "  SUCCEEDED while the policy silently never trains." >&2
-    echo "  Use TENSOR_PARALLEL_SIZE=1 with DATA_PARALLEL_SHARD_SIZE=<num actor chips>." >&2
-    echo "=============================================================================" >&2
-    set -x
-fi
-
-# Off-policy correction (truncated importance sampling).
-#
-# This script runs verl's decoupled PPO regime: trainer_mode=separate_async with
-# num_warmup_batches=1 keeps one rollout batch in flight, so data is sampled by vLLM under
-# theta_{t-1} while old_log_probs are recomputed by torchtitan under theta_t
-# (training/off_policy/trajectory_staleness/mean = 1.0 on every step). That regime requires
-# pi_old / pi_rollout importance weights, but algorithm/rollout_correction.yaml defaults to
-# rollout_is=null.
-#
-# Without IS weights nothing else acts as a trust region: ppo_mini_batch_size == train_batch_size
-# means exactly one optimizer step per batch, so the ratio is identically 1 and actor/ppo_kl and
-# actor/pg_clipfrac are 0.0 on every single step. The only other trust region, kl_loss_coef=0.001,
-# contributes ~0.004 against a pg_loss of ~0.03, i.e. nothing.
-#
-# Failure mechanism: as the policy sharpens, one lr=1e-6 step moves the distribution far enough
-# that tokens happily sampled by the stale rollout policy get near-zero probability under the
-# training policy. Their d/dtheta log pi blows up like 1/p, grad_norm goes 1.4 -> 13 -> 125 -> 363,
-# and the policy is destroyed. Token-level TIS assigns those tokens weight
-# pi_old/pi_rollout ~ 0 and removes them from the gradient instead of letting them dominate it.
+# Off-policy correction (truncated importance sampling). Required, not optional: this pipeline
+# runs verl's decoupled regime with one batch in flight, so rollouts come from theta_{t-1} while
+# old_log_probs are recomputed under theta_t. Without IS weights the reward peaks around step 50
+# and then collapses (grad_norm 0.4 -> 363, rollout/training logprob correlation 0.98 -> 0.28).
+# See run_qwen3_0_6b_torchtitan.sh for the full derivation.
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
@@ -186,8 +133,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
-    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \

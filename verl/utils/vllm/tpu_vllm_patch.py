@@ -109,7 +109,7 @@ def _tpu_runtime_present() -> bool:
 
     ``VERL_PLATFORM`` is the cheap signal, but it does not reach every process
     that matters. The vLLM TPU executor reuses *pooled* Ray workers —
-    ``tpu_inference/executors/ray_distributed_executor.py`` creates
+    ``vllm_torchtpu/executors/ray_distributed_executor.py`` creates
     ``RayWorkerWrapper`` with no ``runtime_env`` — so those workers were started
     before the job existed and see ``VERL_PLATFORM`` unset, even though they are
     precisely the processes that compile and execute the model.

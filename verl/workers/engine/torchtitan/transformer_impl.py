@@ -58,8 +58,10 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     compute_global_batch_num_tokens,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
+    safe_to_padded_tensor,
     synchronize_tpu_loss,
     unwrap_metadata,
+    vocab_parallel_logprobs_from_logits,
 )
 from verl.workers.engine.torchtitan.utils import (
     NoOpDataLoader,
@@ -465,6 +467,8 @@ class TorchTitanEngine(BaseEngine):
             pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
 
         if isinstance(pred, DTensor):
+            if get_device_name() == "tpu" and self.parallel_dims.tp_enabled:
+                return pred
             pred = pred.full_tensor()
         return pred
 
@@ -712,9 +716,9 @@ class TorchTitanEngine(BaseEngine):
             # TODO: cast fp32 to bf16 to reduce weight sync overhead, need more fine-grained control, e.g MoE gate
             for name, param in dense.items():
                 if isinstance(param, DTensor):
-                    yield name, param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                    yield name, param.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
                 else:
-                    yield name, param
+                    yield name, param.to(torch.bfloat16, non_blocking=True)
             # One stack at a time: the gathered (num_experts, ...) tensor is the peak allocation here.
             for stack, slots in expert_stacks:
                 full = stack.to(device, non_blocking=True)
@@ -812,25 +816,20 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             if get_device_name() == "tpu":
                 max_seq_len = bucket_length(max_seq_len)
 
+            to_padded_fn = safe_to_padded_tensor if get_device_name() == "tpu" else torch.nested.to_padded_tensor
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0)
-            input_ids = torch.nested.to_padded_tensor(
-                input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
-            )
+            input_ids = to_padded_fn(input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len))
 
             if position_ids.dim() == 3:
-                position_ids = torch.nested.to_padded_tensor(
+                position_ids = to_padded_fn(
                     position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
                 ).transpose(0, 1)
             else:
-                position_ids = torch.nested.to_padded_tensor(
-                    position_ids, padding=0, output_size=(batch_size, max_seq_len)
-                )
+                position_ids = to_padded_fn(position_ids, padding=0, output_size=(batch_size, max_seq_len))
 
             attention_mask_list = [torch.ones_like(t, dtype=torch.int32) for t in loss_mask]
             attention_mask = torch.nested.as_nested_tensor(attention_mask_list, layout=torch.jagged)
-            attention_mask = torch.nested.to_padded_tensor(
-                attention_mask, padding=0, output_size=(batch_size, max_seq_len)
-            )
+            attention_mask = to_padded_fn(attention_mask, padding=0, output_size=(batch_size, max_seq_len))
 
         extra_inputs = {
             "positions": position_ids,
@@ -880,20 +879,36 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         input_ids = micro_batch["input_ids"]
         cu_seqlens = input_ids.offsets()
+        if isinstance(logits, DTensor) and not use_remove_padding:
+            # The vocab-parallel path below only covers the packed (remove-padding) layout.
+            logits = logits.full_tensor()
         if use_remove_padding:
             labels = labels.squeeze(0)
-            logits_rmpad = logits.squeeze(0)
-            # PyTorch's autograd doesn't allow in-place modification of views when gradients need to flow back
-            logits_rmpad = logits_rmpad / temperature
+            if isinstance(logits, DTensor):
+                tp_mesh = self.parallel_dims.get_optional_mesh("tp")
+                tp_group = tp_mesh.get_group() if tp_mesh is not None else None
+                log_probs = vocab_parallel_logprobs_from_logits(
+                    logits=logits.squeeze(0),
+                    labels=labels,
+                    temperature=temperature,
+                    tp_group=tp_group,
+                )
+                if calculate_entropy:
+                    # Entropy needs the full vocab; the local shard alone gives a wrong value.
+                    logits_rmpad = logits.full_tensor().squeeze(0) / temperature
+            else:
+                logits_rmpad = logits.squeeze(0)
+                # PyTorch's autograd doesn't allow in-place modification of views when gradients need to flow back
+                logits_rmpad = logits_rmpad / temperature
 
-            inplace_backward = True
-            if calculate_entropy:
-                inplace_backward = False
-            log_probs = logprobs_from_logits(
-                logits=logits_rmpad,
-                labels=labels,
-                inplace_backward=inplace_backward,
-            )
+                inplace_backward = True
+                if calculate_entropy:
+                    inplace_backward = False
+                log_probs = logprobs_from_logits(
+                    logits=logits_rmpad,
+                    labels=labels,
+                    inplace_backward=inplace_backward,
+                )
 
             if calculate_entropy:
                 if not self.engine_config.entropy_checkpointing:

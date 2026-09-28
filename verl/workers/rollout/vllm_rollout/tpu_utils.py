@@ -24,27 +24,55 @@ import sys
 import time
 import types
 from collections import defaultdict
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import ray
+import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl.utils.device import get_resource_name
+from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension as _BaseWorkerExtension
 
 # --- Google TPU specific global constants ---
 TPU_WEIGHT_REGISTRY_ACTOR_NAME = "TPUWeightRegistry"
 TPU_WEIGHT_REGISTRY_NAMESPACE = "verl"
 TPU_ROLLOUT_BASE_PORT = 8070
-TPU_HOST_BOUNDS_VAL = "2,4,1"
-TPU_CHIPS_PER_HOST_BOUNDS_VAL = "1,1,1"
-CHIPS_PER_HOST_VAL = "4"
-# -------------------------------------------
+DEFAULT_TPU_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
+    4: "2,2,1",
+    8: "2,4,1",
+    16: "4,4,1",
+    32: "4,8,1",
+    64: "8,8,1",
+    128: "8,16,1",
+    256: "16,16,1",
+}
 
-try:
-    import torch_tpu
-except ImportError:
-    torch_tpu = None
+
+def _resolve_tpu_topology_bounds(
+    total_chips: int, num_nodes: int, fallback_map: dict | None = None
+) -> tuple[str, str, str, str]:
+    """Dynamically resolves (topology, host_bounds, chips_per_host_bounds, chips_per_host) for TPU slices."""
+    topo_map = dict(fallback_map) if fallback_map else {}
+    topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
+
+    topology = os.environ.get("TORCH_TPU_TOPOLOGY") or topo_map.get(total_chips, "1,1,1")
+    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+    chips_per_host = str(os.environ.get("VLLM_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+    if total_chips <= 4:
+        host_bounds = "1,1,1"
+        chips_per_host_bounds = topology if num_nodes == 1 else "1,1,1"
+    else:
+        host_bounds = topology
+        chips_per_host_bounds = "1,1,1"
+
+    return topology, host_bounds, chips_per_host_bounds, chips_per_host
+
+
+# -------------------------------------------
 
 try:
     from verl.checkpoint_engine.tpu_checkpoint_engine import load_weights_on_worker
@@ -53,10 +81,7 @@ except ImportError:
 
 # Fallback imports for TPU vLLM platforms
 try:
-    try:
-        from vllm_torchtpu.executors import ray_distributed_executor
-    except ImportError:
-        from tpu_inference.executors import ray_distributed_executor
+    from vllm_torchtpu.executors import ray_distributed_executor
 except ImportError:
     ray_distributed_executor = None
 
@@ -72,18 +97,12 @@ except ImportError:
     vllm_envs = None
 
 try:
-    try:
-        import vllm_torchtpu.envs as tpu_envs
-    except ImportError:
-        import tpu_inference.envs as tpu_envs
+    import vllm_torchtpu.envs as tpu_envs
 except ImportError:
     tpu_envs = None
 
 try:
-    try:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker
-    except ImportError:
-        from tpu_inference.worker.tpu_worker import TPUWorker
+    from vllm_torchtpu.worker.tpu_worker import TPUWorker
 except ImportError:
     TPUWorker = None
 
@@ -125,12 +144,9 @@ try:
     from vllm_torchtpu.platforms.tpu_platform import get_distributed_init_method
 except ImportError:
     try:
-        from tpu_inference.platforms.tpu_platform import get_distributed_init_method
+        from vllm.utils.network_utils import get_distributed_init_method
     except ImportError:
-        try:
-            from vllm.utils.network_utils import get_distributed_init_method
-        except ImportError:
-            get_distributed_init_method = None
+        get_distributed_init_method = None
 
 try:
     from vllm.platforms import current_platform
@@ -183,7 +199,318 @@ def patch_multiprocessing_for_tpu() -> None:
     multiprocessing.process.BaseProcess._tpu_patched = True
 
 
-_orig_run_engine_core = None
+class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
+    """vLLM Worker Extension for Google Cloud TPU with Raiden P2P weight synchronization.
+
+    Workloads using the 'raiden' checkpoint engine for high-speed TPU weight sync
+    must use this worker extension to bind TPU model tensors with WeightSynchronizer
+    and orchestrate dynamic zero-copy H2D DMA transfers during rollout.
+    """
+
+    def _get_vllm_model(self):
+        """Extract the underlying nn.Module from the vLLM V1 worker."""
+        worker = getattr(self, "worker", self)
+        return worker.model_runner.model
+
+    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
+        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController."""
+        if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
+            return True
+
+        vllm_model = self._get_vllm_model()
+        if vllm_model is None:
+            logging.getLogger(__name__).warning("Raiden Sampler: could not locate vllm_model to bind parameters.")
+            return False
+
+        from tpu_sync.rpc import raiden_service_pb2
+
+        from verl.checkpoint_engine.raiden_checkpoint_engine import (
+            create_torch_weight_synchronizer,
+        )
+
+        bind_ip = ray.util.get_node_ip_address().strip("[]")
+        rank_val = getattr(self, "rank", 0)
+        listener_port = 12000 + rank_val
+
+        # 1. Fetch RaidenController address and un-fused global shapes from TPUWeightRegistry
+        from verl.checkpoint_engine.tpu_weight_registry import get_tpu_weight_registry
+
+        registry = get_tpu_weight_registry()
+
+        controller_addr, global_shapes_map = None, {}
+        for _ in range(30):
+            try:
+                addr, shapes = ray.get(
+                    [
+                        registry.get_controller_address.remote(),
+                        registry.get_global_shapes.remote(),
+                    ]
+                )
+                if addr and shapes:
+                    controller_addr, global_shapes_map = addr, shapes
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not controller_addr or not global_shapes_map:
+            raise RuntimeError(
+                f"Raiden Sampler Rank {rank_val}: No RaidenController address or "
+                f"global shapes found in TPUWeightRegistry after timeout"
+            )
+
+        # 2. Determine tensor parallel size from vLLM V1 config
+        worker = getattr(self, "worker", self)
+        parallel_config = getattr(getattr(worker, "vllm_config", None), "parallel_config", None)
+        tp_size = getattr(parallel_config, "tensor_parallel_size", None)
+        if not tp_size or tp_size <= 0:
+            raise RuntimeError(
+                f"Raiden Sampler Rank {rank_val}: Unable to determine tensor_parallel_size (tp_size) "
+                f"from worker.vllm_config.parallel_config!"
+            )
+
+        # 3. Allocate local TPU staging buffers matching Trainer un-fused layout and sharding specs
+        ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
+
+        staging_tensors = {}
+        variable_protos = []
+        valid_params = []
+
+        for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
+            g_shape = list(g_shape)
+            spec_axes = [""] * len(g_shape)
+            local_shape = list(g_shape)
+
+            if len(g_shape) == 2:
+                if any(name.endswith(s) for s in ROW_PARALLEL_SUFFIXES):
+                    # Row parallel: partition input dimension (dim 1) across TP ranks
+                    spec_axes = ["", "tp"]
+                    local_shape[1] = g_shape[1] // tp_size
+                elif g_shape[0] % tp_size == 0:
+                    # Column parallel or vocab parallel: partition output dimension (dim 0) across TP ranks
+                    spec_axes = ["tp", ""]
+                    local_shape[0] = g_shape[0] // tp_size
+
+            sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+
+            # Allocate local TPU staging buffer with matching layout
+            t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
+            staging_tensors[name] = t
+            valid_params.append((name, t))
+
+            variable_protos.append(
+                raiden_service_pb2.VariableMetadataProto(
+                    name=name,
+                    shape=g_shape,
+                    mesh_shape=sharding_mesh,
+                    layout=list(range(len(local_shape) - 1, -1, -1)),
+                    item_size=t.element_size(),
+                    layer_idx=idx,
+                    sharding_spec=spec_axes,
+                )
+            )
+
+        self._raiden_staging = staging_tensors
+        self._sorted_vllm_params = valid_params
+
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
+
+        logging.getLogger(__name__).info(
+            f"Raiden Sampler Rank {rank_val}: binding {len(valid_params)} staging tensors to WeightSynchronizer "
+            f"(sample: name={valid_params[0][0]}, shape={valid_params[0][1].shape}, "
+            f"total numel={sum(t.numel() for _, t in valid_params)})"
+        )
+
+        self._raiden_ws = create_torch_weight_synchronizer(
+            [[t] for _, t in valid_params],
+            local_port=0,
+            parallelism=parallelism,
+            listener_port=listener_port,
+            bind_ip=bind_ip,
+        )
+
+        try:
+            from tpu_sync.rpc import raiden_controller
+
+            ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
+            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            ctrl_client.register_work_unit(
+                unit_id,
+                [f"{bind_ip}:{self._raiden_ws.local_port}"],
+                f"{bind_ip}:{self._raiden_ws.listener_port}",
+                mesh_shape=[1, tp_size],
+                variables=variable_protos,
+                mesh_axes=["fsdp", "tp"],
+            )
+            logging.getLogger(__name__).info(
+                f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
+                f"directly with RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], "
+                f"data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
+            )
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                f"Raiden Sampler Rank {rank_val} failed to register with RaidenController: {e}"
+            )
+            raise
+
+        return True
+
+    @torch.no_grad()
+    def install_raiden_weights(self) -> int:
+        """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
+        and fuse/transpose them directly into vLLM model parameters."""
+        if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
+            logging.getLogger(__name__).warning(
+                "Raiden Sampler: install_raiden_weights called before _raiden_ws was initialized."
+            )
+            return 0
+
+        t_start = time.perf_counter()
+        t_h2d_start = time.perf_counter()
+        self._raiden_ws.h2d()
+        t_h2d = time.perf_counter() - t_h2d_start
+
+        # Unpack, fuse, and transpose staging tensors into vLLM model parameters
+        vllm_model = self._get_vllm_model()
+        model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
+        module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
+
+        def resolve_model_key(k: str) -> Optional[str]:
+            if k in model_sd:
+                return k
+            if k.startswith("model.") and k[6:] in model_sd:
+                return k[6:]
+            if f"model.{k}" in model_sd:
+                return f"model.{k}"
+            return None
+
+        def get_parent_mod(target_key: str):
+            parent = target_key.rsplit(".", 1)[0] if "." in target_key else ""
+            if parent in module_dict:
+                return module_dict[parent]
+            if parent.startswith("model.") and parent[6:] in module_dict:
+                return module_dict[parent[6:]]
+            if f"model.{parent}" in module_dict:
+                return module_dict[f"model.{parent}"]
+            return None
+
+        def to_target_layout(tensor: torch.Tensor, target_local: torch.Tensor, flipped: bool) -> torch.Tensor:
+            if tensor.ndim == 2 and (
+                flipped or (tensor.shape != target_local.shape and tensor.T.shape == target_local.shape)
+            ):
+                return tensor.transpose(0, 1).contiguous()
+            return tensor.contiguous()
+
+        FUSED_MAP = [
+            (
+                ".self_attn.qkv_proj.weight",
+                [".self_attn.q_proj.weight", ".self_attn.k_proj.weight", ".self_attn.v_proj.weight"],
+            ),
+            (
+                ".self_attn.qkv_proj.bias",
+                [".self_attn.q_proj.bias", ".self_attn.k_proj.bias", ".self_attn.v_proj.bias"],
+            ),
+            (".mlp.gate_up_proj.weight", [".mlp.gate_proj.weight", ".mlp.up_proj.weight"]),
+            (".mlp.gate_up_proj.bias", [".mlp.gate_proj.bias", ".mlp.up_proj.bias"]),
+        ]
+
+        consumed_staging = set()
+
+        # 1. Handle fused projections (QKV and Gate-Up)
+        for target_suffix, src_suffixes in FUSED_MAP:
+            primary_src = src_suffixes[0]
+            for name in list(self._raiden_staging.keys()):
+                if primary_src in name:
+                    layer_src_keys = [name.replace(primary_src, s) for s in src_suffixes]
+                    if all(sk in self._raiden_staging for sk in layer_src_keys):
+                        target_name = name.replace(primary_src, target_suffix)
+                        resolved_key = resolve_model_key(target_name)
+                        if resolved_key is not None:
+                            target_param = model_sd[resolved_key]
+                            target_local = (
+                                target_param.to_local() if hasattr(target_param, "to_local") else target_param
+                            )
+                            parent_mod = get_parent_mod(resolved_key)
+                            is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
+                            parts = [self._raiden_staging[sk] for sk in layer_src_keys]
+                            fused = torch.cat(parts, dim=0)
+                            fused_adapted = to_target_layout(fused, target_local, is_flipped)
+                            target_local.copy_(fused_adapted)
+                            consumed_staging.update(layer_src_keys)
+
+        # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
+        for name, src_t in self._raiden_staging.items():
+            if name in consumed_staging:
+                continue
+            resolved_key = resolve_model_key(name)
+            if resolved_key is not None:
+                target_param = model_sd[resolved_key]
+                target_local = target_param.to_local() if hasattr(target_param, "to_local") else target_param
+                parent_mod = get_parent_mod(resolved_key)
+                is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
+                adapted = to_target_layout(src_t, target_local, is_flipped)
+                target_local.copy_(adapted)
+
+        # 3. Handle tied word embeddings
+        if (
+            hasattr(vllm_model, "lm_head")
+            and hasattr(vllm_model, "model")
+            and hasattr(vllm_model.model, "embed_tokens")
+        ):
+            if vllm_model.lm_head.weight.data_ptr() != vllm_model.model.embed_tokens.weight.data_ptr():
+                vllm_model.lm_head.weight.copy_(vllm_model.model.embed_tokens.weight)
+        elif hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
+            if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
+                vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
+
+        t_sync_start = time.perf_counter()
+        try:
+            from torch_tpu._internal import sync as torch_tpu_sync
+
+            torch_tpu_sync.synchronize(wait=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
+        t_sync = time.perf_counter() - t_sync_start
+        t_total = time.perf_counter() - t_start
+
+        print(
+            f"[RAIDEN TELEMETRY | Sampler Worker] Sampler Rank {getattr(self, 'rank', 0)}: "
+            f"install_raiden_weights completed in {t_total:.4f}s (H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)",
+            flush=True,
+        )
+        logging.getLogger(__name__).info(
+            f"[RAIDEN TELEMETRY | Sampler Worker] install_raiden_weights completed in {t_total:.4f}s "
+            f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
+        )
+        return 1
+
+    def get_model_weights_stats(self, include_shards: bool = False) -> dict:
+        """Computes deterministic parameter count, L1 norm, and L2 norm across all model parameters.
+        When include_shards=True, also returns CPU tensor bytes for each parameter to allow global re-assembly.
+        """
+        vllm_model = self._get_vllm_model()
+        if vllm_model is None:
+            return {"error": "No model found on worker"}
+
+        if not hasattr(self, "_sorted_vllm_params") or not self._sorted_vllm_params:
+            raise RuntimeError(
+                f"get_model_weights_stats is only supported for Raiden after initialization, "
+                f"but self._sorted_vllm_params is not initialized on worker rank {getattr(self, 'rank', 'unknown')}!"
+            )
+
+        rank_val = getattr(self, "rank", 0)
+
+        from verl.checkpoint_engine.raiden_checkpoint_engine import compute_tensor_stats
+
+        res = compute_tensor_stats(self._sorted_vllm_params)
+        res["rank"] = rank_val
+
+        return res
 
 
 def _patched_run_engine_core(*args, **kwargs):
@@ -244,36 +571,6 @@ def patch_vllm_for_tpu() -> None:
                             _allow(attr.default)
                     except Exception:
                         pass
-    except Exception:
-        pass
-
-    try:
-        import tpu_inference.worker.tpu_worker as tw
-
-        if hasattr(tw, "TPUWorker") and not getattr(tw.TPUWorker, "_patched_dynamo", False):
-            orig_determine = tw.TPUWorker.determine_available_memory
-
-            def patched_determine(self, *args, **kwargs):
-                patch_vllm_for_tpu()
-                return orig_determine(self, *args, **kwargs)
-
-            tw.TPUWorker.determine_available_memory = patched_determine
-            tw.TPUWorker._patched_dynamo = True
-    except Exception:
-        pass
-
-    try:
-        import tpu_inference.runner.tpu_runner as tr
-
-        if hasattr(tr, "TPUModelRunner") and not getattr(tr.TPUModelRunner, "_patched_dynamo", False):
-            orig_profile = tr.TPUModelRunner.profile_run
-
-            def patched_profile(self, *args, **kwargs):
-                patch_vllm_for_tpu()
-                return orig_profile(self, *args, **kwargs)
-
-            tr.TPUModelRunner.profile_run = patched_profile
-            tr.TPUModelRunner._patched_dynamo = True
     except Exception:
         pass
 
@@ -344,14 +641,26 @@ def patch_vllm_for_tpu() -> None:
                         pass
                 return 0
 
-            if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
-                state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
-            if isinstance(state_dict_ref, str):
-                state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
-            elif isinstance(state_dict_ref, ray.ObjectRef):
-                state_dict_data = ray.get(state_dict_ref)
+            if isinstance(state_dict_ref, list) and all(isinstance(r, ray.ObjectRef) for r in state_dict_ref):
+                grouped_dict = {}
+                for chunk_ref in state_dict_ref:
+                    chunk_obj = ray.get(chunk_ref)
+                    if isinstance(chunk_obj, tuple) and len(chunk_obj) == 2:
+                        group_name, group_sd = chunk_obj
+                        grouped_dict[group_name] = group_sd
+                    elif isinstance(chunk_obj, dict) and "grouped" in chunk_obj:
+                        grouped_dict.update(chunk_obj["grouped"])
+                    del chunk_obj
+                state_dict_data = {"grouped": grouped_dict}
             else:
-                state_dict_data = state_dict_ref
+                if isinstance(state_dict_ref, list) and len(state_dict_ref) == 1:
+                    state_dict_ref = state_dict_ref[0]  # unwrap the nesting from set_weights
+                if isinstance(state_dict_ref, str):
+                    state_dict_data = torch.load(state_dict_ref, map_location="cpu", weights_only=False)
+                elif isinstance(state_dict_ref, ray.ObjectRef):
+                    state_dict_data = ray.get(state_dict_ref)
+                else:
+                    state_dict_data = state_dict_ref
 
             # Convert NumPy arrays back to native PyTorch CPU tensors
             if isinstance(state_dict_data, dict) and "grouped" in state_dict_data:
@@ -550,8 +859,7 @@ def patch_vllm_for_tpu() -> None:
             getattr(ray_distributed_executor, "TPU_MULTIHOST_TOPOLOGY_MAP", None),
         )
         if _topo_map is not None:
-            _topo_map[4] = "2,2,1"
-            _topo_map[8] = "2,4,1"
+            _topo_map.update(DEFAULT_TPU_TOPOLOGY_MAP)
 
         original_driver_environ_setitem = os.environ.__class__.__setitem__
 
@@ -882,26 +1190,11 @@ def patch_vllm_for_tpu() -> None:
             logger.info(f"Constructed TORCH_TPU_SLICEBUILDER_ADDRESSES: {sb_addresses_str}")
 
             total_chips = len(self.workers)
-            if total_chips == 32:
-                topology = "4,8,1"
-                host_bounds = "4,8,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 8:
-                topology = "2,4,1"
-                host_bounds = "2,4,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
-            elif total_chips == 4:
-                topology = "2,2,1"
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "2,2,1" if num_nodes == 1 else "1,1,1"
-                chips_per_host = "4"
-            else:
-                topology = TPU_TOPOLOGY_MAP_local.get(total_chips, "1,1,1")
-                host_bounds = "1,1,1"
-                chips_per_host_bounds = "1,1,1"
-                chips_per_host = "4"
+            topology, host_bounds, chips_per_host_bounds, chips_per_host = _resolve_tpu_topology_bounds(
+                total_chips=total_chips,
+                num_nodes=num_nodes,
+                fallback_map=TPU_TOPOLOGY_MAP_local,
+            )
 
             rank_0_node_id = unique_node_ids[0]
             rank_0_worker_index = node_workers[rank_0_node_id][0]
@@ -1112,12 +1405,9 @@ try:
     from vllm_torchtpu.platforms.tpu_platform import get_env_vars_to_copy
 except ImportError:
     try:
-        from tpu_inference.platforms.tpu_platform import get_env_vars_to_copy
+        from vllm.ray.ray_env import get_env_vars_to_copy
     except ImportError:
-        try:
-            from vllm.ray.ray_env import get_env_vars_to_copy
-        except ImportError:
-            get_env_vars_to_copy = None
+        get_env_vars_to_copy = None
 
 
 def is_tpu_vllm_run() -> bool:
@@ -1387,10 +1677,7 @@ def prepare_tpu_server_args(args: dict):
     os.environ["VLLM_USE_RAY_V2_EXECUTOR_BACKEND"] = "0"
 
     try:
-        try:
-            import vllm_torchtpu.envs as tpu_envs
-        except ImportError:
-            import tpu_inference.envs as tpu_envs
+        import vllm_torchtpu.envs as tpu_envs
 
         tpu_envs.TPU_MULTIHOST_BACKEND = "ray"
         if hasattr(tpu_envs, "__getattr__") and hasattr(tpu_envs.__getattr__, "cache_clear"):
