@@ -29,6 +29,7 @@ def _floats(pattern: str, text: str) -> list[float]:
 def verify_smoke(text: str, smoke_test: bool) -> None:
     assert "[TPU smoke] PASSED" in text, "[TPU CI] TPU smoke test did not report PASSED."
     assert '"device": "tpu:0"' in text, "[TPU CI] TPU smoke test did not run on a tpu device."
+    assert "[TPU smoke] TPU vs CPU max |diff|" in text, "[TPU CI] TPU smoke test did not run the TPU-vs-CPU check."
     print("[TPU CI] TPU smoke test verified.")
 
 

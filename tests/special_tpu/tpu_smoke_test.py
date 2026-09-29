@@ -99,7 +99,45 @@ def tpu_smoke_task() -> dict:
 
     result.update({"device": str(tpu_tensor.device), "matmul_max_abs_err": (out - a @ b).abs().max().item()})
     result["grad_norm"] = grad_norm
+
+    # 5. TPU vs CPU: identical tiny MLP (fp32) forward + backward on both devices.
+    result["tpu_vs_cpu"] = _compare_mlp_tpu_vs_cpu(device)
     return result
+
+
+def _compare_mlp_tpu_vs_cpu(device) -> dict:
+    """Run the same Linear-GELU-Linear MLP on CPU and TPU; compare output, loss and grads."""
+    import torch
+
+    torch.manual_seed(0)
+    cpu_model = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 8))
+    tpu_model = torch.nn.Sequential(torch.nn.Linear(32, 64), torch.nn.GELU(), torch.nn.Linear(64, 8))
+    tpu_model.load_state_dict(cpu_model.state_dict())
+    tpu_model.to(device)
+    x = torch.randn(16, 32)
+    target = torch.randn(16, 8)
+
+    def run(model, dev):
+        out = model(x.to(dev))
+        loss = torch.nn.functional.mse_loss(out, target.to(dev))
+        loss.backward()
+        grads = {name: p.grad.cpu() for name, p in model.named_parameters()}
+        return out.cpu(), loss.cpu(), grads
+
+    cpu_out, cpu_loss, cpu_grads = run(cpu_model, "cpu")
+    tpu_out, tpu_loss, tpu_grads = run(tpu_model, device)
+
+    # TPU fp32 matmuls may use reduced-precision MXU passes, hence the loose-ish tolerances.
+    tol = {"atol": 2e-2, "rtol": 2e-2}
+    torch.testing.assert_close(tpu_out, cpu_out, **tol)
+    torch.testing.assert_close(tpu_loss, cpu_loss, **tol)
+    for name in cpu_grads:
+        torch.testing.assert_close(tpu_grads[name], cpu_grads[name], **tol, msg=lambda m, n=name: f"grad {n}: {m}")
+
+    diffs = {"output": (tpu_out - cpu_out).abs().max().item(), "loss": (tpu_loss - cpu_loss).abs().item()}
+    diffs.update({f"grad/{n}": (tpu_grads[n] - cpu_grads[n]).abs().max().item() for n in cpu_grads})
+    print("[TPU smoke] TPU vs CPU max |diff|: " + ", ".join(f"{k}={v:.2e}" for k, v in diffs.items()))
+    return {"cpu_loss": cpu_loss.item(), "tpu_loss": tpu_loss.item(), "max_abs_diff": diffs}
 
 
 def main() -> int:
@@ -110,7 +148,10 @@ def main() -> int:
 
     result = ray.get(tpu_smoke_task.remote(), timeout=900)
     print("[TPU smoke] result:\n" + json.dumps(result, indent=2, default=str))
-    print("[TPU smoke] PASSED: torch_tpu import, host<->device copy, bf16 matmul and autograd on 1 TPU chip.")
+    print(
+        "[TPU smoke] PASSED: torch_tpu import, host<->device copy, bf16 matmul, autograd and "
+        "TPU-vs-CPU MLP forward/backward on 1 TPU chip."
+    )
     return 0
 
 
