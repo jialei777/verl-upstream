@@ -1336,7 +1336,6 @@ def patch_vllm_for_tpu() -> None:
                     args["LOCAL_RANK"] = str(local_chip_id)
                     args["TPU_VISIBLE_CHIPS"] = str(effective_chip_id)
                     args["TPU_VISIBLE_DEVICES"] = str(effective_chip_id)
-                    args["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
                     args["TPU_PROCESS_PORT"] = str(base_port + local_chip_id)
                     args["CLOUD_TPU_TASK_ID"] = str(i)
                     args["TPU_WORKER_HOSTNAMES"] = host_names_str
