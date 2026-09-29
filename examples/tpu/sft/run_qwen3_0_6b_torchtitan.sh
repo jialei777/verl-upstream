@@ -35,26 +35,9 @@ TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/test.parquet}"
 # TPU Node topology configs (defaults to 1 single-host TPU 7x 2x2x1 slice = 1 host x 8 TensorCore devices)
 export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-tpu7x}"
 export ALLOW_MULTIPLE_LIBTPU_LOAD=1
-if [[ -z "${NNODES_TRAINER:-}" || -z "${N_CHIPS_TRAINER:-}" ]]; then
-    eval "$(python3 - <<'PY'
-try:
-    import ray
-    ray.init(address="auto", ignore_reinit_error=True, logging_level="ERROR")
-    from verl.plugin.platform.platform_tpu import is_tpu_v7x
-    if is_tpu_v7x():
-        print("export NNODES_TRAINER=${NNODES_TRAINER:-1}")
-        print("export N_CHIPS_TRAINER=${N_CHIPS_TRAINER:-8}")
-    else:
-        print("export NNODES_TRAINER=${NNODES_TRAINER:-2}")
-        print("export N_CHIPS_TRAINER=${N_CHIPS_TRAINER:-4}")
-except Exception:
-    print("export NNODES_TRAINER=${NNODES_TRAINER:-1}")
-    print("export N_CHIPS_TRAINER=${N_CHIPS_TRAINER:-8}")
-PY
-)"
-fi
-export NNODES_TRAINER="${NNODES_TRAINER:-1}"
-export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-8}"
+
+export NNODES_TRAINER="${NNODES_TRAINER:-2}"
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 
 # Parallelism: Pure FSDP across all trainer chips
