@@ -14,6 +14,10 @@ export RAY_memory_usage_threshold=0.99
 # JAX/XLA Launch Barrier Configuration
 export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
 
+# PyTorch Dynamo / Compile Logging and Recompile Limits
+export TORCH_LOGS="${TORCH_LOGS:-recompiles}"
+export TORCH_DYNAMO_RECOMPILE_LIMIT="${TORCH_DYNAMO_RECOMPILE_LIMIT:-64}"
+
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
 if [[ "${SMOKE_TEST}" == "1" ]]; then
@@ -25,7 +29,7 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
     ROLLOUT_N="${ROLLOUT_N:-4}"
     MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-768}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
+    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-3}"
     TEST_FREQ="${TEST_FREQ:-2}"
     VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 else
@@ -37,7 +41,7 @@ else
     ROLLOUT_N="${ROLLOUT_N:-8}"
     MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
-    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-100}"
+    TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-3}"
     TEST_FREQ="${TEST_FREQ:-10}"
     VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 fi
@@ -106,8 +110,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -133,7 +137,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
