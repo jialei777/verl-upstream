@@ -516,6 +516,9 @@ class TorchtitanEngineConfig(EngineConfig):
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results
             in distributed training. Important: this will negatively impact performance, so only use it for
             debugging.
+        use_splash_attention (bool): TPU only. Replace torchtitan's inner attention with the splash
+            attention Pallas kernel from ``torchtitan.experiments.tpu`` (packed-document masking through
+            segment ids instead of a dense [S, S] mask). Default False.
 
     """
 
@@ -544,6 +547,7 @@ class TorchtitanEngineConfig(EngineConfig):
     strategy: str = "torchtitan"
     seed: int = 42
     full_determinism: bool = False
+    use_splash_attention: bool = False
 
     def __post_init__(self):
         super().__post_init__()

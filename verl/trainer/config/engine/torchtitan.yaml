@@ -81,6 +81,9 @@ seed: 42
 # Whether to enable full determinism for distributed training, only for debugging
 full_determinism: false
 
+# TPU only: use the splash attention Pallas kernel (torchtitan.experiments.tpu) for attention
+use_splash_attention: false
+
 # Whether to use forward only
 forward_only: false
 

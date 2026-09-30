@@ -79,6 +79,15 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
+# TorchTitan trainer performance knobs (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md).
+# USE_TORCH_COMPILE: per-TransformerBlock torch.compile(backend="tpu").
+# USE_SPLASH_ATTENTION: splash attention Pallas kernel (segment-id masking) instead of SDPA
+# with a dense [S, S] mask.
+USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-False}"
+USE_SPLASH_ATTENTION="${USE_SPLASH_ATTENTION:-False}"
+# Sequences packed into one trainer micro batch (actor update, old/ref log-prob).
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
@@ -106,16 +115,17 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile="${USE_TORCH_COMPILE}" \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile="${USE_TORCH_COMPILE}" \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention="${USE_SPLASH_ATTENTION}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
@@ -131,7 +141,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.layered_summon=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
     actor_rollout_ref.rollout.enforce_eager=False \

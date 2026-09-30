@@ -54,8 +54,10 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
+    apply_splash_attention_tpu,
     bucket_length,
     compute_global_batch_num_tokens,
+    configure_torch_compile_for_tpu,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
     safe_to_padded_tensor,
@@ -251,9 +253,26 @@ class TorchTitanEngine(BaseEngine):
             # verl uses its own loss function and ignores this one.
             loss=CrossEntropyLoss.Config(),
         )
+        if device_name == "tpu" and self.engine_config.use_torch_compile:
+            configure_torch_compile_for_tpu()
         self.trainer = Trainer(self.config)
 
         self._init_device_mesh()
+
+        self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
+        if self._use_splash_attention:
+            apply_splash_attention_tpu(self.trainer.model_parts)
+        elif self.engine_config.use_splash_attention:
+            logger.warning("use_splash_attention is only supported on TPU; ignoring it on %s", device_name)
+
+        if device_name == "tpu" and self.engine_config.use_torch_compile:
+            # nn.Module.compile() stores the compiled forward in `_compiled_call_impl`.
+            n_compiled = sum(
+                getattr(m, "_compiled_call_impl", None) is not None
+                for part in self.trainer.model_parts
+                for m in part.modules()
+            )
+            logger.warning(f"torch.compile(backend='tpu') enabled on {n_compiled} modules")
 
         if get_device_name() == "tpu" and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -278,11 +297,13 @@ class TorchTitanEngine(BaseEngine):
         else:
             entropy_from_logits = verl_F.entropy_from_logits
 
-        self.compute_entropy_from_logits = (
-            torch.compile(entropy_from_logits, dynamic=True)
-            if self.engine_config.use_torch_compile
-            else entropy_from_logits
-        )
+        if not self.engine_config.use_torch_compile:
+            self.compute_entropy_from_logits = entropy_from_logits
+        elif device_name == "tpu":
+            # Inductor has no TPU codegen; shapes are bucketed, so compile them statically.
+            self.compute_entropy_from_logits = torch.compile(entropy_from_logits, backend="tpu", dynamic=False)
+        else:
+            self.compute_entropy_from_logits = torch.compile(entropy_from_logits, dynamic=True)
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -792,6 +813,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     position_ids=position_ids,
                     micro_batch=micro_batch,
                     device=get_device_id(),
+                    build_attention_mask=not self._use_splash_attention,
                 )
                 output_args["orig_seq_len"] = orig_seq_len
             else:
