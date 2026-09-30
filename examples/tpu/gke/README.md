@@ -32,12 +32,19 @@ The CI does **not** use the long-lived cluster above. Each suite provisions its 
 
 | Suite   | TPU workers | Chips used | What it runs |
 |---------|-------------|-----------:|--------------|
-| `smoke` | 1 x v6e-4 subslice | 1 | [`tests/special_tpu/tpu_smoke_test.py`](../../../tests/special_tpu/tpu_smoke_test.py): `import torch_tpu`, `.to("tpu")`, bf16 matmul, autograd |
+| `smoke` | 1 x v6e-1 (whole `ct6e-standard-1t` node) | 1 | [`tests/special_tpu/tpu_smoke_test.py`](../../../tests/special_tpu/tpu_smoke_test.py): `import torch_tpu`, `.to("tpu")`, bf16 matmul, autograd, TPU-vs-CPU MLP forward/backward |
 | `sft`   | 1 x v6e-4 subslice | 4 | Qwen3-0.6B GSM8K SFT (TorchTitan FSDP2) |
 | `grpo`  | 2 x v6e-4 subslices | 8 | Qwen3-0.6B GSM8K GRPO: 4-chip trainer on `tpu-group-0` + 4-chip vLLM rollout on `tpu-group-1` |
 
 - **Queueing**: the RayCluster ([`tests/special_tpu/gke/raycluster-ci.yaml`](../../../tests/special_tpu/gke/raycluster-ci.yaml)) is labelled `kueue.x-k8s.io/queue-name: verl-tpu-ci`. Kueue ([`tests/special_tpu/gke/kueue-tpu-ci.yaml`](../../../tests/special_tpu/gke/kueue-tpu-ci.yaml), 16-chip quota) keeps it suspended until enough TPU quota is free, then admits the whole cluster at once, so concurrent CI runs wait in FIFO order instead of competing for hosts.
-- **Subslicing**: each TPU worker replica requests one v6e host (`google.com/tpu: 4`) with the `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation, i.e. a single-host KubeRay subslice (v6e-4) of the 2x4 (v6e-8) node pools, and shows up in Ray as its own slice (`tpu-group-<i>`). A whole host is the smallest multi-chip unit: GKE rejects smaller TPU requests on these node pools and libtpu cannot start an ICI session on a 2-chip subset of a host (`START_SESSION failed`). A single chip without ICI works, which the smoke suite uses via `TPU_VISIBLE_CHIPS`.
+- **Subslicing**: each TPU worker replica requests one v6e host (`google.com/tpu: 4`) with the `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation, i.e. a single-host KubeRay subslice (v6e-4) of the 2x4 (v6e-8) node pools, and shows up in Ray as its own slice (`tpu-group-<i>`). A whole host is the smallest multi-chip unit: GKE rejects smaller TPU requests on these node pools and libtpu cannot start an ICI session on a 2-chip subset of a host (`START_SESSION failed`). To avoid idling 3 chips of a host, the 1-chip smoke suite runs on a dedicated 1x1 node pool instead (no subslice annotation, `google.com/tpu: 1`, own Kueue flavor `verl-tpu-ci-v6e-1t`). The pool scales from zero, so a smoke run pays a ~3 min node boot + image pull and costs nothing while idle:
+
+  ```bash
+  gcloud container node-pools create verl-ci-v6e-1t --cluster jialeic-ci-v6e8-2s-spot \
+      --region us-central2 --project tpu-pytorch --node-locations us-central2-b \
+      --machine-type ct6e-standard-1t --spot --disk-size 100 \
+      --enable-autoscaling --num-nodes 0 --min-nodes 0 --max-nodes 1
+  ```
 - **Teardown**: the script deletes its RayCluster on exit (success, failure, timeout or signal), the workflow repeats the deletion in an `if: always()` step, and every run reaps CI RayClusters older than 3 hours.
 
 > [!WARNING]

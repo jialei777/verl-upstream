@@ -18,15 +18,16 @@
 # Every invocation owns the full lifecycle of its own RayCluster:
 #   1. provision  - render tests/special_tpu/gke/raycluster-ci.yaml into a uniquely named,
 #                   Kueue-queued RayCluster whose TPU workers are single-host v6e-4 (2x2)
-#                   subslices of the v6e-8 (2x4) node pools. Kueue keeps it suspended until
-#                   TPU quota is free, so concurrent CI runs queue (FIFO) instead of fighting
-#                   for TPU hosts.
+#                   subslices of the v6e-8 (2x4) node pools (sft/grpo) or a whole 1-chip
+#                   ct6e-standard-1t node (smoke). Kueue keeps it suspended until TPU quota
+#                   is free, so concurrent CI runs queue (FIFO) instead of fighting for hosts.
 #   2. run        - submit the suite as a Ray job and verify its metrics.
 #   3. tear down  - delete the RayCluster on exit, whether the suite passed, failed, timed
 #                   out or was cancelled.
 #
 # Suites:
-#   smoke - 1 x v6e-4 subslice, 1 chip used: torch_tpu import / to(device) / matmul / autograd.
+#   smoke - 1 x v6e-1 (whole ct6e-standard-1t node, 1 chip): torch_tpu import / to(device) /
+#           matmul / autograd / TPU-vs-CPU MLP check.
 #   sft   - 1 x v6e-4 subslice, 4 chips: Qwen3-0.6B GSM8K SFT (TorchTitan FSDP2).
 #   grpo  - 2 x v6e-4 subslices, 8 chips: Qwen3-0.6B GSM8K GRPO, 4-chip trainer on
 #           tpu-group-0 + 4-chip vLLM rollout on tpu-group-1.
@@ -64,6 +65,7 @@ CURRENT_RAY_JOB_ID=""
 RAY_CLUSTER_NAME=""
 HEAD_POD=""
 WORKER_REPLICAS=1
+WORKER_TPU_CHIPS=4
 
 log() {
     echo "[TPU CI $(date +%H:%M:%S)] $*"
@@ -136,14 +138,37 @@ for item in json.load(sys.stdin)["items"]:
 }
 
 provision_ray_cluster() {
-    local suite="$1" replicas="$2" head_cpu="$3" head_mem="$4" worker_cpu="$5" worker_mem="$6"
+    # shape: "v6e-4" = 2x2 single-host subslice of a 2x4 node pool (4 chips per worker);
+    #        "v6e-1" = whole 1x1 node from the ct6e-standard-1t pool (1 chip per worker).
+    local suite="$1" shape="$2" replicas="$3" head_cpu="$4" head_mem="$5" worker_cpu="$6" worker_mem="$7"
+    local node_topology torch_topology annotation_key annotation_value slicebuilder
     WORKER_REPLICAS="${replicas}"
+    case "${shape}" in
+        v6e-4)
+            WORKER_TPU_CHIPS=4 node_topology=2x4 torch_topology=2,2,1
+            annotation_key=cloud.google.com/gke-tpu-slice-topology annotation_value=2x2
+            slicebuilder=localhost:8471,localhost:8472,localhost:8473,localhost:8474
+            ;;
+        v6e-1)
+            # No subslice annotation: the pod owns the whole 1-chip node.
+            WORKER_TPU_CHIPS=1 node_topology=1x1 torch_topology=1,1,1
+            annotation_key=verl-ci/tpu-slice-topology annotation_value=1x1
+            slicebuilder=localhost:8471
+            ;;
+        *)
+            log "ERROR: unknown worker shape ${shape}" >&2
+            exit 1
+            ;;
+    esac
     # Keep the name short: KubeRay derives pod/service names from it (63-char limit).
     RAY_CLUSTER_NAME="$(echo "verl-ci-${suite}-${RUN_ID}-${RUN_ATTEMPT}" | tr '[:upper:]_' '[:lower:]-' | cut -c1-40 | sed 's/-*$//')"
 
-    log "Provisioning RayCluster ${RAY_CLUSTER_NAME} (${replicas} x v6e-4 subslice, queue=${KUEUE_QUEUE}, image=${TPU_CI_IMAGE})"
+    log "Provisioning RayCluster ${RAY_CLUSTER_NAME} (${replicas} x ${shape}, queue=${KUEUE_QUEUE}, image=${TPU_CI_IMAGE})"
     RAY_CLUSTER_NAME="${RAY_CLUSTER_NAME}" SUITE="${suite}" HEAD_CPU="${head_cpu}" HEAD_MEMORY="${head_mem}" \
         WORKER_CPU="${worker_cpu}" WORKER_MEMORY="${worker_mem}" WORKER_REPLICAS="${replicas}" CI_RUN_ID="${RUN_ID}" \
+        WORKER_TPU_CHIPS="${WORKER_TPU_CHIPS}" WORKER_NODE_TOPOLOGY="${node_topology}" \
+        SLICE_ANNOTATION_KEY="${annotation_key}" SLICE_ANNOTATION_VALUE="${annotation_value}" \
+        TORCH_TPU_TOPOLOGY="${torch_topology}" SLICEBUILDER_ADDRESSES="${slicebuilder}" \
         CI_OWNER="${GITHUB_REPOSITORY:-local}/${GITHUB_REF_NAME:-$(hostname)}#${RUN_ID}" \
         python3 - tests/special_tpu/gke/raycluster-ci.yaml <<'PY' | kubectl apply -f -
 import os
@@ -151,7 +176,9 @@ import string
 import sys
 
 keys = ["RAY_CLUSTER_NAME", "RAY_NAMESPACE", "KUEUE_QUEUE", "SUITE", "CI_OWNER", "CI_RUN_ID", "HEAD_CPU",
-        "HEAD_MEMORY", "WORKER_CPU", "WORKER_MEMORY", "WORKER_REPLICAS"]
+        "HEAD_MEMORY", "WORKER_CPU", "WORKER_MEMORY", "WORKER_REPLICAS", "WORKER_TPU_CHIPS",
+        "WORKER_NODE_TOPOLOGY", "SLICE_ANNOTATION_KEY", "SLICE_ANNOTATION_VALUE", "TORCH_TPU_TOPOLOGY",
+        "SLICEBUILDER_ADDRESSES"]
 values = {k: os.environ[k] for k in keys}
 values["IMAGE"] = os.environ["TPU_CI_IMAGE"]
 print(string.Template(open(sys.argv[1]).read()).substitute(values))
@@ -185,8 +212,9 @@ wait_for_ray_cluster() {
 
     # 2. Wait for head + TPU worker pods to be Running and all containers ready.
     local want_pods=$((1 + WORKER_REPLICAS))
-    local want_tpu="0.0/$((4 * WORKER_REPLICAS)).0 TPU"
-    deadline=$((SECONDS + 900))
+    local want_tpu="0.0/$((WORKER_TPU_CHIPS * WORKER_REPLICAS)).0 TPU"
+    # Generous: the 1-chip pool scales from zero (node boot + image pull).
+    deadline=$((SECONDS + 1500))
     while (( SECONDS < deadline )); do
         local ready_pods
         ready_pods="$(kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" --no-headers 2>/dev/null \
@@ -214,7 +242,7 @@ wait_for_ray_cluster() {
         fi
         sleep 10
     done
-    log "ERROR: Ray cluster ${RAY_CLUSTER_NAME} did not register $((4 * WORKER_REPLICAS)) TPU chips." >&2
+    log "ERROR: Ray cluster ${RAY_CLUSTER_NAME} did not register $((WORKER_TPU_CHIPS * WORKER_REPLICAS)) TPU chips." >&2
     kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" -o wide >&2
     exit 1
 }
@@ -338,13 +366,13 @@ run_suite() {
     local suite="$1"
     case "${suite}" in
         smoke)
-            provision_ray_cluster smoke 1 2 8Gi 32 128Gi
+            provision_ray_cluster smoke v6e-1 1 2 8Gi 32 128Gi
             wait_for_ray_cluster
             connect_ray_dashboard
             submit_and_verify_ray_job smoke 15 '{}' python3 tests/special_tpu/tpu_smoke_test.py
             ;;
         sft)
-            provision_ray_cluster sft 1 4 16Gi 96 400Gi
+            provision_ray_cluster sft v6e-4 1 4 16Gi 96 400Gi
             wait_for_ray_cluster
             connect_ray_dashboard
             submit_and_verify_ray_job sft 30 \
@@ -354,7 +382,7 @@ run_suite() {
         grpo)
             # Two v6e-4 subslices: trainer on tpu-group-0, vLLM rollout on tpu-group-1
             # (see TPUPlatform.auto_assign_accelerator_type).
-            provision_ray_cluster grpo 2 4 16Gi 96 400Gi
+            provision_ray_cluster grpo v6e-4 2 4 16Gi 96 400Gi
             wait_for_ray_cluster
             connect_ray_dashboard
             # Disable Qwen3 <think>: with thinking on, 512-token smoke rollouts are all clipped
