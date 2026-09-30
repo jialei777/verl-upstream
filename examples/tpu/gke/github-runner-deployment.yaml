@@ -29,6 +29,10 @@ spec:
     metadata:
       labels:
         app: github-tpu-ci-runner
+      annotations:
+        # The default-pool autoscaler would otherwise drain an under-used node and kill a
+        # runner mid-job ("The runner has received a shutdown signal").
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       serviceAccountName: ray-ksa
       containers:
