@@ -31,7 +31,8 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
-export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-tpu7x}"
+# TPU generation: leave TPU_ACCELERATOR_TYPE unset on v6e. On TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x
+# (e.g. via --runtime-env-json) to select the 4D topology map; it aborts libtpu on v6e.
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=1
 export RAY_memory_monitor_refresh_ms=0
