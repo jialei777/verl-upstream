@@ -17,8 +17,9 @@
 # A single v6e host (4 chips) is the smallest multi-chip unit: libtpu cannot open an ICI session
 # on a 2-chip subset of a host. 1 chip comes from a dedicated 1x1 node pool.
 #
-# tests/special_tpu/run_tpu_e2e_ci.sh provisions the tier's RayCluster through the Kueue
-# LocalQueue `verl-tpu-ci`, so concurrent jobs queue for TPU quota instead of fighting for hosts,
+# tests/special_tpu/run_tpu_e2e_ci.sh provisions the tier's RayCluster through the tier's Kueue
+# LocalQueue (`verl-tpu-ci-{1chip,4chip,8chip}`, FIFO per tier), so concurrent jobs queue for TPU
+# quota instead of fighting for hosts,
 # runs the tier's tests, and deletes the cluster on exit. The final `if: always()` step deletes it
 # again in case the job was cancelled.
 
@@ -103,7 +104,7 @@ env:
   REGION: "us-central2"
   PROJECT: "tpu-pytorch"
   RAY_NAMESPACE: "default"
-  KUEUE_QUEUE: "verl-tpu-ci"
+  KUEUE_QUEUE_PREFIX: "verl-tpu-ci"
   QUEUE_TIMEOUT_MINS: "90"
   SMOKE_TEST: ${{ github.event.inputs.smoke_test || '1' }}
   GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}

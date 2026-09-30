@@ -18,10 +18,12 @@ metadata:
   labels:
     app: github-tpu-ci-runner
 spec:
-  # One runner per TPU CI tier (v6e 1-chip / 4-chip / 8-chip) so the jobs of a workflow run in
-  # parallel. Runners only submit work; TPU contention across runs is resolved by the
-  # Kueue LocalQueue `verl-tpu-ci` (see tests/special_tpu/gke/kueue-tpu-ci.yaml).
-  replicas: 3
+  # Two workflow runs' worth of tier jobs (v6e 1-chip / 4-chip / 8-chip) can hold a runner at
+  # once. A runner stays busy while its job waits in Kueue, so a few spares keep e.g. a 1-chip job
+  # from waiting for a runner behind queued 8-chip jobs. Runners only submit work; TPU contention
+  # is resolved by the per-tier Kueue LocalQueues `verl-tpu-ci-{1chip,4chip,8chip}` (see
+  # tests/special_tpu/gke/kueue-tpu-ci.yaml).
+  replicas: 6
   selector:
     matchLabels:
       app: github-tpu-ci-runner
@@ -58,9 +60,10 @@ spec:
                   name: github-runner-secret
                   key: ACCESS_TOKEN
           resources:
+            # Runners only run kubectl / the Ray job CLI; keep requests small so 6 fit on default-pool.
             requests:
-              cpu: "4"
-              memory: "16Gi"
+              cpu: "2"
+              memory: "8Gi"
             limits:
               cpu: "8"
               memory: "32Gi"

@@ -4,7 +4,8 @@
 # placeholders) and applied once per CI tier, then deleted on exit.
 #
 # - Queued through Kueue (`kueue.x-k8s.io/queue-name`): the RayCluster stays suspended
-#   until the `verl-tpu-ci` LocalQueue has free TPU quota, then all pods are created.
+#   until the tier's LocalQueue (`verl-tpu-ci-{1chip,4chip,8chip}`) has free TPU quota, then
+#   all pods are created.
 # - Worker shape (rendered per tier by the script):
 #   * v6e-4chip / v6e-8chip - RayCluster subslicing: the worker group carries the
 #     `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation so the KubeRay TPU webhook

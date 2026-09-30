@@ -47,7 +47,10 @@ export CLUSTER_NAME="${CLUSTER_NAME:-jialeic-ci-v6e8-2s-spot}"
 export REGION="${REGION:-us-central2}"
 export PROJECT="${PROJECT:-tpu-pytorch}"
 export RAY_NAMESPACE="${RAY_NAMESPACE:-default}"
-export KUEUE_QUEUE="${KUEUE_QUEUE:-verl-tpu-ci}"
+# Each tier has its own Kueue LocalQueue: ${KUEUE_QUEUE_PREFIX}-{1chip,4chip,8chip}.
+export KUEUE_QUEUE_PREFIX="${KUEUE_QUEUE_PREFIX:-verl-tpu-ci}"
+KUEUE_QUEUE=""
+TIER_NAME=""
 export TPU_CI_IMAGE="${TPU_CI_IMAGE:-us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260928-tsync0927}"
 export SMOKE_TEST="${SMOKE_TEST:-1}"
 export PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-$((28000 + RANDOM % 1000))}"
@@ -162,13 +165,15 @@ provision_ray_cluster() {
             exit 1
             ;;
     esac
+    TIER_NAME="${tier}"
+    KUEUE_QUEUE="${KUEUE_QUEUE_PREFIX}-${tier#v6e-}"
     # Keep the name short: KubeRay derives pod/service names from it (63-char limit).
     RAY_CLUSTER_NAME="$(echo "verl-ci-${tier}-${RUN_ID}-${RUN_ATTEMPT}" | tr '[:upper:]_' '[:lower:]-' | cut -c1-40 | sed 's/-*$//')"
 
     log "Provisioning RayCluster ${RAY_CLUSTER_NAME} (${replicas} x ${shape}, queue=${KUEUE_QUEUE}, image=${TPU_CI_IMAGE})"
     RAY_CLUSTER_NAME="${RAY_CLUSTER_NAME}" TIER="${tier}" HEAD_CPU="${head_cpu}" HEAD_MEMORY="${head_mem}" \
         WORKER_CPU="${worker_cpu}" WORKER_MEMORY="${worker_mem}" WORKER_REPLICAS="${replicas}" CI_RUN_ID="${RUN_ID}" \
-        WORKER_TPU_CHIPS="${WORKER_TPU_CHIPS}" WORKER_NODE_TOPOLOGY="${node_topology}" \
+        KUEUE_QUEUE="${KUEUE_QUEUE}" WORKER_TPU_CHIPS="${WORKER_TPU_CHIPS}" WORKER_NODE_TOPOLOGY="${node_topology}" \
         SLICE_ANNOTATION_KEY="${annotation_key}" SLICE_ANNOTATION_VALUE="${annotation_value}" \
         TORCH_TPU_TOPOLOGY="${torch_topology}" SLICEBUILDER_ADDRESSES="${slicebuilder}" \
         CI_OWNER="${GITHUB_REPOSITORY:-local}/${GITHUB_REF_NAME:-$(hostname)}#${RUN_ID}" \
@@ -201,7 +206,7 @@ wait_for_ray_cluster() {
         if (( SECONDS - last_report >= 60 )); then
             log "Queued in Kueue (${KUEUE_QUEUE}); waiting for TPU quota. Queue state:"
             kubectl get localqueue -n "${RAY_NAMESPACE}" "${KUEUE_QUEUE}" --no-headers 2>/dev/null || true
-            kubectl get raycluster -n "${RAY_NAMESPACE}" -l verl-ci/managed=true \
+            kubectl get raycluster -n "${RAY_NAMESPACE}" -l "verl-ci/managed=true,verl-ci/tier=${TIER_NAME}" \
                 -o custom-columns=NAME:.metadata.name,SUSPENDED:.spec.suspend,STATE:.status.state --no-headers || true
             last_report=${SECONDS}
         fi
