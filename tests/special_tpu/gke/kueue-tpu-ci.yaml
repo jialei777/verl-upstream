@@ -1,6 +1,6 @@
 # Kueue admission queue for the verl TPU CI (GKE cluster `jialeic-ci-v6e8-2s-spot`).
 #
-# Every CI suite provisions its own short-lived RayCluster labelled with
+# Every CI tier provisions its own short-lived RayCluster labelled with
 # `kueue.x-k8s.io/queue-name: verl-tpu-ci`. Kueue keeps the RayCluster suspended (no pods
 # are created) until the ClusterQueue has enough free TPU quota, then admits it as a
 # whole (gang admission). Concurrent CI runs therefore queue in FIFO order instead of
@@ -8,8 +8,8 @@
 #
 # The TPU quota (16 chips) matches the physical capacity of the node pools
 # (2 x v6e-8 slices = 4 hosts x 4 chips). GKE only allows whole-host TPU requests
-# (4 chips) on `tpu-v6e-slice` 2x4 nodes, so each sft/grpo worker reserves one host.
-# The 1-chip smoke suite runs on a separate ct6e-standard-1t (1x1) node pool that scales
+# (4 chips) on `tpu-v6e-slice` 2x4 nodes, so each 4/8-chip tier worker reserves one host.
+# The v6e-1chip tier runs on a separate ct6e-standard-1t (1x1) node pool that scales
 # from zero, tracked by its own flavor (1 chip). Kueue picks the flavor whose node labels
 # match the worker's nodeSelector (topology 2x4 vs 1x1).
 #

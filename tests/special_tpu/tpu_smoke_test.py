@@ -17,7 +17,7 @@ Submitted as a Ray job to the per-run CI RayCluster. Schedules a single Ray task
 reserves exactly one TPU chip, pins the process to it, imports ``torch_tpu``, moves
 tensors to the ``tpu`` device and checks a few basic ops against CPU results. It is meant
 to fail fast (minutes) on broken images, driver/libtpu issues or device plugin problems
-before the heavier SFT / GRPO suites spend time on them.
+before the heavier trainer / RL tiers spend time on them.
 
 Usage (inside the Ray cluster):
     python3 tests/special_tpu/tpu_smoke_test.py

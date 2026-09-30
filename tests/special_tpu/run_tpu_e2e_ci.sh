@@ -15,32 +15,34 @@
 #
 # End-to-End CI Runner for TPU v6e on GKE KubeRay.
 #
-# Every invocation owns the full lifecycle of its own RayCluster:
+# Every invocation runs one CI tier and owns the full lifecycle of its own RayCluster:
 #   1. provision  - render tests/special_tpu/gke/raycluster-ci.yaml into a uniquely named,
 #                   Kueue-queued RayCluster whose TPU workers are single-host v6e-4 (2x2)
-#                   subslices of the v6e-8 (2x4) node pools (sft/grpo) or a whole 1-chip
-#                   ct6e-standard-1t node (smoke). Kueue keeps it suspended until TPU quota
-#                   is free, so concurrent CI runs queue (FIFO) instead of fighting for hosts.
-#   2. run        - submit the suite as a Ray job and verify its metrics.
-#   3. tear down  - delete the RayCluster on exit, whether the suite passed, failed, timed
-#                   out or was cancelled.
+#                   subslices of the v6e-8 (2x4) node pools (4/8-chip tiers) or a whole 1-chip
+#                   ct6e-standard-1t node (1-chip tier). Kueue keeps it suspended until TPU
+#                   quota is free, so concurrent CI runs queue (FIFO) instead of fighting for hosts.
+#   2. run        - submit each of the tier's tests as a Ray job and verify its metrics.
+#   3. tear down  - delete the RayCluster on exit, whether the tests passed, failed, timed
+#                   out or were cancelled.
 #
-# Suites:
-#   smoke - 1 x v6e-1 (whole ct6e-standard-1t node, 1 chip): torch_tpu import / to(device) /
-#           matmul / autograd / TPU-vs-CPU MLP check.
-#   sft   - 1 x v6e-4 subslice, 4 chips: Qwen3-0.6B GSM8K SFT (TorchTitan FSDP2).
-#   grpo  - 2 x v6e-4 subslices, 8 chips: Qwen3-0.6B GSM8K GRPO, 4-chip trainer on
-#           tpu-group-0 + 4-chip vLLM rollout on tpu-group-1.
+# Tiers (add new tests to the matching tier in run_tier):
+#   v6e-1chip - 1 x v6e-1 (whole ct6e-standard-1t node). TPU platform tests:
+#               test_tpu_platform (torch_tpu import / to(device) / matmul / autograd / TPU-vs-CPU).
+#   v6e-4chip - 1 x v6e-4 subslice. Trainer tests:
+#               test_trainer_sft (Qwen3-0.6B GSM8K SFT, TorchTitan FSDP2).
+#   v6e-8chip - 2 x v6e-4 subslices. RL tests:
+#               test_rl_grpo (Qwen3-0.6B GSM8K GRPO, 4-chip trainer on tpu-group-0 + 4-chip
+#               vLLM rollout on tpu-group-1).
 # Note: multi-chip ICI sessions smaller than a full v6e host (e.g. 2 chips) are rejected by
 # libtpu (START_SESSION failed), so a single host (4 chips) is the smallest multi-chip unit.
 #
 # Usage:
-#   bash tests/special_tpu/run_tpu_e2e_ci.sh <smoke|sft|grpo>
-#   bash tests/special_tpu/run_tpu_e2e_ci.sh teardown [suite]   # delete this run's clusters
+#   bash tests/special_tpu/run_tpu_e2e_ci.sh <v6e-1chip|v6e-4chip|v6e-8chip>
+#   bash tests/special_tpu/run_tpu_e2e_ci.sh teardown [tier]   # delete this run's clusters
 
 set -euo pipefail
 
-MODE="${1:?usage: $0 <smoke|sft|grpo|teardown> [suite]}"
+MODE="${1:?usage: $0 <v6e-1chip|v6e-4chip|v6e-8chip|teardown> [tier]}"
 export CLUSTER_NAME="${CLUSTER_NAME:-jialeic-ci-v6e8-2s-spot}"
 export REGION="${REGION:-us-central2}"
 export PROJECT="${PROJECT:-tpu-pytorch}"
@@ -140,7 +142,7 @@ for item in json.load(sys.stdin)["items"]:
 provision_ray_cluster() {
     # shape: "v6e-4" = 2x2 single-host subslice of a 2x4 node pool (4 chips per worker);
     #        "v6e-1" = whole 1x1 node from the ct6e-standard-1t pool (1 chip per worker).
-    local suite="$1" shape="$2" replicas="$3" head_cpu="$4" head_mem="$5" worker_cpu="$6" worker_mem="$7"
+    local tier="$1" shape="$2" replicas="$3" head_cpu="$4" head_mem="$5" worker_cpu="$6" worker_mem="$7"
     local node_topology torch_topology annotation_key annotation_value slicebuilder
     WORKER_REPLICAS="${replicas}"
     case "${shape}" in
@@ -161,10 +163,10 @@ provision_ray_cluster() {
             ;;
     esac
     # Keep the name short: KubeRay derives pod/service names from it (63-char limit).
-    RAY_CLUSTER_NAME="$(echo "verl-ci-${suite}-${RUN_ID}-${RUN_ATTEMPT}" | tr '[:upper:]_' '[:lower:]-' | cut -c1-40 | sed 's/-*$//')"
+    RAY_CLUSTER_NAME="$(echo "verl-ci-${tier}-${RUN_ID}-${RUN_ATTEMPT}" | tr '[:upper:]_' '[:lower:]-' | cut -c1-40 | sed 's/-*$//')"
 
     log "Provisioning RayCluster ${RAY_CLUSTER_NAME} (${replicas} x ${shape}, queue=${KUEUE_QUEUE}, image=${TPU_CI_IMAGE})"
-    RAY_CLUSTER_NAME="${RAY_CLUSTER_NAME}" SUITE="${suite}" HEAD_CPU="${head_cpu}" HEAD_MEMORY="${head_mem}" \
+    RAY_CLUSTER_NAME="${RAY_CLUSTER_NAME}" TIER="${tier}" HEAD_CPU="${head_cpu}" HEAD_MEMORY="${head_mem}" \
         WORKER_CPU="${worker_cpu}" WORKER_MEMORY="${worker_mem}" WORKER_REPLICAS="${replicas}" CI_RUN_ID="${RUN_ID}" \
         WORKER_TPU_CHIPS="${WORKER_TPU_CHIPS}" WORKER_NODE_TOPOLOGY="${node_topology}" \
         SLICE_ANNOTATION_KEY="${annotation_key}" SLICE_ANNOTATION_VALUE="${annotation_value}" \
@@ -175,7 +177,7 @@ import os
 import string
 import sys
 
-keys = ["RAY_CLUSTER_NAME", "RAY_NAMESPACE", "KUEUE_QUEUE", "SUITE", "CI_OWNER", "CI_RUN_ID", "HEAD_CPU",
+keys = ["RAY_CLUSTER_NAME", "RAY_NAMESPACE", "KUEUE_QUEUE", "TIER", "CI_OWNER", "CI_RUN_ID", "HEAD_CPU",
         "HEAD_MEMORY", "WORKER_CPU", "WORKER_MEMORY", "WORKER_REPLICAS", "WORKER_TPU_CHIPS",
         "WORKER_NODE_TOPOLOGY", "SLICE_ANNOTATION_KEY", "SLICE_ANNOTATION_VALUE", "TORCH_TPU_TOPOLOGY",
         "SLICEBUILDER_ADDRESSES"]
@@ -280,17 +282,17 @@ connect_ray_dashboard() {
 }
 
 submit_and_verify_ray_job() {
-    local suite_name="$1"
+    local test_name="$1"
     local timeout_mins="$2"
-    local suite_env_json="$3"
+    local test_env_json="$3"
     shift 3
     local entrypoint=("$@")
 
-    local sub_id="ci_${suite_name}_$(date +%Y%m%d_%H%M%S)"
+    local sub_id="ci_${test_name}_$(date +%Y%m%d_%H%M%S)"
     local log_file="/tmp/${sub_id}.log"
 
     local runtime_env
-    runtime_env="$(SUITE_ENV="${suite_env_json}" python3 -c '
+    runtime_env="$(TEST_ENV="${test_env_json}" python3 -c '
 import json, os
 env_vars = {
     "PYTHONPATH": ".",
@@ -302,14 +304,14 @@ env_vars = {
     "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
     "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1",
 }
-env_vars.update(json.loads(os.environ["SUITE_ENV"]))
+env_vars.update(json.loads(os.environ["TEST_ENV"]))
 print(json.dumps({
     "excludes": [".git", "logs", "*.log", "*.pt", "*.bin", "__pycache__", ".ruff_cache", ".mypy_cache"],
     "env_vars": env_vars,
 }))
 ')"
 
-    log "Submitting ${suite_name^^} job ${sub_id}: ${entrypoint[*]}"
+    log "Submitting ${test_name^^} job ${sub_id}: ${entrypoint[*]}"
     ray job submit \
         --address "${RAY_ADDRESS}" \
         --submission-id "${sub_id}" \
@@ -358,48 +360,74 @@ print(json.dumps({
         exit 1
     fi
 
-    python3 tests/special_tpu/verify_tpu_e2e_log.py "${suite_name}" "${log_file}" "${SMOKE_TEST}"
-    log "${suite_name^^} E2E test PASSED!"
+    python3 tests/special_tpu/verify_tpu_e2e_log.py "${test_name}" "${log_file}" "${SMOKE_TEST}"
+    log "${test_name^^} E2E test PASSED!"
 }
 
-run_suite() {
-    local suite="$1"
-    case "${suite}" in
-        smoke)
-            provision_ray_cluster smoke v6e-1 1 2 8Gi 32 128Gi
+# ---------------------------------------------------------------------------------------------
+# Tests. Each runs as one Ray job on the tier's RayCluster; add new tests as functions here and
+# call them from the matching tier in run_tier.
+# ---------------------------------------------------------------------------------------------
+
+test_tpu_platform() {
+    # torch_tpu import / host<->device copy / bf16 matmul / autograd / TPU-vs-CPU MLP on 1 chip.
+    submit_and_verify_ray_job smoke 15 '{}' python3 tests/special_tpu/tpu_smoke_test.py
+}
+
+test_trainer_sft() {
+    # Qwen3-0.6B GSM8K SFT, TorchTitan FSDP2 on one v6e-4 subslice.
+    submit_and_verify_ray_job sft 30 \
+        '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4"}' \
+        bash examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
+}
+
+test_rl_grpo() {
+    # Qwen3-0.6B GSM8K GRPO: 4-chip TorchTitan trainer on tpu-group-0 + 4-chip vLLM rollout on
+    # tpu-group-1 (see TPUPlatform.auto_assign_accelerator_type).
+    # Disable Qwen3 <think>: with thinking on, 512-token smoke rollouts are all clipped before
+    # "#### <answer>" and the reward is ~0. 8 prompts x 4 samples per step keeps the
+    # training-reward check stable.
+    submit_and_verify_ray_job grpo 40 \
+        '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4"}' \
+        bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
+        +data.apply_chat_template_kwargs.enable_thinking=False \
+        trainer.val_before_train=True \
+        data.val_max_samples=32 \
+        data.train_batch_size=8 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+        actor_rollout_ref.rollout.n=4
+}
+
+# ---------------------------------------------------------------------------------------------
+# CI tiers: one RayCluster per tier, sized by chip count, running that tier's tests in order.
+# ---------------------------------------------------------------------------------------------
+
+run_tier() {
+    local tier="$1"
+    case "${tier}" in
+        v6e-1chip)
+            # TPU platform tests: a whole ct6e-standard-1t (1x1) node.
+            provision_ray_cluster "${tier}" v6e-1 1 2 8Gi 32 128Gi
             wait_for_ray_cluster
             connect_ray_dashboard
-            submit_and_verify_ray_job smoke 15 '{}' python3 tests/special_tpu/tpu_smoke_test.py
+            test_tpu_platform
             ;;
-        sft)
-            provision_ray_cluster sft v6e-4 1 4 16Gi 96 400Gi
+        v6e-4chip)
+            # Trainer tests: one v6e-4 (2x2) subslice.
+            provision_ray_cluster "${tier}" v6e-4 1 4 16Gi 96 400Gi
             wait_for_ray_cluster
             connect_ray_dashboard
-            submit_and_verify_ray_job sft 30 \
-                '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4"}' \
-                bash examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
+            test_trainer_sft
             ;;
-        grpo)
-            # Two v6e-4 subslices: trainer on tpu-group-0, vLLM rollout on tpu-group-1
-            # (see TPUPlatform.auto_assign_accelerator_type).
-            provision_ray_cluster grpo v6e-4 2 4 16Gi 96 400Gi
+        v6e-8chip)
+            # RL tests: two v6e-4 subslices (trainer slice + rollout slice).
+            provision_ray_cluster "${tier}" v6e-4 2 4 16Gi 96 400Gi
             wait_for_ray_cluster
             connect_ray_dashboard
-            # Disable Qwen3 <think>: with thinking on, 512-token smoke rollouts are all clipped
-            # before "#### <answer>" and the reward is ~0. 8 prompts x 4 samples per step keeps the
-            # training-reward check stable.
-            submit_and_verify_ray_job grpo 40 \
-                '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4"}' \
-                bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
-                +data.apply_chat_template_kwargs.enable_thinking=False \
-                trainer.val_before_train=True \
-                data.val_max_samples=32 \
-                data.train_batch_size=8 \
-                actor_rollout_ref.actor.ppo_mini_batch_size=8 \
-                actor_rollout_ref.rollout.n=4
+            test_rl_grpo
             ;;
         *)
-            echo "Usage: $0 <smoke|sft|grpo|teardown> [suite]" >&2
+            echo "Usage: $0 <v6e-1chip|v6e-4chip|v6e-8chip|teardown> [tier]" >&2
             exit 1
             ;;
     esac
@@ -411,7 +439,7 @@ if [[ "${MODE}" == "teardown" ]]; then
     # Safety net for cancelled workflows: delete every cluster created by this CI run.
     selector="verl-ci/managed=true,verl-ci/run-id=${RUN_ID}"
     if [[ -n "${2:-}" ]]; then
-        selector="${selector},verl-ci/suite=${2}"
+        selector="${selector},verl-ci/tier=${2}"
     fi
     log "Deleting RayClusters matching ${selector}"
     delete_ray_clusters "${selector}"
@@ -424,4 +452,4 @@ trap 'exit 143' TERM
 
 ensure_kueue_queue
 reap_stale_clusters
-run_suite "${MODE}"
+run_tier "${MODE}"

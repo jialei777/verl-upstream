@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify the Ray job log of a TPU CI suite (smoke / sft / grpo).
+"""Verify the Ray job log of a TPU CI test (smoke: TPU platform / sft: trainer / grpo: RL).
 
 Usage:
     python3 tests/special_tpu/verify_tpu_e2e_log.py <suite> <log_file> <smoke_test: 0|1>

@@ -18,7 +18,7 @@ metadata:
   labels:
     app: github-tpu-ci-runner
 spec:
-  # One runner per TPU CI suite (smoke / sft / grpo) so the jobs of a workflow run in
+  # One runner per TPU CI tier (v6e 1-chip / 4-chip / 8-chip) so the jobs of a workflow run in
   # parallel. Runners only submit work; TPU contention across runs is resolved by the
   # Kueue LocalQueue `verl-tpu-ci` (see tests/special_tpu/gke/kueue-tpu-ci.yaml).
   replicas: 3

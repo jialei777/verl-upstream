@@ -28,16 +28,18 @@ Once the cluster is running, see:
 
 ## 🧪 TPU CI (`.github/workflows/e2e_tpu.yml`)
 
-The CI does **not** use the long-lived cluster above. Each suite provisions its own short-lived RayCluster on the CI GKE cluster (`jialeic-ci-v6e8-2s-spot`) with [`tests/special_tpu/run_tpu_e2e_ci.sh`](../../../tests/special_tpu/run_tpu_e2e_ci.sh):
+The CI does **not** use the long-lived cluster above. It is split into tiers by TPU chip count. Each tier is its own GitHub Actions job and provisions its own short-lived RayCluster on the CI GKE cluster (`jialeic-ci-v6e8-2s-spot`) with [`tests/special_tpu/run_tpu_e2e_ci.sh`](../../../tests/special_tpu/run_tpu_e2e_ci.sh), then runs that tier's tests on it:
 
-| Suite   | TPU workers | Chips used | What it runs |
-|---------|-------------|-----------:|--------------|
-| `smoke` | 1 x v6e-1 (whole `ct6e-standard-1t` node) | 1 | [`tests/special_tpu/tpu_smoke_test.py`](../../../tests/special_tpu/tpu_smoke_test.py): `import torch_tpu`, `.to("tpu")`, bf16 matmul, autograd, TPU-vs-CPU MLP forward/backward |
-| `sft`   | 1 x v6e-4 subslice | 4 | Qwen3-0.6B GSM8K SFT (TorchTitan FSDP2) |
-| `grpo`  | 2 x v6e-4 subslices | 8 | Qwen3-0.6B GSM8K GRPO: 4-chip trainer on `tpu-group-0` + 4-chip vLLM rollout on `tpu-group-1` |
+| CI job | Tier (`run_tpu_e2e_ci.sh` arg) | TPU workers | Scope | Tests today |
+|--------|--------------------------------|-------------|-------|-------------|
+| `v6e 1-chip (TPU platform tests)` | `v6e-1chip` | 1 x v6e-1 (whole `ct6e-standard-1t` node) | TPU platform | `test_tpu_platform`: [`tests/special_tpu/tpu_smoke_test.py`](../../../tests/special_tpu/tpu_smoke_test.py): `import torch_tpu`, `.to("tpu")`, bf16 matmul, autograd, TPU-vs-CPU MLP forward/backward |
+| `v6e 4-chip (trainer tests)` | `v6e-4chip` | 1 x v6e-4 subslice | Trainer | `test_trainer_sft`: Qwen3-0.6B GSM8K SFT (TorchTitan FSDP2) |
+| `v6e 8-chip (RL tests)` | `v6e-8chip` | 2 x v6e-4 subslices | RL | `test_rl_grpo`: Qwen3-0.6B GSM8K GRPO, 4-chip trainer on `tpu-group-0` + 4-chip vLLM rollout on `tpu-group-1` |
+
+To add a test, write a `test_*` function in `run_tpu_e2e_ci.sh` (one Ray job, optionally with a verifier in [`tests/special_tpu/verify_tpu_e2e_log.py`](../../../tests/special_tpu/verify_tpu_e2e_log.py)) and call it from the matching tier in `run_tier`. Tests in a tier run one after another on the same RayCluster.
 
 - **Queueing**: the RayCluster ([`tests/special_tpu/gke/raycluster-ci.yaml`](../../../tests/special_tpu/gke/raycluster-ci.yaml)) is labelled `kueue.x-k8s.io/queue-name: verl-tpu-ci`. Kueue ([`tests/special_tpu/gke/kueue-tpu-ci.yaml`](../../../tests/special_tpu/gke/kueue-tpu-ci.yaml), 16-chip quota) keeps it suspended until enough TPU quota is free, then admits the whole cluster at once, so concurrent CI runs wait in FIFO order instead of competing for hosts.
-- **Subslicing**: each TPU worker replica requests one v6e host (`google.com/tpu: 4`) with the `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation, i.e. a single-host KubeRay subslice (v6e-4) of the 2x4 (v6e-8) node pools, and shows up in Ray as its own slice (`tpu-group-<i>`). A whole host is the smallest multi-chip unit: GKE rejects smaller TPU requests on these node pools and libtpu cannot start an ICI session on a 2-chip subset of a host (`START_SESSION failed`). To avoid idling 3 chips of a host, the 1-chip smoke suite runs on a dedicated 1x1 node pool instead (no subslice annotation, `google.com/tpu: 1`, own Kueue flavor `verl-tpu-ci-v6e-1t`). The pool scales from zero, so a smoke run pays a ~3 min node boot + image pull and costs nothing while idle:
+- **Subslicing**: each TPU worker replica requests one v6e host (`google.com/tpu: 4`) with the `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation, i.e. a single-host KubeRay subslice (v6e-4) of the 2x4 (v6e-8) node pools, and shows up in Ray as its own slice (`tpu-group-<i>`). A whole host is the smallest multi-chip unit: GKE rejects smaller TPU requests on these node pools and libtpu cannot start an ICI session on a 2-chip subset of a host (`START_SESSION failed`). To avoid idling 3 chips of a host, the `v6e-1chip` tier runs on a dedicated 1x1 node pool instead (no subslice annotation, `google.com/tpu: 1`, own Kueue flavor `verl-tpu-ci-v6e-1t`). The pool scales from zero, so a 1-chip run pays a ~3 min node boot + image pull and costs nothing while idle:
 
   ```bash
   gcloud container node-pools create verl-ci-v6e-1t --cluster jialeic-ci-v6e8-2s-spot \
@@ -50,8 +52,8 @@ The CI does **not** use the long-lived cluster above. Each suite provisions its 
 > [!WARNING]
 > Do not apply `ray-tpu-v6e8-2slice.yaml` on the CI cluster: it pins all 16 chips outside of Kueue and CI RayClusters would stay unschedulable.
 
-Run a suite by hand (from a machine with `kubectl` access and the `ray` CLI):
+Run a tier by hand (from a machine with `kubectl` access and the `ray` CLI):
 
 ```bash
-bash tests/special_tpu/run_tpu_e2e_ci.sh smoke   # or sft / grpo
+bash tests/special_tpu/run_tpu_e2e_ci.sh v6e-1chip   # or v6e-4chip / v6e-8chip
 ```

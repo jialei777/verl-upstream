@@ -1,16 +1,16 @@
 # Per-run RayCluster template for the verl TPU CI.
 #
 # Rendered by tests/special_tpu/run_tpu_e2e_ci.sh (Python string.Template, dollar-brace
-# placeholders) and applied once per CI suite, then deleted on exit.
+# placeholders) and applied once per CI tier, then deleted on exit.
 #
 # - Queued through Kueue (`kueue.x-k8s.io/queue-name`): the RayCluster stays suspended
 #   until the `verl-tpu-ci` LocalQueue has free TPU quota, then all pods are created.
-# - Worker shape (rendered per suite by the script):
-#   * sft/grpo - RayCluster subslicing: the worker group carries the
+# - Worker shape (rendered per tier by the script):
+#   * v6e-4chip / v6e-8chip - RayCluster subslicing: the worker group carries the
 #     `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation so the KubeRay TPU webhook
 #     treats every replica as a standalone 2x2 single-host slice (v6e-4) carved out of a 2x4
 #     (v6e-8) node pool. Each replica becomes its own Ray TPU slice (`tpu-group-0`, ...).
-#   * smoke    - one whole 1x1 node (ct6e-standard-1t, 1 chip), so no chips sit idle.
+#   * v6e-1chip - one whole 1x1 node (ct6e-standard-1t, 1 chip), so no chips sit idle.
 # - A single host is the smallest multi-chip unit: GKE only admits whole-host TPU requests
 #   (4 chips) on 2x4 nodes, and libtpu cannot start an ICI session for a 2-chip subset of a
 #   host (START_SESSION fails). 1 chip needs its own 1x1 node pool.
@@ -22,7 +22,7 @@ metadata:
   labels:
     kueue.x-k8s.io/queue-name: ${KUEUE_QUEUE}
     verl-ci/managed: "true"
-    verl-ci/suite: ${SUITE}
+    verl-ci/tier: ${TIER}
     verl-ci/run-id: "${CI_RUN_ID}"
   annotations:
     verl-ci/owner: "${CI_OWNER}"
@@ -85,8 +85,8 @@ spec:
         metadata:
           annotations:
             gke-gcsfuse/volumes: "true"
-            # sft/grpo: `cloud.google.com/gke-tpu-slice-topology: 2x2` (subslice of a 2x4 host).
-            # smoke: an inert `verl-ci/tpu-slice-topology: 1x1` marker (whole 1-chip node).
+            # 4/8-chip tiers: `cloud.google.com/gke-tpu-slice-topology: 2x2` (subslice of a 2x4 host).
+            # 1-chip tier: an inert `verl-ci/tpu-slice-topology: 1x1` marker (whole 1-chip node).
             ${SLICE_ANNOTATION_KEY}: ${SLICE_ANNOTATION_VALUE}
         spec:
           serviceAccountName: ray-ksa
