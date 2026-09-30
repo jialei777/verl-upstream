@@ -32,7 +32,6 @@ set -xeuo pipefail
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
 export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-tpu7x}"
-export ALLOW_MULTIPLE_LIBTPU_LOAD=1
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=1
 export RAY_memory_monitor_refresh_ms=0

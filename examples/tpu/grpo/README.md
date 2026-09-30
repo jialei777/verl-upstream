@@ -5,7 +5,7 @@ This directory contains examples and scripts for running **GRPO (Group Relative 
 The training setup uses:
 - **Actor Engine**: TorchTitan (`model_engine=torchtitan`)
 - **Rollout Engine**: vLLM (`actor_rollout_ref.rollout.name=vllm`)
-- **Placement Strategy**: Non-colocated multi-slice execution (Slice 0 for Trainer/Actor, Slice 1 for Rollout) or single-host split sharing (`2x2x1` TPU 7x)
+- **Placement Strategy**: Non-colocated multi-slice execution (Slice 0 for Trainer/Actor, Slice 1 for Rollout)
 - **TPU 7x (`2x2x1` Single-Host Topology)**: Each `2x2x1` host (`numOfHosts: 1`) provides 4 physical dual-core chips = 8 addressable TensorCore devices (`NNODES=1`, `N_CHIPS=8`, 4D mesh topology `2,2,1,2`).
 
 ---
@@ -54,7 +54,6 @@ ray job submit --address "${RAY_ADDRESS}" \
       "PYTHONUNBUFFERED": "1",
       "VERL_PLATFORM": "tpu",
       "TPU_ACCELERATOR_TYPE": "tpu7x",
-      "ALLOW_MULTIPLE_LIBTPU_LOAD": "1",
       "VLLM_USE_V1": "0",
       "RAY_memory_monitor_refresh_ms": "0",
       "RAY_memory_usage_threshold": "0.99",
