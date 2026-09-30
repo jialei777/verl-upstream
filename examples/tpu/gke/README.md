@@ -46,7 +46,7 @@ To add a test, write a `test_*` function in `run_tpu_e2e_ci.sh` (one Ray job, op
   | `verl-tpu-ci-4chip` | 8 chips guaranteed (two trainer jobs) | borrows unused chips from `8chip` (cohort `verl-tpu-ci-v6e`, 16 chips total) |
   | `verl-tpu-ci-8chip` | 8 chips guaranteed (one RL job) | borrows unused chips from `4chip` |
 
-  There is no preemption: borrowed chips are returned when the CI job finishes. Watch the queues with `kubectl get localqueue` / `kubectl get workloads`.
+  There is no preemption: borrowed chips are returned when the CI job finishes. Watch the queues with `kubectl get localqueue` / `kubectl get workloads`. CI only creates the queues when they are missing and never modifies them; roll out changes to `kueue-tpu-ci.yaml` with `kubectl apply -f tests/special_tpu/gke/kueue-tpu-ci.yaml`.
 - **Subslicing**: each TPU worker replica requests one v6e host (`google.com/tpu: 4`) with the `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation, i.e. a single-host KubeRay subslice (v6e-4) of the 2x4 (v6e-8) node pools, and shows up in Ray as its own slice (`tpu-group-<i>`). A whole host is the smallest multi-chip unit: GKE rejects smaller TPU requests on these node pools and libtpu cannot start an ICI session on a 2-chip subset of a host (`START_SESSION failed`). To avoid idling 3 chips of a host, the `v6e-1chip` tier runs on a dedicated 1x1 node pool instead (no subslice annotation, `google.com/tpu: 1`, own Kueue flavor `verl-tpu-ci-v6e-1t`). The pool scales from zero, so a 1-chip run pays a ~3 min node boot + image pull and costs nothing while idle:
 
   ```bash

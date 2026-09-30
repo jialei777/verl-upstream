@@ -24,8 +24,9 @@
 #   4/8-chip worker reserves one host. Kueue picks the flavor whose node labels match the
 #   worker's nodeSelector (topology 2x4 vs 1x1).
 #
-# Applied idempotently by tests/special_tpu/run_tpu_e2e_ci.sh on every run:
+# Rolled out by an admin (the queues are shared by every PR, so CI never modifies them):
 #   kubectl apply -f tests/special_tpu/gke/kueue-tpu-ci.yaml
+# tests/special_tpu/run_tpu_e2e_ci.sh only applies this file when the tier's LocalQueue is missing.
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ResourceFlavor

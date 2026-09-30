@@ -121,8 +121,16 @@ cleanup() {
 }
 
 ensure_kueue_queue() {
-    # Idempotent: creates/updates the ResourceFlavors, ClusterQueue and LocalQueue.
-    kubectl apply -f tests/special_tpu/gke/kueue-tpu-ci.yaml
+    # Bootstrap only: create the Kueue objects if this tier's LocalQueue does not exist yet. The
+    # queues and quotas are shared by every PR, so an existing setup is never modified from CI;
+    # changes to kueue-tpu-ci.yaml are rolled out by an admin with `kubectl apply -f`.
+    local queue="${KUEUE_QUEUE_PREFIX}-${MODE#v6e-}"
+    if kubectl get localqueue -n "${RAY_NAMESPACE}" "${queue}" >/dev/null 2>&1; then
+        log "Kueue LocalQueue ${queue} exists."
+    else
+        log "Kueue LocalQueue ${queue} not found; applying tests/special_tpu/gke/kueue-tpu-ci.yaml."
+        kubectl apply -f tests/special_tpu/gke/kueue-tpu-ci.yaml
+    fi
 }
 
 reap_stale_clusters() {
@@ -233,6 +241,12 @@ wait_for_ray_cluster() {
         sleep 10
     done
     kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME}" -o wide
+    if [[ "${ready_pods}" -lt "${want_pods}" ]]; then
+        log "ERROR: RayCluster ${RAY_CLUSTER_NAME} pods not ready within 25 minutes of admission." >&2
+        kubectl get events -n "${RAY_NAMESPACE}" --sort-by=.lastTimestamp 2>/dev/null \
+            | grep "${RAY_CLUSTER_NAME}" | tail -n 20 >&2 || true
+        exit 1
+    fi
 
     HEAD_POD="$(kubectl get pods -n "${RAY_NAMESPACE}" -l "ray.io/cluster=${RAY_CLUSTER_NAME},ray.io/node-type=head" \
         -o jsonpath='{.items[0].metadata.name}')"
@@ -335,6 +349,11 @@ print(json.dumps({
             ray job status --address http://127.0.0.1:8265 "${sub_id}" 2>/dev/null \
             | grep -E "Job '.*' (succeeded|failed|was stopped)|Status message|Status for job" || true)"
         log "${sub_id}: $(tail -n 1 <<<"${status_out}")"
+        if [[ -z "${status_out}" ]] && ! kubectl get pod -n "${RAY_NAMESPACE}" "${HEAD_POD}" >/dev/null 2>&1; then
+            log "ERROR: Ray head pod ${HEAD_POD} is gone (evicted or preempted)." >&2
+            final_status="HEAD_LOST"
+            break
+        fi
         local status_lower="${status_out,,}"
         if [[ "${status_lower}" == *"' succeeded"* || "${status_lower}" == *"': succeeded"* ]]; then
             final_status="SUCCEEDED"

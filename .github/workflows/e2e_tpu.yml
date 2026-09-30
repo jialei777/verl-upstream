@@ -19,9 +19,8 @@
 #
 # tests/special_tpu/run_tpu_e2e_ci.sh provisions the tier's RayCluster through the tier's Kueue
 # LocalQueue (`verl-tpu-ci-{1chip,4chip,8chip}`, FIFO per tier), so concurrent jobs queue for TPU
-# quota instead of fighting for hosts,
-# runs the tier's tests, and deletes the cluster on exit. The final `if: always()` step deletes it
-# again in case the job was cancelled.
+# quota instead of fighting for hosts, runs the tier's tests, and deletes the cluster on exit. The
+# final `if: always()` step deletes it again in case the job was cancelled.
 
 name: e2e_tpu
 

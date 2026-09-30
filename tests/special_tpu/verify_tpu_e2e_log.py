@@ -14,7 +14,7 @@
 """Verify the Ray job log of a TPU CI test (smoke: TPU platform / sft: trainer / grpo: RL).
 
 Usage:
-    python3 tests/special_tpu/verify_tpu_e2e_log.py <suite> <log_file> <smoke_test: 0|1>
+    python3 tests/special_tpu/verify_tpu_e2e_log.py <smoke|sft|grpo> <log_file> <smoke_test: 0|1>
 """
 
 import math
@@ -94,11 +94,11 @@ VERIFIERS = {"smoke": verify_smoke, "sft": verify_sft, "grpo": verify_grpo}
 
 
 def main() -> None:
-    suite, log_path, smoke_test = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+    test_name, log_path, smoke_test = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
     text = open(log_path, encoding="utf-8", errors="replace").read()
-    if suite != "smoke" and not re.findall(r"step[:\s]+([1-9][0-9]*)", text, flags=re.IGNORECASE):
-        sys.exit(f"[TPU CI] ERROR: No training steps logged in {suite} output.")
-    VERIFIERS[suite](text, smoke_test)
+    if test_name != "smoke" and not re.findall(r"step[:\s]+([1-9][0-9]*)", text, flags=re.IGNORECASE):
+        sys.exit(f"[TPU CI] ERROR: No training steps logged in {test_name} output.")
+    VERIFIERS[test_name](text, smoke_test)
 
 
 if __name__ == "__main__":
