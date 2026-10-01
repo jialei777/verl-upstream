@@ -79,18 +79,16 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
-# TorchTitan trainer: the fastest validated 4B config on v6e-8, following torchtitan's TPU recipes
+# TorchTitan trainer: the fastest validated 4B trainer config on v6e-8, following torchtitan's TPU recipes
 # (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md):
 #   * per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas kernel (compile on
 #     TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu);
 #   * SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled block;
 #   * torch_tpu DEFER_AND_FUSE eager mode: ops outside the compiled blocks (LM head, log-prob/loss, grad
 #     clipping, optimizer) are fused into larger XLA programs instead of one program per op;
-#   * 4 packed sequences per trainer micro batch (actor update, old/ref log-prob);
-#   * raiden weight sync: P2P push from each trainer rank's local shard (~14 s at 4B vs ~26 s for the
-#     rank-0 gather of the tpu backend).
-# Measured (SMOKE_TEST, ~700-token responses): update_actor ~2.7-4.1 s and step ~25-37 s (rollout +
-# weight-sync bound), vs update_actor 26.6 s and step ~63.5 s with all of the above off.
+#   * 4 packed sequences per trainer micro batch (actor update, old/ref log-prob).
+# Trainer compute per step (old_log_prob + ref + update_actor) is ~4.5 s vs ~37 s with all of the above off.
+# Weight sync uses the tpu checkpoint engine (gather to rank 0, publish through the Ray object store).
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -151,7 +149,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \

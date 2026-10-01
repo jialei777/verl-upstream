@@ -228,9 +228,8 @@ def export_local_shards(engine) -> tuple[list[tuple[str, torch.Tensor]], dict[st
     is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     if full_names and not _WARNED_FULL_EXPORT and is_rank0:
         # A tensor that is not a dim-0 shard is exported FULL on every rank: every rank holds a full bf16 send
-        # buffer for it and pushes the same bytes. This defeats the point of the sharded export, and it is how
-        # the fused-QKV all-gather was found (q/k/v arrived here as Replicate DTensors; see
-        # torchtitan/utils.py::shard_export_state_dict). Warn once so such regressions are visible.
+        # buffer for it and pushes the same bytes. Known case: torchtitan's FusedQKVLinear save hook all-gathers
+        # wqkv before splitting it, so HF q/k/v arrive here as Replicate DTensors. Warn once so it is visible.
         _WARNED_FULL_EXPORT = True
         logger.warning(
             f"Raiden export: {len(full_names)} tensors are not dim-0 shards and are exported full on every rank, "
@@ -512,10 +511,10 @@ class RaidenCheckpointEngine(CheckpointEngine):
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
         # Keep the bound device buffers alive until the transfer completes: the controller-driven push reads
-        # them after send_weights returns. They are bf16 copies of every exported tensor (~0.94 GB/rank at 4B
-        # on 8 shards), so they must NOT live until the next send_weights: that would hold them through the
-        # whole next training step, where they OOMed update_actor at 4B with micro-batch 4. update_raiden_weights
-        # calls release_device_buffers() as soon as the push is done.
+        # them after send_weights returns. They are bf16 copies of every exported tensor (~1.9 GB/rank at 4B on
+        # 8 shards), so they must NOT live until the next send_weights: that would hold them through the whole
+        # next training step and steal HBM from it. update_raiden_weights calls release_device_buffers() as
+        # soon as the push is done.
         self._bound_tensors = [t for _, t in valid_weights]
 
         # No explicit ws.d2h() here: PushWeightsResharded (triggered by the controller's start_transfer)

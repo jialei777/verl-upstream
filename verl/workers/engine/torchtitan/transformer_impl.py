@@ -74,7 +74,6 @@ from verl.workers.engine.torchtitan.utils import (
     enable_fsdp_gradient_division,
     get_attention_masks,
     make_simple_fsdp_parallelize_fn,
-    shard_export_state_dict,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -719,9 +718,7 @@ class TorchTitanEngine(BaseEngine):
         self._assert_shard_export_supported()
         raw = {}
         for module in self.module:
-            # Not module.state_dict(): torchtitan's fused-QKV save hook would all-gather wqkv on every rank and
-            # hand back full q/k/v tensors, defeating the sharded export (see shard_export_state_dict).
-            raw.update(shard_export_state_dict(module))
+            raw.update(module.state_dict())
 
         # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
         stacks = {}

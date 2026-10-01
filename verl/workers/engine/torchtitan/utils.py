@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
 import importlib
 import logging
 import re
@@ -223,96 +222,6 @@ def make_simple_fsdp_parallelize_fn(parallelize_fn, *, spmd_safe_blocks: bool = 
         return model
 
     return _parallelize
-
-
-def _split_fused_qkv_local(qkv_module: nn.Module, prefix: str, param_name: str, param: Any) -> dict | None:
-    """Split this rank's ``wqkv`` shard into ``Shard(0)`` q/k/v DTensors without any collective.
-
-    torchtitan's ``FusedQKVLinear`` stores rows as ``[n_kv, heads_per_kv + 2, head_dim]`` (q heads of a kv group,
-    then its k and v). When the 1-D FSDP ``Shard(0)`` split gives every rank whole kv groups (``n_kv % shards == 0``),
-    this rank's q/k/v rows are exactly the ``Shard(0)`` block of the HF ``q_proj``/``k_proj``/``v_proj`` tensors.
-    Returns ``None`` when the layout does not allow it, so the caller falls back to the all-gathering hook.
-
-    Example, Qwen3-4B on 8 FSDP shards (n_heads=32, n_kv=8, head_dim=128, so heads_per_kv=4):
-      * ``wqkv`` has 8 * (4 + 2) * 128 = 6144 rows; rank r holds rows [768r, 768r + 768) = kv group r, i.e.
-        q heads 4r..4r+3 (512 rows), then k head r (128 rows), then v head r (128 rows).
-      * HF ``q_proj`` (4096 rows) under ``Shard(0)`` gives rank r rows [512r, 512r + 512) = q heads 4r..4r+3;
-        ``k_proj``/``v_proj`` (1024 rows each) give rank r rows [128r, 128r + 128) = kv head r.
-      * So each rank's slices of its own ``wqkv`` shard are already its HF q/k/v shards.
-    """
-    from torch.distributed.tensor import Shard
-
-    if not isinstance(param, DTensor) or param.device_mesh.ndim != 1 or tuple(param.placements) != (Shard(0),):
-        return None
-    hd, hpk, r = qkv_module.head_dim, qkv_module.heads_per_kv, qkv_module.r_dim
-    shards = param.device_mesh.size()
-    n_kv = param.shape[0] // (r * hd)
-    if n_kv * r * hd != param.shape[0] or n_kv % shards:
-        return None
-    local = param.to_local().detach()
-    tail = tuple(local.shape[1:])
-    grouped = local.reshape(n_kv // shards, r, hd, *tail)
-    out = {}
-    for name, rows in (("wq", grouped[:, :hpk]), ("wk", grouped[:, hpk]), ("wv", grouped[:, hpk + 1])):
-        rows = rows.reshape(-1, *tail).contiguous()
-        full_shape = (rows.shape[0] * shards, *tail)
-        stride = tuple(int(torch.Size(full_shape)[d + 1 :].numel()) for d in range(len(full_shape)))
-        out[f"{prefix}{name}.{param_name}"] = DTensor.from_local(
-            rows, param.device_mesh, [Shard(0)], run_check=False, shape=torch.Size(full_shape), stride=stride
-        )
-    return out
-
-
-def _local_split_qkv_on_save(module, state_dict, prefix, local_metadata, *, fallback) -> None:
-    """``state_dict`` post-hook: like ``FusedQKVLinear._split_qkv_on_save`` but split locally when possible."""
-    for param_name in ("weight", "bias"):
-        key = f"{prefix}wqkv.{param_name}"
-        if key not in state_dict:
-            continue
-        split = _split_fused_qkv_local(module, prefix, param_name, state_dict[key])
-        if split is None:
-            fallback(module, state_dict, prefix, local_metadata)
-            return
-        del state_dict[key]
-        state_dict.update(split)
-
-
-def shard_export_state_dict(module: nn.Module) -> dict[str, Any]:
-    """``module.state_dict()`` for the sharded weight export, minus the fused-QKV all-gather when avoidable.
-
-    Why: the Raiden checkpoint engine has every trainer rank push only its own dim-0 FSDP shard, so no rank
-    ever materializes the full model. torchtitan's ``FusedQKVLinear`` breaks that: its ``state_dict`` post-hook
-    (``_split_qkv_on_save``) redistributes ``wqkv`` to ``Replicate`` (an all-gather on every rank) before
-    splitting it into HF ``wq``/``wk``/``wv``, because a ``Shard(0)`` slice of the fused tensor is not in
-    general a ``Shard(0)`` slice of q, k and v. The export then saw q/k/v as full tensors, so at Qwen3-4B on 8
-    shards every rank paid, on every weight sync:
-      * a ~2.3 GB fp32 all-gather transient (36 layers of ``wqkv``),
-      * ~1.05 GB of extra bf16 send buffers (108 full q/k/v tensors, vs 0.94 GB for the whole sharded model),
-      * and pushed the same q/k/v bytes from all 8 ranks.
-    Together with the send buffers being held across the training step, this OOMed ``update_actor``.
-
-    Fix: while this runs, that hook is swapped for one that splits each rank's local shard into ``Shard(0)``
-    q/k/v blocks (exact when every rank holds whole kv groups, see ``_split_fused_qkv_local``), falling back
-    to the original hook when the layout does not allow a local split. The original hook is restored
-    afterwards, so regular checkpoint saving is unchanged.
-    """
-    swapped = []
-    for mod in module.modules():
-        hooks = getattr(mod, "_state_dict_hooks", None)
-        if not hooks or not hasattr(mod, "r_dim"):
-            continue
-        for hook_id, hook in list(hooks.items()):
-            if getattr(hook, "__name__", "") != "_split_qkv_on_save":
-                continue
-            local_hook = functools.partial(_local_split_qkv_on_save, fallback=hook)
-            local_hook._from_public_api = getattr(hook, "_from_public_api", False)
-            hooks[hook_id] = local_hook
-            swapped.append((hooks, hook_id, hook))
-    try:
-        return module.state_dict()
-    finally:
-        for hooks, hook_id, hook in swapped:
-            hooks[hook_id] = hook
 
 
 def get_attention_masks(
