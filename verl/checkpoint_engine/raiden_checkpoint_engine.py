@@ -227,7 +227,10 @@ def export_local_shards(engine) -> tuple[list[tuple[str, torch.Tensor]], dict[st
     global _WARNED_FULL_EXPORT
     is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     if full_names and not _WARNED_FULL_EXPORT and is_rank0:
-        # Every rank holds and registers these in full: extra HBM and redundant transfer volume.
+        # A tensor that is not a dim-0 shard is exported FULL on every rank: every rank holds a full bf16 send
+        # buffer for it and pushes the same bytes. This defeats the point of the sharded export, and it is how
+        # the fused-QKV all-gather was found (q/k/v arrived here as Replicate DTensors; see
+        # torchtitan/utils.py::shard_export_state_dict). Warn once so such regressions are visible.
         _WARNED_FULL_EXPORT = True
         logger.warning(
             f"Raiden export: {len(full_names)} tensors are not dim-0 shards and are exported full on every rank, "
@@ -509,7 +512,10 @@ class RaidenCheckpointEngine(CheckpointEngine):
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
         # Keep the bound device buffers alive until the transfer completes: the controller-driven push reads
-        # them after send_weights returns. update_raiden_weights then calls release_device_buffers().
+        # them after send_weights returns. They are bf16 copies of every exported tensor (~0.94 GB/rank at 4B
+        # on 8 shards), so they must NOT live until the next send_weights: that would hold them through the
+        # whole next training step, where they OOMed update_actor at 4B with micro-batch 4. update_raiden_weights
+        # calls release_device_buffers() as soon as the push is done.
         self._bound_tensors = [t for _, t in valid_weights]
 
         # No explicit ws.d2h() here: PushWeightsResharded (triggered by the controller's start_transfer)
@@ -544,10 +550,17 @@ class RaidenCheckpointEngine(CheckpointEngine):
     def release_device_buffers(self) -> None:
         """Drop the bf16 device copies bound for the last push once the transfer has completed.
 
-        ``send_weights`` casts every local shard to a fresh bf16 device tensor (~2 bytes/param/rank) and
-        keeps it alive for the controller-driven push. Once ``start_transfer`` has finished, nothing reads
-        them until the next ``send_weights`` rebinds new buffers, so holding them only steals HBM from the
-        next training step.
+        Why: ``send_weights`` casts every exported tensor to a fresh bf16 device tensor (~2 bytes/param/rank)
+        and keeps it in ``_bound_tensors`` for the controller-driven push. Previously they stayed alive until
+        the next ``send_weights`` replaced them, i.e. through the entire next training step. At Qwen3-4B on
+        v6e-8 (32 GB HBM) the trainer is already near the limit at micro-batch 4 (fp32 master weights + AdamW
+        state + activations + the logits buffer), so those extra ~1-2 GB/rank made the second ``update_actor``
+        OOM.
+
+        Safe because: once ``start_transfer`` has finished, the push has already read them, nothing else reads
+        them until the next ``send_weights`` binds new buffers, and tpu_sync's ``WeightSynchronizer`` keeps
+        its own host buffers rather than a reference to these device tensors, so dropping our reference
+        frees the HBM.
         """
         if self._bound_tensors is None:
             return
@@ -679,8 +692,10 @@ async def update_raiden_weights(
     await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
 
-    # The push has read the trainer device buffers; free them so they don't hold HBM through the next
-    # training step. Runs concurrently with the sampler-side install below.
+    # The P2P push has finished reading the trainer's bf16 device send buffers. Free them now instead of at
+    # the next send_weights, otherwise they occupy trainer HBM through the next training step (OOM at 4B with
+    # micro-batch 4; see RaidenCheckpointEngine.release_device_buffers). This is a small control RPC per trainer
+    # rank, run concurrently with the sampler-side install below, so it adds no latency.
     release_refs = manager.actor_wg.execute_checkpoint_engine(["release_device_buffers"] * manager.actor_wg.world_size)
     release_task = asyncio.create_task(asyncio.to_thread(ray.get, release_refs)) if release_refs is not None else None
 

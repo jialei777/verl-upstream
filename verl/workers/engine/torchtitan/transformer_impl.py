@@ -738,6 +738,8 @@ class TorchTitanEngine(BaseEngine):
         self._assert_shard_export_supported()
         raw = {}
         for module in self.module:
+            # Not module.state_dict(): torchtitan's fused-QKV save hook would all-gather wqkv on every rank and
+            # hand back full q/k/v tensors, defeating the sharded export (see shard_export_state_dict).
             raw.update(shard_export_state_dict(module))
 
         # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
