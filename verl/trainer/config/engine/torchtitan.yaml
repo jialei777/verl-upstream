@@ -92,6 +92,11 @@ tpu_eager_mode: null
 # and reshard once at the end: one all-gather per pass instead of one per micro-batch
 forward_only_keep_unsharded: false
 
+# Shard parameters with torchtitan's SimpleFSDP (DTensor parametrization: the FSDP all-gather and
+# reduce-scatter are traced into each compiled TransformerBlock) instead of FSDP2 hooks, as
+# torchtitan's TPU recipes do. Pure FSDP/HSDP only (no TP/PP/CP/EP)
+use_simple_fsdp: false
+
 # Whether to use forward only
 forward_only: false
 

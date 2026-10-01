@@ -55,6 +55,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
     TPUPhaseTimer,
+    align_micro_batch_shapes_across_ranks,
     apply_splash_attention_tpu,
     bucket_length,
     compute_global_batch_num_tokens,
@@ -74,6 +75,7 @@ from verl.workers.engine.torchtitan.utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
+    make_simple_fsdp_parallelize_fn,
     shard_export_state_dict,
 )
 
@@ -153,6 +155,11 @@ class TorchTitanEngine(BaseEngine):
         # Get ModelSpec from model registry
         model_module = importlib.import_module(f"torchtitan.models.{torchtitan_name}")
         model_spec = model_module.model_registry(torchtitan_flavor, attn_backend=self.engine_config.attn_type)
+        self._use_simple_fsdp = self.engine_config.use_simple_fsdp
+        if self._use_simple_fsdp:
+            model_spec.parallelize_fn = make_simple_fsdp_parallelize_fn(
+                model_spec.parallelize_fn, spmd_safe_blocks=device_name == "tpu"
+            )
 
         # Use foreach optimizer implementation on TPU.
         impl = "foreach" if get_platform().device_name == "tpu" else "fused"
@@ -285,7 +292,10 @@ class TorchTitanEngine(BaseEngine):
         # Re-enable FSDP's gradient division for verl's loss scaling.
         # TorchTitan disables gradient division by default (for global token normalization),
         # but verl's loss function multiplies by dp_size to compensate for gradient averaging.
-        if self.engine_config.data_parallel_shard_size > 1:
+        # SimpleFSDP has no divide factor (its backward reduce-scatter sums), so forward_backward_batch
+        # scales the loss by 1 / dp_size before backward instead.
+        self._simple_fsdp_loss_scale = 1.0 / self.get_data_parallel_size() if self._use_simple_fsdp else None
+        if self.engine_config.data_parallel_shard_size > 1 and not self._use_simple_fsdp:
             dp_size = self.get_data_parallel_size()
             for model_part in self.trainer.model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
@@ -449,12 +459,16 @@ class TorchTitanEngine(BaseEngine):
             dp_group=self.get_data_parallel_group(),
             same_micro_num_in_dp=True,
         )
+        if is_tpu and self._use_simple_fsdp:
+            # SimpleFSDP's collectives run inside the compiled blocks: every rank must run the same program.
+            align_micro_batch_shapes_across_ranks(micro_batches)
 
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
-        fsdp_enabled = self.engine_config.data_parallel_shard_size > 1
+        # FSDP2-only knobs: SimpleFSDP has no FSDPModule state to keep unsharded.
+        fsdp_enabled = self.engine_config.data_parallel_shard_size > 1 and not self._use_simple_fsdp
         # Training with reshard_after_forward="never" (torchtitan afmv7 recipe): the gathered params
         # stay resident through the whole mini-batch, so FSDP2 all-gathers once per mini-batch instead
         # of twice per micro-batch; they are resharded after the last micro-batch's backward. Gradients
@@ -488,6 +502,9 @@ class TorchTitanEngine(BaseEngine):
                     if timer is not None:
                         timer.mark("forward")
                     if not forward_only:
+                        if self._simple_fsdp_loss_scale is not None:
+                            # SimpleFSDP sums gradients across DP ranks; FSDP2 here averages them.
+                            loss = loss * self._simple_fsdp_loss_scale
                         if is_tpu:
                             synchronize_tpu_loss(loss)
                         loss.backward()

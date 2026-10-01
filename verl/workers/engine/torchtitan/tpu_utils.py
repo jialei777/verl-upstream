@@ -312,6 +312,38 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group, tp_size: int) ->
     return batch_num_tokens.item()
 
 
+def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict]) -> None:
+    """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
+
+    Each rank buckets its own packed token count, so ranks normally run differently shaped programs for the
+    same micro-batch. That is fine while FSDP collectives run as their own eager programs (FSDP2 hooks), but
+    SimpleFSDP traces the all-gather/reduce-scatter into each compiled (``spmd_safe``) TransformerBlock, and
+    collectives inside a program require every participant to run the same program: mismatched shapes halt
+    the TPU (``sync_flag_public_access_error``). One CPU all-reduce(MAX) over all micro-batches' buckets (the
+    same CPU-side collective ``compute_global_batch_num_tokens`` uses) gives each micro-batch a common
+    ``tpu_padded_seq_len`` / ``tpu_max_response_len`` that :func:`pad_packed_inputs_for_tpu` pads up to.
+    Requires the same number of micro-batches on every rank (``same_micro_num_in_dp``).
+    """
+    from verl.utils import tensordict_utils as tu
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
+        return
+    bucket_size = get_tpu_seq_bucket_size()
+    lens = []
+    for mb in micro_batches:
+        ids = mb["input_ids"]
+        n_tokens = ids.values().numel() if getattr(ids, "is_nested", False) else ids.numel()
+        resp = mb["responses"] if "responses" in mb.keys() else None
+        max_resp = int(resp.offsets().diff().max().item()) if getattr(resp, "is_nested", False) else 0
+        lens += [bucket_length(n_tokens, bucket_size), bucket_length(max_resp, bucket_size) if max_resp else 0]
+    lens = torch.tensor(lens, dtype=torch.int64)
+    torch.distributed.all_reduce(lens, op=torch.distributed.ReduceOp.MAX)
+    lens = lens.tolist()
+    for i, mb in enumerate(micro_batches):
+        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", int(lens[2 * i]))
+        tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(lens[2 * i + 1]))
+
+
 def synchronize_tpu_loss(loss: torch.Tensor):
     """Materializes forward graph loss without blocking to split XLA forward and backward compilation passes."""
     try:
@@ -468,7 +500,11 @@ def pad_packed_inputs_for_tpu(
     labels_cpu = torch.roll(input_ids_cpu, shifts=-1, dims=1)
 
     orig_seq_len = int(input_ids_cpu.shape[1])
-    padded_seq_len = bucket_length(orig_seq_len, bucket_size)
+    # tpu_padded_seq_len: common length across ranks from align_micro_batch_shapes_across_ranks (SimpleFSDP).
+    padded_seq_len = max(
+        bucket_length(orig_seq_len, bucket_size),
+        int(tu.get_non_tensor_data(data=micro_batch, key="tpu_padded_seq_len", default=0) or 0),
+    )
     pad_len = padded_seq_len - orig_seq_len
 
     pos_2d_cpu = position_ids_cpu[0] if position_ids_cpu.dim() == 3 else position_ids_cpu
@@ -503,7 +539,11 @@ def pad_packed_inputs_for_tpu(
     if "responses" in micro_batch.keys() and getattr(micro_batch["responses"], "is_nested", False):
         resp_lens = micro_batch["responses"].offsets().diff().cpu()
         raw_max_resp = int(resp_lens.max().item())
-        tu.assign_non_tensor_data(micro_batch, "max_response_len", bucket_length(raw_max_resp, bucket_size))
+        max_resp = max(
+            bucket_length(raw_max_resp, bucket_size),
+            int(tu.get_non_tensor_data(data=micro_batch, key="tpu_max_response_len", default=0) or 0),
+        )
+        tu.assign_non_tensor_data(micro_batch, "max_response_len", max_resp)
 
     return (
         input_ids_cpu.to(device=device).contiguous(),

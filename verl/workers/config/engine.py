@@ -529,6 +529,14 @@ class TorchtitanEngineConfig(EngineConfig):
             micro-batches of a forward-only pass (old/ref log-prob) and reshard once at the end, so every
             layer is all-gathered once per pass instead of once per micro-batch. Costs one unsharded
             parameter copy in the param dtype for the duration of the pass. Default False.
+        use_simple_fsdp (bool): Shard parameters with torchtitan's SimpleFSDP
+            (``torchtitan.experiments.graph_trainer.simple_fsdp``) instead of FSDP2. Parameters become
+            ``Shard(0)`` DTensors whose attribute access all-gathers them (and whose backward
+            reduce-scatters the gradients), so with ``use_torch_compile`` the FSDP collectives are traced
+            into each compiled TransformerBlock instead of running as eager FSDP2 hooks between them, as
+            torchtitan's TPU recipes do (``parallelism.use_simple_fsdp``). Pure FSDP/HSDP only (no
+            TP/PP/CP/EP). ``reshard_after_forward`` and ``forward_only_keep_unsharded`` do not apply:
+            parameters are re-gathered in backward through activation-checkpoint recompute. Default False.
 
     """
 
@@ -560,12 +568,21 @@ class TorchtitanEngineConfig(EngineConfig):
     use_splash_attention: bool = False
     tpu_eager_mode: Optional[str] = None
     forward_only_keep_unsharded: bool = False
+    use_simple_fsdp: bool = False
 
     def __post_init__(self):
         super().__post_init__()
         assert self.tpu_eager_mode in [None, "DEFER_AND_FUSE", "DEFER_NEVER"], (
             f"tpu_eager_mode {self.tpu_eager_mode} not supported"
         )
+        if self.use_simple_fsdp:
+            assert (
+                self.tensor_parallel_size
+                == self.pipeline_parallel_size
+                == self.context_parallel_size
+                == self.expert_parallel_size
+                == 1
+            ), "use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/context/expert parallel size 1)"
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )

@@ -87,8 +87,9 @@ USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-False}"
 USE_SPLASH_ATTENTION="${USE_SPLASH_ATTENTION:-False}"
 # Sequences packed into one trainer micro batch (actor update, old/ref log-prob).
 # Fastest validated 4B setting on v6e-8 (SMOKE_TEST, ~700-token responses): USE_TORCH_COMPILE=True
-# USE_SPLASH_ATTENTION=True MICRO_BATCH_SIZE=4 with the defaults below (step ~34-39 s vs ~39-51 s with
-# DEFER_NEVER + tpu weight sync).
+# USE_SPLASH_ATTENTION=True MICRO_BATCH_SIZE=4 USE_SIMPLE_FSDP=True with the defaults below: update_actor
+# ~2.7-3.8 s (7-8 s with FSDP2, 26.6 s with everything off), step ~25-37 s (rollout + weight-sync bound) vs
+# ~63.5 s with every optimization off.
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 # TPU_EAGER_MODE: torch_tpu eager mode for ops outside the compiled blocks (DEFER_AND_FUSE as in
 # torchtitan's afmv7/qwen3 TPU recipes; null = torch_tpu default DEFER_NEVER, one XLA program per op).
@@ -102,6 +103,11 @@ FORWARD_ONLY_KEEP_UNSHARDED="${FORWARD_ONLY_KEEP_UNSHARDED:-True}"
 # Trainer -> rollout weight sync backend: raiden (P2P from local FSDP shards, ~14 s at 4B) or tpu (gather
 # to rank 0 and publish through the Ray object store, ~26 s at 4B).
 CHECKPOINT_ENGINE_BACKEND="${CHECKPOINT_ENGINE_BACKEND:-raiden}"
+# USE_SIMPLE_FSDP=True shards with torchtitan's SimpleFSDP (as its TPU recipes do) instead of FSDP2: the
+# FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock (use with USE_TORCH_COMPILE).
+USE_SIMPLE_FSDP="${USE_SIMPLE_FSDP:-False}"
+# Activation checkpointing: selective (torchtitan default), full (torchtitan TPU qwen3 recipes), or none.
+ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-selective}"
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -136,6 +142,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.tpu_eager_mode="${TPU_EAGER_MODE}" \
     actor_rollout_ref.actor.torchtitan.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
     actor_rollout_ref.actor.torchtitan.forward_only_keep_unsharded="${FORWARD_ONLY_KEEP_UNSHARDED}" \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp="${USE_SIMPLE_FSDP}" \
+    actor_rollout_ref.actor.torchtitan.activation_checkpoint="${ACTIVATION_CHECKPOINT}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \

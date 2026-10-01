@@ -29,5 +29,6 @@ torchtitan:
   use_splash_attention: ${oc.select:actor_rollout_ref.actor.torchtitan.use_splash_attention,False}
   tpu_eager_mode: ${oc.select:actor_rollout_ref.actor.torchtitan.tpu_eager_mode,null}
   forward_only_keep_unsharded: ${oc.select:actor_rollout_ref.actor.torchtitan.forward_only_keep_unsharded,False}
+  use_simple_fsdp: ${oc.select:actor_rollout_ref.actor.torchtitan.use_simple_fsdp,False}
   reshard_after_forward: ${oc.select:actor_rollout_ref.actor.torchtitan.reshard_after_forward,default}
   forward_only: True
