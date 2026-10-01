@@ -266,3 +266,7 @@ class PlatformBase(abc.ABC):
     def cudart(self) -> Any:
         """Return the CUDA runtime API object, or ``None`` if not applicable."""
         ...
+
+    def get_ray_init_kwargs(self) -> dict[str, Any]:
+        """Return kwargs to pass to ray.init() for this platform."""
+        return {}

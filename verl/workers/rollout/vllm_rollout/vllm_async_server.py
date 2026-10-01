@@ -73,6 +73,26 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
+if get_resource_name() == "TPU":
+    from verl.workers.rollout.vllm_rollout.tpu_utils import (
+        is_tpu_vllm_run,
+        launch_tpu_vllm_servers,
+        override_vllm_configs_for_tpu,
+        patch_vllm_for_tpu,
+        prepare_tpu_server_args,
+    )
+else:
+
+    def is_tpu_vllm_run():
+        return False
+
+    def prepare_tpu_server_args(*args, **kwargs):
+        pass
+
+    def override_vllm_configs_for_tpu(*args, **kwargs):
+        pass
+
+
 # Max wait for admissions already past the submission gate to reach the engine.
 _GATE_BARRIER_TIMEOUT_S = 60.0
 
@@ -253,7 +273,7 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
@@ -453,6 +473,9 @@ class vLLMHttpServer:
         if self._disaggregation_role != "null":
             args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
 
+        prepare_tpu_server_args(args)
+        override_vllm_configs_for_tpu(args)
+
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:
@@ -469,6 +492,7 @@ class vLLMHttpServer:
                 cmds[cmd.name] = cmd
         server_args = parser.parse_args(args=server_args)
         server_args.model = server_args.model_tag
+        override_vllm_configs_for_tpu(server_args)
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
 
@@ -479,7 +503,9 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        override_vllm_configs_for_tpu(args)
         engine_args = AsyncEngineArgs.from_cli_args(args)
+        override_vllm_configs_for_tpu(engine_args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
@@ -1272,6 +1298,10 @@ class vLLMHttpServer:
 
     def _get_worker_extension_cls(self) -> str:
         """Return the fully-qualified colocate worker extension class name."""
+        backend = getattr(getattr(self.config, "checkpoint_engine", None), "backend", None)
+        # Workloads using Raiden for TPU weight sync must use the specialized Raiden worker extension
+        if get_resource_name() == "TPU" and backend == "raiden":
+            return "verl.workers.rollout.vllm_rollout.tpu_utils.vLLMRaidenWorkerExtension"
         return "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
 
     def _get_cli_modules(self) -> list:
@@ -1338,6 +1368,10 @@ class vLLMReplica(RolloutReplica):
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
+
+        if is_tpu_vllm_run():
+            await launch_tpu_vllm_servers(self)
+            return
 
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
@@ -1483,5 +1517,9 @@ class vLLMReplica(RolloutReplica):
     # -----------------------------------------------------------------------
 
     def _get_server_name_prefix(self) -> str:
-        """Return the Ray actor name prefix (e.g. 'vllm_')."""
+        """Return the Ray actor name prefix for server instances (e.g. 'vllm_')."""
         return "vllm_"
+
+
+if is_tpu_vllm_run():
+    patch_vllm_for_tpu()

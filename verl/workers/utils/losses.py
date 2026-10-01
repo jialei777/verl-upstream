@@ -19,16 +19,18 @@ from tensordict import TensorDict
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
+from verl.utils.device import get_device_name
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
+from verl.workers.engine.torchtitan.tpu_utils import select_and_to_padded_tensor, tpu_no_padding_2_padding
 from verl.workers.utils.padding import no_padding_2_padding
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
-    dp_size = data["dp_size"]
-    batch_num_tokens = data["batch_num_tokens"]
+    dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
+    batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
 
     log_prob = model_output["log_probs"]
 
@@ -37,11 +39,18 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # for each sample, loss mask shape is [1, prompt_length + response_length]
         loss_mask = data["loss_mask"]
 
-        log_prob_flatten = log_prob.values()
-        loss_mask_flatten = loss_mask.values()
-
-        # left-shift the loss mask by one token to align with log_prob
-        loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
+        log_prob_flatten = getattr(log_prob, "_tpu_padded_values", None)
+        if log_prob_flatten is not None:
+            loss_mask_flatten = torch.roll(loss_mask.values().detach().cpu(), shifts=-1, dims=0)
+            pad_len = int(log_prob_flatten.shape[0]) - int(loss_mask_flatten.shape[0])
+            if pad_len > 0:
+                loss_mask_flatten = torch.nn.functional.pad(loss_mask_flatten, (0, pad_len), value=0)
+            loss_mask_flatten = loss_mask_flatten.to(device=log_prob_flatten.device)
+        else:
+            log_prob_flatten = log_prob.values()
+            loss_mask_flatten = loss_mask.values()
+            # left-shift the loss mask by one token to align with log_prob
+            loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
 
         # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
@@ -56,14 +65,17 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
-    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+    pad_fn = tpu_no_padding_2_padding if get_device_name() == "tpu" else no_padding_2_padding
+    log_prob = pad_fn(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
-        entropy = no_padding_2_padding(entropy, data)
+        entropy = pad_fn(entropy, data)
 
     # global batch info for loss aggregation
-    config.global_batch_info["dp_size"] = data["dp_size"]
-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    dp_size = tu.get_non_tensor_data(data=data, key="dp_size", default=1)
+    batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
+    config.global_batch_info["dp_size"] = dp_size
+    config.global_batch_info["batch_num_tokens"] = batch_num_tokens
     config.global_batch_info["global_batch_size"] = data["global_batch_size"]
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
@@ -71,8 +83,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
     # to reflect the mean loss over the global batch
     if (
-        data["dp_size"] > 1
-        or data["batch_num_tokens"] is not None
+        dp_size > 1
+        or batch_num_tokens is not None
         or data["global_batch_size"] is not None
         or config.loss_scale_factor is not None
     ):
@@ -88,7 +100,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
-    data = data.select(*fields).to_padded_tensor()
+    data = (
+        select_and_to_padded_tensor(data, *fields)
+        if get_device_name() == "tpu"
+        else data.select(*fields).to_padded_tensor()
+    )
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
@@ -156,7 +172,8 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     Returns:
         value loss
     """
-    vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
+    pad_fn = tpu_no_padding_2_padding if get_device_name() == "tpu" else no_padding_2_padding
+    vpreds = pad_fn(model_output["values"], data)  # (bsz, response_length)
 
     # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
     # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
@@ -178,7 +195,13 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         metric_aggregation = AggregationType.MEAN
 
     # select fields and convert to padded tensor
-    data = data.select("values", "returns", "response_mask").to_padded_tensor()
+    fields = ("values", "returns", "response_mask")
+    data = (
+        select_and_to_padded_tensor(data, *fields)
+        if get_device_name() == "tpu"
+        else data.select(*fields).to_padded_tensor()
+    )
+
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
