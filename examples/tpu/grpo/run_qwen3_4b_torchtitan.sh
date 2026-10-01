@@ -79,31 +79,18 @@ DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
 ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
-# TorchTitan trainer performance knobs (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md).
-# The trainer always runs per-TransformerBlock torch.compile(backend="tpu") with the splash attention
-# Pallas kernel (compile on TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu).
-# Sequences packed into one trainer micro batch (actor update, old/ref log-prob).
-# Fastest validated 4B setting on v6e-8 (SMOKE_TEST, ~700-token responses): MICRO_BATCH_SIZE=4
-# USE_SIMPLE_FSDP=True with the defaults below: update_actor ~2.7-3.8 s (7-8 s with FSDP2, 26.6 s with
-# everything off), step ~25-37 s (rollout + weight-sync bound) vs ~63.5 s with every optimization off.
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-# TPU_EAGER_MODE: torch_tpu eager mode for ops outside the compiled blocks (DEFER_AND_FUSE as in
-# torchtitan's afmv7/qwen3 TPU recipes; null = torch_tpu default DEFER_NEVER, one XLA program per op).
-TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_AND_FUSE}"
-# RESHARD_AFTER_FORWARD=never keeps the FSDP-gathered params resident for the whole mini-batch
-# (one all-gather per mini-batch instead of two per micro-batch), as torchtitan's afmv7 recipe does.
-RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-default}"
-# FORWARD_ONLY_KEEP_UNSHARDED=True gathers the params once per old/ref log-prob pass instead of once per
-# micro-batch (training keeps resharding: never-reshard in training OOMs a 4B model on v6e-8).
-FORWARD_ONLY_KEEP_UNSHARDED="${FORWARD_ONLY_KEEP_UNSHARDED:-True}"
-# Trainer -> rollout weight sync backend: raiden (P2P from local FSDP shards, ~14 s at 4B) or tpu (gather
-# to rank 0 and publish through the Ray object store, ~26 s at 4B).
-CHECKPOINT_ENGINE_BACKEND="${CHECKPOINT_ENGINE_BACKEND:-raiden}"
-# USE_SIMPLE_FSDP=True shards with torchtitan's SimpleFSDP (as its TPU recipes do) instead of FSDP2: the
-# FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock.
-USE_SIMPLE_FSDP="${USE_SIMPLE_FSDP:-False}"
-# Activation checkpointing: selective (torchtitan default), full (torchtitan TPU qwen3 recipes), or none.
-ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-selective}"
+# TorchTitan trainer: the fastest validated 4B config on v6e-8, following torchtitan's TPU recipes
+# (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md):
+#   * per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas kernel (compile on
+#     TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu);
+#   * SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled block;
+#   * torch_tpu DEFER_AND_FUSE eager mode: ops outside the compiled blocks (LM head, log-prob/loss, grad
+#     clipping, optimizer) are fused into larger XLA programs instead of one program per op;
+#   * 4 packed sequences per trainer micro batch (actor update, old/ref log-prob);
+#   * raiden weight sync: P2P push from each trainer rank's local shard (~14 s at 4B vs ~26 s for the
+#     rank-0 gather of the tpu backend).
+# Measured (SMOKE_TEST, ~700-token responses): update_actor ~2.7-4.1 s and step ~25-37 s (rollout +
+# weight-sync bound), vs update_actor 26.6 s and step ~63.5 s with all of the above off.
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -135,19 +122,16 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_torch_compile=True \
     actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
     actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
-    actor_rollout_ref.actor.torchtitan.tpu_eager_mode="${TPU_EAGER_MODE}" \
-    actor_rollout_ref.actor.torchtitan.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
-    actor_rollout_ref.actor.torchtitan.forward_only_keep_unsharded="${FORWARD_ONLY_KEEP_UNSHARDED}" \
-    actor_rollout_ref.actor.torchtitan.use_simple_fsdp="${USE_SIMPLE_FSDP}" \
-    actor_rollout_ref.actor.torchtitan.activation_checkpoint="${ACTIVATION_CHECKPOINT}" \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.torchtitan.tensor_parallel_size="${TENSOR_PARALLEL_SIZE}" \
@@ -165,9 +149,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.layered_summon=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend="${CHECKPOINT_ENGINE_BACKEND}" \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \

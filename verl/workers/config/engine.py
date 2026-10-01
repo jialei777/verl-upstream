@@ -526,18 +526,14 @@ class TorchtitanEngineConfig(EngineConfig):
             hooks, LM head, log-prob/loss, grad clipping, optimizer) is its own XLA program;
             DEFER_AND_FUSE fuses them into larger programs, as torchtitan's TPU recipes do
             (``tpu_config.eager_mode``). Default None keeps the torch_tpu default.
-        forward_only_keep_unsharded (bool): Keep the FSDP-gathered parameters resident across all
-            micro-batches of a forward-only pass (old/ref log-prob) and reshard once at the end, so every
-            layer is all-gathered once per pass instead of once per micro-batch. Costs one unsharded
-            parameter copy in the param dtype for the duration of the pass. Default False.
         use_simple_fsdp (bool): Shard parameters with torchtitan's SimpleFSDP
             (``torchtitan.experiments.graph_trainer.simple_fsdp``) instead of FSDP2. Parameters become
             ``Shard(0)`` DTensors whose attribute access all-gathers them (and whose backward
             reduce-scatters the gradients), so with ``use_torch_compile`` the FSDP collectives are traced
             into each compiled TransformerBlock instead of running as eager FSDP2 hooks between them, as
             torchtitan's TPU recipes do (``parallelism.use_simple_fsdp``). Pure FSDP/HSDP only (no
-            TP/PP/CP/EP). ``reshard_after_forward`` and ``forward_only_keep_unsharded`` do not apply:
-            parameters are re-gathered in backward through activation-checkpoint recompute. Default False.
+            TP/PP/CP/EP). ``reshard_after_forward`` does not apply: parameters are re-gathered in backward
+            through activation-checkpoint recompute. Default False.
 
     """
 
@@ -568,7 +564,6 @@ class TorchtitanEngineConfig(EngineConfig):
     full_determinism: bool = False
     use_splash_attention: bool = False
     tpu_eager_mode: Optional[str] = None
-    forward_only_keep_unsharded: bool = False
     use_simple_fsdp: bool = False
 
     def __post_init__(self):

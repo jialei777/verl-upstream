@@ -60,11 +60,9 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
-    fsdp_keep_unsharded,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
     safe_to_padded_tensor,
-    set_fsdp_reshard_after_backward,
     synchronize_tpu_loss,
     tpu_eager_mode_context,
     unwrap_metadata,
@@ -467,31 +465,14 @@ class TorchTitanEngine(BaseEngine):
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
-
-        # FSDP2-only knobs: SimpleFSDP has no FSDPModule state to keep unsharded.
-        fsdp_enabled = self.engine_config.data_parallel_shard_size > 1 and not self._use_simple_fsdp
-        # Training with reshard_after_forward="never" (torchtitan afmv7 recipe): the gathered params
-        # stay resident through the whole mini-batch, so FSDP2 all-gathers once per mini-batch instead
-        # of twice per micro-batch; they are resharded after the last micro-batch's backward. Gradients
-        # are still reduce-scattered per micro-batch, so sharded gradient accumulation is unchanged.
-        # Needs memory for the unsharded params on top of activations (OOMs a 4B model on v6e-8).
-        keep_unsharded = not forward_only and self.engine_config.reshard_after_forward == "never" and fsdp_enabled
-        # Forward-only (old/ref log-prob): gather every layer once per pass instead of once per micro-batch.
-        forward_keep_ctx = (
-            fsdp_keep_unsharded(self.module)
-            if forward_only and self.engine_config.forward_only_keep_unsharded and fsdp_enabled
-            else nullcontext()
-        )
         timer = TPUPhaseTimer("forward_only" if forward_only else "forward_backward") if is_tpu else None
 
         # train_context activates the (thread-local) SPMD mesh required by spmd_types; it must
         # span backward too, since activation-checkpoint recompute re-runs the forward there.
         # record_function names each micro-batch so a forward-only stage (compute_log_prob /
         # compute_ref_log_prob) shows "micro_batch<i>" rows instead of a single anonymous forward.
-        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None), forward_keep_ctx:
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
-                if keep_unsharded:
-                    set_fsdp_reshard_after_backward(self.module, micro_batch_idx == len(micro_batches) - 1)
                 with (
                     self.trainer.train_context(),
                     ctx,
@@ -513,7 +494,7 @@ class TorchTitanEngine(BaseEngine):
                             timer.mark("backward")
                 output_lst.append(output)
         if timer is not None:
-            timer.report(micro_batches=len(micro_batches), keep_unsharded=keep_unsharded)
+            timer.report(micro_batches=len(micro_batches))
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -831,8 +812,9 @@ class EngineEvalModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, TorchTitanEngine)
 
-        # Reshard every FSDP module: FSDPModule.reshard() is not recursive, and with
-        # reshard_after_forward="never" the per-layer modules also stay gathered after an eval forward.
+        # Reshard every FSDP2 module: FSDPModule.reshard() is not recursive, so resharding only the root left
+        # the per-layer modules gathered under reshard_after_forward="never". The isinstance check also makes
+        # this a no-op under SimpleFSDP, whose modules are not FSDPModules (and have no reshard()).
         if self.engine.engine_config.data_parallel_shard_size > 1:
             from torch.distributed.fsdp import FSDPModule
 

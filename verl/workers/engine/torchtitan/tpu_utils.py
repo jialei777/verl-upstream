@@ -16,7 +16,7 @@
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -352,52 +352,6 @@ def tpu_eager_mode_context(mode: str | None):
     from torch_tpu._internal import execution_mode
 
     return execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode))
-
-
-def set_fsdp_reshard_after_backward(modules: list[torch.nn.Module], reshard: bool) -> None:
-    """Sets FSDP2 ``reshard_after_backward`` on every FSDP module in ``modules`` (recursively)."""
-    from torch.distributed.fsdp import FSDPModule
-
-    for module in modules:
-        if isinstance(module, FSDPModule):
-            module.set_reshard_after_backward(reshard, recurse=True)
-
-
-@contextmanager
-def fsdp_keep_unsharded(modules: list[torch.nn.Module]):
-    """Keeps FSDP2 parameters gathered for the whole block, then reshards all of them.
-
-    For a forward-only pass over N micro-batches FSDP2 otherwise all-gathers every layer N times.
-    Inside this context each layer is gathered once (first micro-batch) and stays resident; on exit
-    every FSDP module is resharded (``FSDPModule.reshard`` is not recursive) and the original per-group
-    ``reshard_after_forward`` policy is restored. Costs one unsharded copy of the parameters in the
-    param dtype (8 GB for a 4B model in bf16) for the duration of the pass.
-    """
-    from torch.distributed.fsdp import FSDPModule
-
-    fsdp_modules = [m for root in modules for m in root.modules() if isinstance(m, FSDPModule)]
-    saved = []
-    for module in fsdp_modules:
-        state = module._get_fsdp_state()
-        groups = getattr(state, "_fsdp_param_groups", [])
-        saved.append(
-            (
-                state,
-                getattr(state, "_auto_reshard_after_forward", None),
-                [(group, group.post_forward_mesh_info) for group in groups],
-            )
-        )
-        module.set_reshard_after_forward(False, recurse=False)
-    try:
-        yield
-    finally:
-        for state, auto_reshard, groups in saved:
-            if auto_reshard is not None:
-                state._auto_reshard_after_forward = auto_reshard
-            for group, post_forward_mesh_info in groups:
-                group.post_forward_mesh_info = post_forward_mesh_info
-        for module in fsdp_modules:
-            module.reshard()
 
 
 class TPUPhaseTimer:
