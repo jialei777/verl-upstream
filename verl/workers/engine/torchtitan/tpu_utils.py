@@ -15,6 +15,8 @@
 
 import logging
 import os
+import time
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -318,6 +320,108 @@ def synchronize_tpu_loss(loss: torch.Tensor):
         synchronize(loss, wait=False)
     except ImportError:
         pass
+
+
+def tpu_eager_mode_context(mode: str | None):
+    """Context manager running the enclosed ops under the torch_tpu eager ``mode`` (no-op for None).
+
+    Mirrors torchtitan's ``tpu_config.eager_mode`` (``torchtitan/experiments/tpu/gmain.py``), which the
+    afmv7 / qwen3 TPU recipes set to ``DEFER_AND_FUSE``: ops outside the compiled blocks are deferred
+    and compiled into fused XLA programs at the next materialization point instead of being launched
+    one XLA program per op (the torch_tpu default, ``DEFER_NEVER``). A context manager rather than a
+    global setting so it applies to whichever Ray actor thread runs the RPC.
+    """
+    if mode is None:
+        return nullcontext()
+    from torch_tpu._internal import execution_mode
+
+    return execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode))
+
+
+def set_fsdp_reshard_after_backward(modules: list[torch.nn.Module], reshard: bool) -> None:
+    """Sets FSDP2 ``reshard_after_backward`` on every FSDP module in ``modules`` (recursively)."""
+    from torch.distributed.fsdp import FSDPModule
+
+    for module in modules:
+        if isinstance(module, FSDPModule):
+            module.set_reshard_after_backward(reshard, recurse=True)
+
+
+@contextmanager
+def fsdp_keep_unsharded(modules: list[torch.nn.Module]):
+    """Keeps FSDP2 parameters gathered for the whole block, then reshards all of them.
+
+    For a forward-only pass over N micro-batches FSDP2 otherwise all-gathers every layer N times.
+    Inside this context each layer is gathered once (first micro-batch) and stays resident; on exit
+    every FSDP module is resharded (``FSDPModule.reshard`` is not recursive) and the original per-group
+    ``reshard_after_forward`` policy is restored. Costs one unsharded copy of the parameters in the
+    param dtype (8 GB for a 4B model in bf16) for the duration of the pass.
+    """
+    from torch.distributed.fsdp import FSDPModule
+
+    fsdp_modules = [m for root in modules for m in root.modules() if isinstance(m, FSDPModule)]
+    saved = []
+    for module in fsdp_modules:
+        state = module._get_fsdp_state()
+        groups = getattr(state, "_fsdp_param_groups", [])
+        saved.append(
+            (
+                state,
+                getattr(state, "_auto_reshard_after_forward", None),
+                [(group, group.post_forward_mesh_info) for group in groups],
+            )
+        )
+        module.set_reshard_after_forward(False, recurse=False)
+    try:
+        yield
+    finally:
+        for state, auto_reshard, groups in saved:
+            if auto_reshard is not None:
+                state._auto_reshard_after_forward = auto_reshard
+            for group, post_forward_mesh_info in groups:
+                group.post_forward_mesh_info = post_forward_mesh_info
+        for module in fsdp_modules:
+            module.reshard()
+
+
+class TPUPhaseTimer:
+    """Blocking per-phase wall-clock timer, enabled with ``VERL_TPU_PHASE_TIMING=1``.
+
+    Each ``mark`` waits for the TPU to drain (``synchronize(wait=True)``), so the numbers are device
+    times per phase, at the cost of serializing host dispatch with device execution. Diagnostics only.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.enabled = os.getenv("VERL_TPU_PHASE_TIMING", "0") == "1"
+        self.totals: dict[str, float] = {}
+        self._last = None
+        if self.enabled:
+            self._sync()
+            self._last = time.perf_counter()
+
+    @staticmethod
+    def _sync():
+        from torch_tpu._internal.sync import synchronize
+
+        synchronize(wait=True)
+
+    def mark(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        self._sync()
+        now = time.perf_counter()
+        self.totals[phase] = self.totals.get(phase, 0.0) + now - self._last
+        self._last = now
+
+    def report(self, **extra) -> None:
+        if not self.enabled:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        phases = " ".join(f"{k}={v:.3f}s" for k, v in self.totals.items())
+        extras = " ".join(f"{k}={v}" for k, v in extra.items())
+        logger.warning(f"[tpu_phase_timing] {self.name}: {phases} {extras}")
 
 
 def get_tpu_seq_bucket_size() -> int:

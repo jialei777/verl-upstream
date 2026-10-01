@@ -49,6 +49,8 @@ actor_rollout_ref:
       seed: 42
       full_determinism: false
       use_splash_attention: false
+      tpu_eager_mode: null
+      forward_only_keep_unsharded: false
       forward_only: false
       dtype: bfloat16
     _target_: verl.workers.config.TorchTitanActorConfig
@@ -173,7 +175,7 @@ actor_rollout_ref:
       optimizer_offload: false
       wrap_policy:
         min_num_params: 0
-      reshard_after_forward: default
+      reshard_after_forward: ${oc.select:actor_rollout_ref.actor.torchtitan.reshard_after_forward,default}
       forward_prefetch: false
       use_orig_params: false
       mixed_precision: false
@@ -196,6 +198,8 @@ actor_rollout_ref:
       seed: ${oc.select:actor_rollout_ref.actor.torchtitan.seed,42}
       full_determinism: false
       use_splash_attention: ${oc.select:actor_rollout_ref.actor.torchtitan.use_splash_attention,False}
+      tpu_eager_mode: ${oc.select:actor_rollout_ref.actor.torchtitan.tpu_eager_mode,null}
+      forward_only_keep_unsharded: ${oc.select:actor_rollout_ref.actor.torchtitan.forward_only_keep_unsharded,False}
       forward_only: true
       dtype: bfloat16
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
@@ -537,6 +541,8 @@ critic:
     seed: 42
     full_determinism: false
     use_splash_attention: false
+    tpu_eager_mode: null
+    forward_only_keep_unsharded: false
     forward_only: false
     dtype: bfloat16
   _target_: verl.workers.config.TorchTitanCriticConfig

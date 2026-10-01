@@ -519,6 +519,16 @@ class TorchtitanEngineConfig(EngineConfig):
         use_splash_attention (bool): TPU only. Replace torchtitan's inner attention with the splash
             attention Pallas kernel from ``torchtitan.experiments.tpu`` (packed-document masking through
             segment ids instead of a dense [S, S] mask). Default False.
+        tpu_eager_mode (Optional[str]): TPU only. torch_tpu eager execution mode used for the
+            forward/backward and optimizer step, one of "DEFER_AND_FUSE", "DEFER_NEVER". Under the
+            torch_tpu default (DEFER_NEVER) every op outside the compiled TransformerBlocks (FSDP2
+            hooks, LM head, log-prob/loss, grad clipping, optimizer) is its own XLA program;
+            DEFER_AND_FUSE fuses them into larger programs, as torchtitan's TPU recipes do
+            (``tpu_config.eager_mode``). Default None keeps the torch_tpu default.
+        forward_only_keep_unsharded (bool): Keep the FSDP-gathered parameters resident across all
+            micro-batches of a forward-only pass (old/ref log-prob) and reshard once at the end, so every
+            layer is all-gathered once per pass instead of once per micro-batch. Costs one unsharded
+            parameter copy in the param dtype for the duration of the pass. Default False.
 
     """
 
@@ -548,9 +558,14 @@ class TorchtitanEngineConfig(EngineConfig):
     seed: int = 42
     full_determinism: bool = False
     use_splash_attention: bool = False
+    tpu_eager_mode: Optional[str] = None
+    forward_only_keep_unsharded: bool = False
 
     def __post_init__(self):
         super().__post_init__()
+        assert self.tpu_eager_mode in [None, "DEFER_AND_FUSE", "DEFER_NEVER"], (
+            f"tpu_eager_mode {self.tpu_eager_mode} not supported"
+        )
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )

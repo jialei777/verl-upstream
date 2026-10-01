@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import importlib
 import logging
 import re
@@ -165,6 +166,80 @@ def enable_fsdp_gradient_division(model: nn.Module, dp_size: int) -> None:
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.set_gradient_divide_factor(float(dp_size))
+
+
+def _split_fused_qkv_local(qkv_module: nn.Module, prefix: str, param_name: str, param: Any) -> dict | None:
+    """Split this rank's ``wqkv`` shard into ``Shard(0)`` q/k/v DTensors without any collective.
+
+    torchtitan's ``FusedQKVLinear`` stores rows as ``[n_kv, heads_per_kv + 2, head_dim]`` (q heads of a kv group,
+    then its k and v). When the 1-D FSDP ``Shard(0)`` split gives every rank whole kv groups (``n_kv % shards == 0``),
+    this rank's q/k/v rows are exactly the ``Shard(0)`` block of the HF ``q_proj``/``k_proj``/``v_proj`` tensors.
+    Returns ``None`` when the layout does not allow it, so the caller falls back to the all-gathering hook.
+    """
+    from torch.distributed.tensor import Shard
+
+    if not isinstance(param, DTensor) or param.device_mesh.ndim != 1 or tuple(param.placements) != (Shard(0),):
+        return None
+    hd, hpk, r = qkv_module.head_dim, qkv_module.heads_per_kv, qkv_module.r_dim
+    shards = param.device_mesh.size()
+    n_kv = param.shape[0] // (r * hd)
+    if n_kv * r * hd != param.shape[0] or n_kv % shards:
+        return None
+    local = param.to_local().detach()
+    tail = tuple(local.shape[1:])
+    grouped = local.reshape(n_kv // shards, r, hd, *tail)
+    out = {}
+    for name, rows in (("wq", grouped[:, :hpk]), ("wk", grouped[:, hpk]), ("wv", grouped[:, hpk + 1])):
+        rows = rows.reshape(-1, *tail).contiguous()
+        full_shape = (rows.shape[0] * shards, *tail)
+        stride = tuple(int(torch.Size(full_shape)[d + 1 :].numel()) for d in range(len(full_shape)))
+        out[f"{prefix}{name}.{param_name}"] = DTensor.from_local(
+            rows, param.device_mesh, [Shard(0)], run_check=False, shape=torch.Size(full_shape), stride=stride
+        )
+    return out
+
+
+def _local_split_qkv_on_save(module, state_dict, prefix, local_metadata, *, fallback) -> None:
+    """``state_dict`` post-hook: like ``FusedQKVLinear._split_qkv_on_save`` but split locally when possible."""
+    for param_name in ("weight", "bias"):
+        key = f"{prefix}wqkv.{param_name}"
+        if key not in state_dict:
+            continue
+        split = _split_fused_qkv_local(module, prefix, param_name, state_dict[key])
+        if split is None:
+            fallback(module, state_dict, prefix, local_metadata)
+            return
+        del state_dict[key]
+        state_dict.update(split)
+
+
+def shard_export_state_dict(module: nn.Module) -> dict[str, Any]:
+    """``module.state_dict()`` for the sharded weight export, minus the fused-QKV all-gather when avoidable.
+
+    torchtitan's ``FusedQKVLinear`` registers a ``state_dict`` post-hook that redistributes ``wqkv`` to
+    ``Replicate`` (an all-gather on every rank) before splitting it into HF ``wq``/``wk``/``wv``. For the
+    sharded export that turns q/k/v into full tensors on every rank (~2.3 GB fp32 transient and ~1 GB of bf16
+    send buffers per rank at 4B on 8 shards). While this runs, that hook is swapped for one that splits each
+    rank's local shard into ``Shard(0)`` q/k/v blocks, falling back to the original hook when the layout does
+    not allow a local split.
+    """
+    swapped = []
+    for mod in module.modules():
+        hooks = getattr(mod, "_state_dict_hooks", None)
+        if not hooks or not hasattr(mod, "r_dim"):
+            continue
+        for hook_id, hook in list(hooks.items()):
+            if getattr(hook, "__name__", "") != "_split_qkv_on_save":
+                continue
+            local_hook = functools.partial(_local_split_qkv_on_save, fallback=hook)
+            local_hook._from_public_api = getattr(hook, "_from_public_api", False)
+            hooks[hook_id] = local_hook
+            swapped.append((hooks, hook_id, hook))
+    try:
+        return module.state_dict()
+    finally:
+        for hooks, hook_id, hook in swapped:
+            hooks[hook_id] = hook
 
 
 def get_attention_masks(

@@ -86,7 +86,22 @@ ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-False}"
 USE_SPLASH_ATTENTION="${USE_SPLASH_ATTENTION:-False}"
 # Sequences packed into one trainer micro batch (actor update, old/ref log-prob).
+# Fastest validated 4B setting on v6e-8 (SMOKE_TEST, ~700-token responses): USE_TORCH_COMPILE=True
+# USE_SPLASH_ATTENTION=True MICRO_BATCH_SIZE=4 with the defaults below (step ~34-39 s vs ~39-51 s with
+# DEFER_NEVER + tpu weight sync).
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+# TPU_EAGER_MODE: torch_tpu eager mode for ops outside the compiled blocks (DEFER_AND_FUSE as in
+# torchtitan's afmv7/qwen3 TPU recipes; null = torch_tpu default DEFER_NEVER, one XLA program per op).
+TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_AND_FUSE}"
+# RESHARD_AFTER_FORWARD=never keeps the FSDP-gathered params resident for the whole mini-batch
+# (one all-gather per mini-batch instead of two per micro-batch), as torchtitan's afmv7 recipe does.
+RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-default}"
+# FORWARD_ONLY_KEEP_UNSHARDED=True gathers the params once per old/ref log-prob pass instead of once per
+# micro-batch (training keeps resharding: never-reshard in training OOMs a 4B model on v6e-8).
+FORWARD_ONLY_KEEP_UNSHARDED="${FORWARD_ONLY_KEEP_UNSHARDED:-True}"
+# Trainer -> rollout weight sync backend: raiden (P2P from local FSDP shards, ~14 s at 4B) or tpu (gather
+# to rank 0 and publish through the Ray object store, ~26 s at 4B).
+CHECKPOINT_ENGINE_BACKEND="${CHECKPOINT_ENGINE_BACKEND:-raiden}"
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -118,6 +133,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_torch_compile="${USE_TORCH_COMPILE}" \
     actor_rollout_ref.actor.torchtitan.use_torch_compile="${USE_TORCH_COMPILE}" \
     actor_rollout_ref.actor.torchtitan.use_splash_attention="${USE_SPLASH_ATTENTION}" \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode="${TPU_EAGER_MODE}" \
+    actor_rollout_ref.actor.torchtitan.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
+    actor_rollout_ref.actor.torchtitan.forward_only_keep_unsharded="${FORWARD_ONLY_KEEP_UNSHARDED}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
@@ -133,6 +151,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
@@ -143,7 +163,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
+    actor_rollout_ref.rollout.checkpoint_engine.backend="${CHECKPOINT_ENGINE_BACKEND}" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \

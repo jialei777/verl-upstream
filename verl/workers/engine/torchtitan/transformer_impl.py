@@ -54,14 +54,18 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
+    TPUPhaseTimer,
     apply_splash_attention_tpu,
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
+    fsdp_keep_unsharded,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
     safe_to_padded_tensor,
+    set_fsdp_reshard_after_backward,
     synchronize_tpu_loss,
+    tpu_eager_mode_context,
     unwrap_metadata,
     vocab_parallel_logprobs_from_logits,
 )
@@ -70,6 +74,7 @@ from verl.workers.engine.torchtitan.utils import (
     derive_torchtitan_name_and_flavor,
     enable_fsdp_gradient_division,
     get_attention_masks,
+    shard_export_state_dict,
 )
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -449,18 +454,48 @@ class TorchTitanEngine(BaseEngine):
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
+        fsdp_enabled = self.engine_config.data_parallel_shard_size > 1
+        # Training with reshard_after_forward="never" (torchtitan afmv7 recipe): the gathered params
+        # stay resident through the whole mini-batch, so FSDP2 all-gathers once per mini-batch instead
+        # of twice per micro-batch; they are resharded after the last micro-batch's backward. Gradients
+        # are still reduce-scattered per micro-batch, so sharded gradient accumulation is unchanged.
+        # Needs memory for the unsharded params on top of activations (OOMs a 4B model on v6e-8).
+        keep_unsharded = not forward_only and self.engine_config.reshard_after_forward == "never" and fsdp_enabled
+        # Forward-only (old/ref log-prob): gather every layer once per pass instead of once per micro-batch.
+        forward_keep_ctx = (
+            fsdp_keep_unsharded(self.module)
+            if forward_only and self.engine_config.forward_only_keep_unsharded and fsdp_enabled
+            else nullcontext()
+        )
+        timer = TPUPhaseTimer("forward_only" if forward_only else "forward_backward") if is_tpu else None
+
         # train_context activates the (thread-local) SPMD mesh required by spmd_types; it must
         # span backward too, since activation-checkpoint recompute re-runs the forward there.
         # record_function names each micro-batch so a forward-only stage (compute_log_prob /
         # compute_ref_log_prob) shows "micro_batch<i>" rows instead of a single anonymous forward.
-        for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-                if not forward_only:
-                    if get_device_name() == "tpu":
-                        synchronize_tpu_loss(loss)
-                    loss.backward()
-            output_lst.append(output)
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None), forward_keep_ctx:
+            for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                if keep_unsharded:
+                    set_fsdp_reshard_after_backward(self.module, micro_batch_idx == len(micro_batches) - 1)
+                with (
+                    self.trainer.train_context(),
+                    ctx,
+                    torch.profiler.record_function(f"micro_batch{micro_batch_idx}"),
+                ):
+                    loss, output = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
+                    if timer is not None:
+                        timer.mark("forward")
+                    if not forward_only:
+                        if is_tpu:
+                            synchronize_tpu_loss(loss)
+                        loss.backward()
+                        if timer is not None:
+                            timer.mark("backward")
+                output_lst.append(output)
+        if timer is not None:
+            timer.report(micro_batches=len(micro_batches), keep_unsharded=keep_unsharded)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -502,27 +537,36 @@ class TorchTitanEngine(BaseEngine):
 
     def optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
-        # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
-        # it returns inf even when every gradient is exactly zero. Since a non-finite
-        # grad_norm makes this method skip the update entirely, that silently froze the
-        # policy while the job still reported success. Use the per-tensor path there.
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.module for p in m.parameters()],
-            self.config.training.max_norm,
-            foreach=get_device_name() != "tpu",
-            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=self.parallel_dims.ep_enabled,
-        )
+        is_tpu = get_device_name() == "tpu"
+        timer = TPUPhaseTimer("optimizer_step") if is_tpu else None
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
+            # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
+            # it returns inf even when every gradient is exactly zero. Since a non-finite
+            # grad_norm makes this method skip the update entirely, that silently froze the
+            # policy while the job still reported success. Use the per-tensor path there.
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.module for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=not is_tpu,
+                pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=self.parallel_dims.ep_enabled,
+            )
+            if timer is not None:
+                timer.mark("clip_grad_norm")
 
-        # If grad_norm is not finite the update is thrown away. This is silent by design,
-        # so say it loudly: a run where this fires on every step reports success while the
-        # policy never changes.
-        if not torch.isfinite(grad_norm):
-            logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
-            self.optimizer.zero_grad()
-        else:
-            self.optimizer.step()
-        return grad_norm.item()
+            # If grad_norm is not finite the update is thrown away. This is silent by design,
+            # so say it loudly: a run where this fires on every step reports success while the
+            # policy never changes.
+            if not torch.isfinite(grad_norm):
+                logger.warning(f"grad_norm is not finite ({grad_norm}); skipping this optimizer step")
+                self.optimizer.zero_grad()
+            else:
+                self.optimizer.step()
+            grad_norm = grad_norm.item()
+        if timer is not None:
+            timer.mark("step")
+            timer.report()
+        return grad_norm
 
     def lr_scheduler_step(self):
         """Advance learning rate scheduler."""
@@ -676,7 +720,7 @@ class TorchTitanEngine(BaseEngine):
         self._assert_shard_export_supported()
         raw = {}
         for module in self.module:
-            raw.update(module.state_dict())
+            raw.update(shard_export_state_dict(module))
 
         # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
         stacks = {}
@@ -767,10 +811,15 @@ class EngineEvalModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, TorchTitanEngine)
 
-        # Reshard the root FSDP module
+        # Reshard every FSDP module: FSDPModule.reshard() is not recursive, and with
+        # reshard_after_forward="never" the per-layer modules also stay gathered after an eval forward.
         if self.engine.engine_config.data_parallel_shard_size > 1:
+            from torch.distributed.fsdp import FSDPModule
+
             for module in self.engine.module:
-                module.reshard()
+                for submodule in module.modules():
+                    if isinstance(submodule, FSDPModule):
+                        submodule.reshard()
 
         super().__exit__(exc_type, exc_value, traceback)
 
