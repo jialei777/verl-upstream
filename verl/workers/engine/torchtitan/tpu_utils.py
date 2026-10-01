@@ -166,7 +166,6 @@ def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:
         )
 
 
-
 def splash_block_size_for(seq_len: int, max_block_size: int = 512, min_block_size: int = 128) -> int:
     """Largest power-of-two splash block size <= ``max_block_size`` that divides ``seq_len``.
 
