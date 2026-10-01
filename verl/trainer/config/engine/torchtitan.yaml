@@ -81,7 +81,8 @@ seed: 42
 # Whether to enable full determinism for distributed training, only for debugging
 full_determinism: false
 
-# TPU only: use the splash attention Pallas kernel (torchtitan.experiments.tpu) for attention
+# TPU only: use the splash attention Pallas kernel (torchtitan.experiments.tpu) for attention.
+# Required on TPU when use_torch_compile=true (compiled SDPA yields NaN gradients on torch_tpu).
 use_splash_attention: false
 
 # TPU only: torch_tpu eager execution mode for forward/backward and optimizer step

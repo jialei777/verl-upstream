@@ -518,7 +518,8 @@ class TorchtitanEngineConfig(EngineConfig):
             debugging.
         use_splash_attention (bool): TPU only. Replace torchtitan's inner attention with the splash
             attention Pallas kernel from ``torchtitan.experiments.tpu`` (packed-document masking through
-            segment ids instead of a dense [S, S] mask). Default False.
+            segment ids instead of a dense [S, S] mask). Required on TPU when ``use_torch_compile`` is
+            True (compiled SDPA yields NaN gradients on torch_tpu). Default False.
         tpu_eager_mode (Optional[str]): TPU only. torch_tpu eager execution mode used for the
             forward/backward and optimizer step, one of "DEFER_AND_FUSE", "DEFER_NEVER". Under the
             torch_tpu default (DEFER_NEVER) every op outside the compiled TransformerBlocks (FSDP2
@@ -593,6 +594,16 @@ class TorchtitanEngineConfig(EngineConfig):
             f"activation_checkpoint {self.activation_checkpoint} not supported"
         )
         assert self.strategy in ["torchtitan"], f"strategy {self.strategy} not supported"
+
+    def check_device_support(self, device_name: str) -> None:
+        """Validate device-dependent options; the dataclass itself does not know the device."""
+        if device_name == "tpu" and self.use_torch_compile and not self.use_splash_attention:
+            raise ValueError(
+                "use_torch_compile=True on TPU requires use_splash_attention=True: torch_tpu's compiled "
+                "F.scaled_dot_product_attention produces NaN q/k/v gradients, so every optimizer step would be "
+                "skipped. Use splash attention + torch.compile (use_splash_attention=True), or set "
+                "use_torch_compile=False."
+            )
 
 
 @dataclass

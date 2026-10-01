@@ -42,18 +42,6 @@ def unwrap_metadata(val):
     return val
 
 
-def _math_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor, scale: float | None
-) -> torch.Tensor:
-    """softmax(q k^T * scale + mask) v with a boolean mask; softmax in fp32. Inputs (B, H, S, D)."""
-    if scale is None:
-        scale = q.shape[-1] ** -0.5
-    scores = torch.matmul(q, k.transpose(-1, -2)).float() * scale
-    scores = scores.masked_fill(~mask, float("-inf"))
-    probs = torch.softmax(scores, dim=-1).to(v.dtype)
-    return torch.matmul(probs, v)
-
-
 def monkey_patch_varlen_attention_tpu():
     """Patches TorchTitan's VarlenAttention forward method to use native scaled_dot_product_attention on TPU."""
     try:
@@ -113,14 +101,10 @@ def monkey_patch_varlen_attention_tpu():
                 k = k.repeat_interleave(num_repeat, dim=1)
                 v = v.repeat_interleave(num_repeat, dim=1)
 
-            if torch.compiler.is_compiling():
-                # F.scaled_dot_product_attention traced by torch.compile(backend="tpu") returns
-                # NaN gradients for q/k/v (forward is exact), with or without a mask, is_causal
-                # or enable_gqa (scratch repro_sdpa_nan2.py). The explicit form compiles to the
-                # same forward and finite, eager-matching gradients.
-                attn_out = _math_attention(q, k, v, mask, scale)
-            else:
-                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            # Eager only: TorchTitanEngine rejects use_torch_compile without use_splash_attention on TPU,
+            # because F.scaled_dot_product_attention traced by torch.compile(backend="tpu") yields NaN q/k/v
+            # gradients. With splash attention enabled this module is replaced by TPUSplashAttention.
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
             return attn_out.transpose(1, 2)
 
         VarlenAttention.forward = tpu_varlen_forward

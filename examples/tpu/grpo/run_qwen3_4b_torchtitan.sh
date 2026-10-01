@@ -80,7 +80,8 @@ ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
 # TorchTitan trainer performance knobs (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md).
-# USE_TORCH_COMPILE: per-TransformerBlock torch.compile(backend="tpu").
+# USE_TORCH_COMPILE: per-TransformerBlock torch.compile(backend="tpu"). Requires USE_SPLASH_ATTENTION=True
+# (compiled SDPA yields NaN gradients on torch_tpu; the engine raises otherwise).
 # USE_SPLASH_ATTENTION: splash attention Pallas kernel (segment-id masking) instead of SDPA
 # with a dense [S, S] mask.
 USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-False}"
