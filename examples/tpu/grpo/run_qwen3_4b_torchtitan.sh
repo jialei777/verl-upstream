@@ -80,17 +80,12 @@ ROLLOUT_IS="${ROLLOUT_IS:-token}"
 ROLLOUT_IS_THRESHOLD="${ROLLOUT_IS_THRESHOLD:-2.0}"
 
 # TorchTitan trainer performance knobs (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md).
-# USE_TORCH_COMPILE: per-TransformerBlock torch.compile(backend="tpu"). Requires USE_SPLASH_ATTENTION=True
-# (compiled SDPA yields NaN gradients on torch_tpu; the engine raises otherwise).
-# USE_SPLASH_ATTENTION: splash attention Pallas kernel (segment-id masking) instead of SDPA
-# with a dense [S, S] mask.
-USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-False}"
-USE_SPLASH_ATTENTION="${USE_SPLASH_ATTENTION:-False}"
+# The trainer always runs per-TransformerBlock torch.compile(backend="tpu") with the splash attention
+# Pallas kernel (compile on TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu).
 # Sequences packed into one trainer micro batch (actor update, old/ref log-prob).
-# Fastest validated 4B setting on v6e-8 (SMOKE_TEST, ~700-token responses): USE_TORCH_COMPILE=True
-# USE_SPLASH_ATTENTION=True MICRO_BATCH_SIZE=4 USE_SIMPLE_FSDP=True with the defaults below: update_actor
-# ~2.7-3.8 s (7-8 s with FSDP2, 26.6 s with everything off), step ~25-37 s (rollout + weight-sync bound) vs
-# ~63.5 s with every optimization off.
+# Fastest validated 4B setting on v6e-8 (SMOKE_TEST, ~700-token responses): MICRO_BATCH_SIZE=4
+# USE_SIMPLE_FSDP=True with the defaults below: update_actor ~2.7-3.8 s (7-8 s with FSDP2, 26.6 s with
+# everything off), step ~25-37 s (rollout + weight-sync bound) vs ~63.5 s with every optimization off.
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 # TPU_EAGER_MODE: torch_tpu eager mode for ops outside the compiled blocks (DEFER_AND_FUSE as in
 # torchtitan's afmv7/qwen3 TPU recipes; null = torch_tpu default DEFER_NEVER, one XLA program per op).
@@ -105,7 +100,7 @@ FORWARD_ONLY_KEEP_UNSHARDED="${FORWARD_ONLY_KEEP_UNSHARDED:-True}"
 # to rank 0 and publish through the Ray object store, ~26 s at 4B).
 CHECKPOINT_ENGINE_BACKEND="${CHECKPOINT_ENGINE_BACKEND:-raiden}"
 # USE_SIMPLE_FSDP=True shards with torchtitan's SimpleFSDP (as its TPU recipes do) instead of FSDP2: the
-# FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock (use with USE_TORCH_COMPILE).
+# FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock.
 USE_SIMPLE_FSDP="${USE_SIMPLE_FSDP:-False}"
 # Activation checkpointing: selective (torchtitan default), full (torchtitan TPU qwen3 recipes), or none.
 ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-selective}"
@@ -137,9 +132,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile="${USE_TORCH_COMPILE}" \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile="${USE_TORCH_COMPILE}" \
-    actor_rollout_ref.actor.torchtitan.use_splash_attention="${USE_SPLASH_ATTENTION}" \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
     actor_rollout_ref.actor.torchtitan.tpu_eager_mode="${TPU_EAGER_MODE}" \
     actor_rollout_ref.actor.torchtitan.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
     actor_rollout_ref.actor.torchtitan.forward_only_keep_unsharded="${FORWARD_ONLY_KEEP_UNSHARDED}" \

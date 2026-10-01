@@ -113,13 +113,9 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
     set -x
 fi
 
-# TorchTitan trainer performance knobs (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md).
-# USE_TORCH_COMPILE: per-TransformerBlock torch.compile(backend="tpu"). Requires USE_SPLASH_ATTENTION=True
-# (compiled SDPA yields NaN gradients on torch_tpu; the engine raises otherwise).
-# USE_SPLASH_ATTENTION: splash attention Pallas kernel (segment-id masking) instead of SDPA
-# with a dense [S, S] mask.
-USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-False}"
-USE_SPLASH_ATTENTION="${USE_SPLASH_ATTENTION:-False}"
+# The TorchTitan trainer runs per-TransformerBlock torch.compile(backend="tpu") with the splash attention
+# Pallas kernel (compile on TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu).
+# See torchtitan/experiments/tpu/torch-tpu-optimization-guide.md.
 
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
@@ -146,9 +142,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile="${USE_TORCH_COMPILE}" \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile="${USE_TORCH_COMPILE}" \
-    actor_rollout_ref.actor.torchtitan.use_splash_attention="${USE_SPLASH_ATTENTION}" \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
