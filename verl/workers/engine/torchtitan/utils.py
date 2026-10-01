@@ -197,10 +197,10 @@ def make_simple_fsdp_parallelize_fn(parallelize_fn, *, spmd_safe_blocks: bool = 
 
     def _parallelize(model: nn.Module, *, parallel_dims, training, compile_config, **kwargs) -> nn.Module:
         if spmd_safe_blocks and compile_config.enable and hasattr(model, "layers"):
-            from torch_tpu._internal.distributed.spmd_util import spmd_safe
+            from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
 
             for block in model.layers.values():
-                block.forward = spmd_safe(block.forward)
+                apply_spmd_safe(block)
 
         kwargs.pop("skip_dp", None)
         model = parallelize_fn(

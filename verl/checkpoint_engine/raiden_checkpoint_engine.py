@@ -193,7 +193,6 @@ def export_local_shards(engine) -> tuple[list[tuple[str, torch.Tensor]], dict[st
     items = filter_tied_embeddings((name, (local, spec)) for name, local, spec in gen)
 
     named, shard_info = [], {}
-    full_names = []
     for name, (local, spec) in items:
         if spec.place is not None or spec.hf_slots is not None:
             raise NotImplementedError(
@@ -206,7 +205,6 @@ def export_local_shards(engine) -> tuple[list[tuple[str, torch.Tensor]], dict[st
             named.append((name, local.view(local_shape)))
             shard_info[name] = (num_shards, shard_index)
             continue
-        full_names.append((name, None if spec.mesh is None else tuple(spec.placements)))
         place = derive_dtensor_placement(spec)[0] if spec.mesh is not None else 0
         if not isinstance(place, BlockPlacement):
             # unsharded or fully replicated: the local tensor is already the full parameter
@@ -224,21 +222,7 @@ def export_local_shards(engine) -> tuple[list[tuple[str, torch.Tensor]], dict[st
             stride=tuple(strides),
         )
         named.append((name, dt.full_tensor()))
-    global _WARNED_FULL_EXPORT
-    is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    if full_names and not _WARNED_FULL_EXPORT and is_rank0:
-        # A tensor that is not a dim-0 shard is exported FULL on every rank: every rank holds a full bf16 send
-        # buffer for it and pushes the same bytes. Known case: torchtitan's FusedQKVLinear save hook all-gathers
-        # wqkv before splitting it, so HF q/k/v arrive here as Replicate DTensors. Warn once so it is visible.
-        _WARNED_FULL_EXPORT = True
-        logger.warning(
-            f"Raiden export: {len(full_names)} tensors are not dim-0 shards and are exported full on every rank, "
-            f"e.g. (name, placements): {full_names[:3]}"
-        )
     return named, shard_info
-
-
-_WARNED_FULL_EXPORT = False
 
 
 def merge_rank_stats(rank_stats: dict) -> dict:
@@ -407,11 +391,9 @@ class RaidenCheckpointEngine(CheckpointEngine):
                 )
             )
         num_sharded = sum(name in self._shard_info for name, _ in valid_weights)
-        sharded_gb = sum(t.numel() * t.element_size() for n, t in valid_weights if n in self._shard_info) / 1024**3
-        full_gb = sum(t.numel() * t.element_size() for n, t in valid_weights if n not in self._shard_info) / 1024**3
         logger.info(
-            f"Trainer Rank {self.rank}: registering {num_sharded} sharded ({sharded_gb:.2f} GB) and "
-            f"{len(valid_weights) - num_sharded} full tensors ({full_gb:.2f} GB)"
+            f"Trainer Rank {self.rank}: registering {num_sharded} sharded and "
+            f"{len(valid_weights) - num_sharded} full tensors"
         )
 
         # TODO(tpu): Consider passing controller_address directly during orchestration (e.g., via
@@ -510,11 +492,8 @@ class RaidenCheckpointEngine(CheckpointEngine):
         else:
             await self._create_and_register(valid_weights)
             self._registered_signature = signature
-        # Keep the bound device buffers alive until the transfer completes: the controller-driven push reads
-        # them after send_weights returns. They are bf16 copies of every exported tensor (~1.9 GB/rank at 4B on
-        # 8 shards), so they must NOT live until the next send_weights: that would hold them through the whole
-        # next training step and steal HBM from it. update_raiden_weights calls release_device_buffers() as
-        # soon as the push is done.
+        # Keep the bound device buffers alive until the next sync: the controller-driven push reads them
+        # after send_weights returns.
         self._bound_tensors = [t for _, t in valid_weights]
 
         # No explicit ws.d2h() here: PushWeightsResharded (triggered by the controller's start_transfer)
@@ -545,27 +524,6 @@ class RaidenCheckpointEngine(CheckpointEngine):
             )
         except Exception as e:
             logger.warning(f"Failed to record trainer rank {self.rank} stats in TPUWeightRegistry: {e}")
-
-    def release_device_buffers(self) -> None:
-        """Drop the bf16 device copies bound for the last push once the transfer has completed.
-
-        Why: ``send_weights`` casts every exported tensor to a fresh bf16 device tensor (~2 bytes/param/rank)
-        and keeps it in ``_bound_tensors`` for the controller-driven push. Previously they stayed alive until
-        the next ``send_weights`` replaced them, i.e. through the entire next training step. At Qwen3-4B on
-        v6e-8 (32 GB HBM) the trainer is already near the limit at micro-batch 4 (fp32 master weights + AdamW
-        state + activations + the logits buffer), so those extra ~1-2 GB/rank made the second ``update_actor``
-        OOM.
-
-        Safe because: once ``start_transfer`` has finished, the push has already read them, nothing else reads
-        them until the next ``send_weights`` binds new buffers, and tpu_sync's ``WeightSynchronizer`` keeps
-        its own host buffers rather than a reference to these device tensors, so dropping our reference
-        frees the HBM.
-        """
-        if self._bound_tensors is None:
-            return
-        released = sum(t.numel() * t.element_size() for t in self._bound_tensors)
-        self._bound_tensors = None
-        logger.info(f"Trainer Rank {self.rank}: released {released / 1024**3:.2f} GB of Raiden device send buffers")
 
     @torch.no_grad()
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs):
@@ -691,13 +649,6 @@ async def update_raiden_weights(
     await transfer_future.wait()
     t_transfer = time.perf_counter() - t_transfer_start
 
-    # The P2P push has finished reading the trainer's bf16 device send buffers. Free them now instead of at
-    # the next send_weights, otherwise they occupy trainer HBM through the next training step (OOM at 4B with
-    # micro-batch 4; see RaidenCheckpointEngine.release_device_buffers). This is a small control RPC per trainer
-    # rank, run concurrently with the sampler-side install below, so it adds no latency.
-    release_refs = manager.actor_wg.execute_checkpoint_engine(["release_device_buffers"] * manager.actor_wg.world_size)
-    release_task = asyncio.create_task(asyncio.to_thread(ray.get, release_refs)) if release_refs is not None else None
-
     # 5. Sampler replicas install received weights to TPU HBM via H2D DMA
     t_install_start = time.perf_counter()
     install_futures = [
@@ -705,8 +656,6 @@ async def update_raiden_weights(
     ]
     await asyncio.gather(*install_futures)
     t_install = time.perf_counter() - t_install_start
-    if release_task is not None:
-        await release_task
 
     t_total = time.perf_counter() - t_total_start
 

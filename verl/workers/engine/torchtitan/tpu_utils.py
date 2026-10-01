@@ -15,7 +15,6 @@
 
 import logging
 import os
-import time
 from contextlib import nullcontext
 from typing import Any
 
@@ -181,8 +180,6 @@ class TPUSplashAttention(torch.nn.Module):
         super().__init__()
         self.original_module = original_module
         self.local_window_size = local_window_size
-        # Read once here: env lookups inside a fullgraph-compiled block would break the trace.
-        self.max_block_size = int(os.getenv("VERL_TPU_SPLASH_MAX_BLOCK_SIZE", "512"))
 
     def forward(
         self,
@@ -201,7 +198,7 @@ class TPUSplashAttention(torch.nn.Module):
         from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
         from torchtitan.models.common.attention import segment_ids_from_positions
 
-        block = splash_block_size_for(int(q.shape[1]), self.max_block_size)
+        block = splash_block_size_for(int(q.shape[1]))
         if block == 0 or q.device.type == "cpu":
             return self.original_module(
                 q,
@@ -352,46 +349,6 @@ def tpu_eager_mode_context(mode: str | None):
     from torch_tpu._internal import execution_mode
 
     return execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode))
-
-
-class TPUPhaseTimer:
-    """Blocking per-phase wall-clock timer, enabled with ``VERL_TPU_PHASE_TIMING=1``.
-
-    Each ``mark`` waits for the TPU to drain (``synchronize(wait=True)``), so the numbers are device
-    times per phase, at the cost of serializing host dispatch with device execution. Diagnostics only.
-    """
-
-    def __init__(self, name: str):
-        self.name = name
-        self.enabled = os.getenv("VERL_TPU_PHASE_TIMING", "0") == "1"
-        self.totals: dict[str, float] = {}
-        self._last = None
-        if self.enabled:
-            self._sync()
-            self._last = time.perf_counter()
-
-    @staticmethod
-    def _sync():
-        from torch_tpu._internal.sync import synchronize
-
-        synchronize(wait=True)
-
-    def mark(self, phase: str) -> None:
-        if not self.enabled:
-            return
-        self._sync()
-        now = time.perf_counter()
-        self.totals[phase] = self.totals.get(phase, 0.0) + now - self._last
-        self._last = now
-
-    def report(self, **extra) -> None:
-        if not self.enabled:
-            return
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return
-        phases = " ".join(f"{k}={v:.3f}s" for k, v in self.totals.items())
-        extras = " ".join(f"{k}={v}" for k, v in extra.items())
-        logger.warning(f"[tpu_phase_timing] {self.name}: {phases} {extras}")
 
 
 def get_tpu_seq_bucket_size() -> int:

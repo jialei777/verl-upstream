@@ -54,7 +54,6 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
-    TPUPhaseTimer,
     align_micro_batch_shapes_across_ranks,
     apply_splash_attention_tpu,
     bucket_length,
@@ -464,7 +463,6 @@ class TorchTitanEngine(BaseEngine):
         output_lst = []
 
         ctx = torch.no_grad() if forward_only else nullcontext()
-        timer = TPUPhaseTimer("forward_only" if forward_only else "forward_backward") if is_tpu else None
 
         # train_context activates the (thread-local) SPMD mesh required by spmd_types; it must
         # span backward too, since activation-checkpoint recompute re-runs the forward there.
@@ -480,8 +478,6 @@ class TorchTitanEngine(BaseEngine):
                     loss, output = self.forward_step(
                         micro_batch, loss_function=loss_function, forward_only=forward_only
                     )
-                    if timer is not None:
-                        timer.mark("forward")
                     if not forward_only:
                         if self._simple_fsdp_loss_scale is not None:
                             # SimpleFSDP sums gradients across DP ranks; FSDP2 here averages them.
@@ -489,11 +485,7 @@ class TorchTitanEngine(BaseEngine):
                         if is_tpu:
                             synchronize_tpu_loss(loss)
                         loss.backward()
-                        if timer is not None:
-                            timer.mark("backward")
                 output_lst.append(output)
-        if timer is not None:
-            timer.report(micro_batches=len(micro_batches))
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
@@ -536,7 +528,6 @@ class TorchTitanEngine(BaseEngine):
     def optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
         is_tpu = get_device_name() == "tpu"
-        timer = TPUPhaseTimer("optimizer_step") if is_tpu else None
         with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
             # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
             # it returns inf even when every gradient is exactly zero. Since a non-finite
@@ -549,8 +540,6 @@ class TorchTitanEngine(BaseEngine):
                 pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=self.parallel_dims.ep_enabled,
             )
-            if timer is not None:
-                timer.mark("clip_grad_norm")
 
             # If grad_norm is not finite the update is thrown away. This is silent by design,
             # so say it loudly: a run where this fires on every step reports success while the
@@ -560,11 +549,7 @@ class TorchTitanEngine(BaseEngine):
                 self.optimizer.zero_grad()
             else:
                 self.optimizer.step()
-            grad_norm = grad_norm.item()
-        if timer is not None:
-            timer.mark("step")
-            timer.report()
-        return grad_norm
+            return grad_norm.item()
 
     def lr_scheduler_step(self):
         """Advance learning rate scheduler."""
