@@ -59,7 +59,6 @@ from verl.workers.engine.torchtitan.tpu_utils import (
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
-    monkey_patch_fsdp2_finalize_backward_tpu,
     monkey_patch_varlen_attention_tpu,
     pad_packed_inputs_for_tpu,
     safe_to_padded_tensor,
@@ -111,7 +110,6 @@ device_name = get_device_name()
 
 if device_name == "tpu":
     monkey_patch_varlen_attention_tpu()
-    monkey_patch_fsdp2_finalize_backward_tpu()
 
 
 class TorchTitanEngine(BaseEngine):
@@ -268,15 +266,6 @@ class TorchTitanEngine(BaseEngine):
             configure_torch_compile_for_tpu()
         self.trainer = Trainer(self.config)
 
-        if (
-            device_name == "tpu"
-            and self.engine_config.use_torch_compile
-            and self.engine_config.activation_checkpoint == "full"
-            and not self._use_simple_fsdp
-            and os.environ.get("VERL_TPU_AC_OUTSIDE_COMPILE", "1") == "1"
-        ):
-            self._move_activation_checkpoint_outside_compile(backend=compile_config.backend)
-
         self._init_device_mesh()
 
         self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
@@ -354,40 +343,6 @@ class TorchTitanEngine(BaseEngine):
             cp_mesh = self.parallel_dims.get_optional_mesh("cp")
             is_collect = is_collect and (cp_mesh.get_local_rank() == 0)
         return is_collect
-
-    def _move_activation_checkpoint_outside_compile(self, backend: str):
-        """Reorder ``compile(CheckpointWrapper(block))`` into ``CheckpointWrapper(compile(block))`` on TPU.
-
-        torchtitan applies full AC, then ``block.compile()`` on the CheckpointWrapper, then FSDP2. With AC traced
-        inside the compiled region, AOTAutograd saves the FSDP2-unsharded bf16 weights (graph inputs, not
-        recomputable) for backward, and the torch_tpu executable returns every saved tensor as a fresh buffer.
-        FSDP2 reshard frees its own unsharded weight but not these copies, so one full bf16 weight set stays
-        resident from forward to backward (~14 GiB per chip for Qwen3-8B, FSDP 8).
-
-        Compiling only the inner block keeps non-reentrant checkpointing eager: its saved-tensor hooks drop
-        everything the compiled forward saves (keeping just the block input) and recompute it per layer in
-        backward. Single-host probe (4 blocks, 1 GiB of weights): +1.11 GiB held after forward -> +0.10 GiB.
-        Only valid for full AC; FSDP2 hooks stay on the (now eager) wrapper. Opt out with
-        ``VERL_TPU_AC_OUTSIDE_COMPILE=0``.
-        """
-        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
-
-        moved = 0
-        for model_part in self.trainer.model_parts:
-            layers = getattr(model_part, "layers", None)
-            if layers is None:
-                continue
-            for block in layers.children():
-                if not isinstance(block, CheckpointWrapper) or getattr(block, "_compiled_call_impl", None) is None:
-                    continue
-                inner = getattr(block, "_checkpoint_wrapped_module", None)
-                if inner is None:
-                    continue
-                block._compiled_call_impl = None
-                inner.compile(backend=backend, fullgraph=True)
-                moved += 1
-        if not moved:
-            logger.warning("AC-outside-compile requested but no compiled CheckpointWrapper blocks were found")
 
     def _drop_checkpoint_state_dict_cache(self):
         """Free torchtitan ``ModelWrapper.cached_state_dict`` after loading.

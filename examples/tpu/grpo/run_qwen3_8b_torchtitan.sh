@@ -42,7 +42,7 @@ ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-full}"
 # SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled TransformerBlock instead of running
 # from FSDP2 hooks. Compared with FSDP2 (which fills HBM in update_actor, with the TPU runtime constantly unloading
 # and reloading programs), it lowers the update_actor tensor peak by ~3.7 GiB per chip and runs update_actor ~6x
-# faster. Set False for FSDP2.
+# faster. FSDP2 (False) is not supported for 8B on 8 chips: update_actor runs out of HBM.
 USE_SIMPLE_FSDP="${USE_SIMPLE_FSDP:-True}"
 # torch_tpu eager mode for the ops outside the compiled blocks (LM head, log-prob/loss, grad clipping, optimizer):
 # DEFER_AND_FUSE fuses them into larger XLA programs; null keeps torch_tpu's default of one program per op. Even
@@ -58,9 +58,6 @@ USE_KL_LOSS="${USE_KL_LOSS:-False}"
 # attention scale with it, so 2048 keeps one micro-batch well inside HBM (torchtitan's v6e-8 recipe
 # trains at seq_len 2048). Must stay >= MAX_MODEL_LEN.
 MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-2048}"
-# FSDP2 reshard policy (ignored with USE_SIMPLE_FSDP=True). "always" also frees the gathered [norm, lm_head]
-# (~1.24 GB bf16) after forward, which torchtitan's "default" keeps until backward (forever, for forward-only passes).
-RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-always}"
 TEST_FREQ="${TEST_FREQ:-10}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 
@@ -151,7 +148,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.actor.torchtitan.activation_checkpoint="${ACTIVATION_CHECKPOINT}" \
-    actor_rollout_ref.actor.torchtitan.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \

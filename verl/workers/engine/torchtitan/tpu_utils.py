@@ -41,47 +41,6 @@ def unwrap_metadata(val):
     return val
 
 
-_FSDP2_FINALIZE_PATCHED = False
-
-
-def monkey_patch_fsdp2_finalize_backward_tpu():
-    """Make FSDP2's "mistargeted unshard" cleanup in ``finalize_backward`` safe on TPU.
-
-    ``FSDPParamGroup.finalize_backward`` waits on a leftover prefetch all-gather with
-    ``torch.accelerator.current_stream().wait_event(all_gather_event)``. On TPU the event comes from
-    ``torch.tpu.Stream.record_event()`` and is a Python ``TpuEvent``, not a ``torch.Event``; the C++
-    ``torch.Stream.wait_event`` binding then reads a garbage device type and raises e.g.
-    "Event device type VE does not match blocking stream's device type TPU". ``TpuEvent.wait`` is a
-    no-op (torch_tpu has a single implicit stream per device), so dropping the event is equivalent;
-    FSDP2 still ``work.wait()``s the all-gather and clears the result.
-    """
-    global _FSDP2_FINALIZE_PATCHED
-    if _FSDP2_FINALIZE_PATCHED:
-        return
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
-    except ImportError:
-        return
-    orig_finalize_backward = FSDPParamGroup.finalize_backward
-    warned = []
-
-    def finalize_backward(self):
-        result = self._all_gather_result
-        if result is not None and result.all_gather_event is not None:
-            if not isinstance(result.all_gather_event, torch.Event):
-                if not warned:
-                    logger.warning(
-                        "FSDP2 mistargeted unshard at finalize_backward (%s); dropping TPU event",
-                        getattr(self, "_module_fqn", "?"),
-                    )
-                    warned.append(True)
-                self._all_gather_result = result._replace(all_gather_event=None)
-        return orig_finalize_backward(self)
-
-    FSDPParamGroup.finalize_backward = finalize_backward
-    _FSDP2_FINALIZE_PATCHED = True
-
-
 def monkey_patch_varlen_attention_tpu():
     """Patches TorchTitan's VarlenAttention forward method to use native scaled_dot_product_attention on TPU."""
     try:
