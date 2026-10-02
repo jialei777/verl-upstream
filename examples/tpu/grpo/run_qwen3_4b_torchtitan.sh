@@ -155,7 +155,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS}" \
     trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
-    trainer.logger="['console','tensorboard','wandb']" \
+    trainer.logger="['console','tensorboard']" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.log_val_generations=4 \
