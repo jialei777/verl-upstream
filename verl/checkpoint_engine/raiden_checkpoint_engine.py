@@ -766,6 +766,12 @@ async def update_raiden_weights(
     ]
     install_results = await asyncio.gather(*install_futures)
     t_install = time.perf_counter() - t_install_start
+    # collective_rpc returns one result per TP worker of each replica; each is the timing dict returned by
+    # vLLMRaidenWorkerExtension.install_raiden_weights. The slowest worker gates the sync, so report the max.
+    worker_install_stats = [
+        r for per_replica in install_results for r in (per_replica or []) if isinstance(r, dict) and "h2d" in r
+    ]
+    t_h2d_pure = max((r["h2d"] for r in worker_install_stats), default=None)
     # Tag new generations with this weight version (the trajectory staleness metrics read it), as the other
     # checkpoint backends do once the new weights are loaded.
     if global_steps is not None:
