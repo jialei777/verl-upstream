@@ -8,11 +8,6 @@
 #
 # The settings that separate the two modes, and why they matter:
 #
-#   rollout.n              2  -> 8     GRPO estimates the advantage as the spread of
-#                                      rewards *within* a group of samples for the same
-#                                      prompt. With n=2 the group is almost always all-
-#                                      correct or all-wrong, the advantage collapses to
-#                                      zero and no gradient flows.
 #   train_batch_size       4  -> 32    4 prompts/step is far too noisy to show a trend.
 #   max_response_length  512  -> 1024  At 512 the smoke test truncated 87.5% of responses
 #                                      (`response_length/clip_ratio: 0.875`), so the model
@@ -20,12 +15,19 @@
 #                                      line and scored zero regardless of correctness.
 #   total_training_steps   5  -> 100   Enough steps for the reward curve to move.
 #
+# Both modes sample rollout.n=8 responses per prompt. GRPO estimates the advantage as the
+# spread of rewards *within* a group of samples for the same prompt. With n=2 the group is
+# almost always all-correct or all-wrong, the advantage collapses to zero and no gradient
+# flows: one smoke run at n=2 had grad_norm 0.0 on all 5 steps, so it never updated the
+# actor or sent changed weights to the rollout.
+#
 # Parallelism: the actor runs pure FSDP (tensor_parallel_size=1,
 # data_parallel_shard_size=8). Do not re-enable tensor parallelism without re-testing.
 # Under tensor_parallel_size=2 the actor produced non-finite gradients on most steps, and
 # because optimizer_step() silently skips the update when grad_norm is not finite, the job
-# still reported SUCCEEDED while the policy never changed. The same smoke config gives
-# grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and inf / 8.3e37 / 3.8e24 at tp=2.
+# still reported SUCCEEDED while the policy never changed. The smoke config (then at
+# rollout.n=2) gave grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and
+# inf / 8.3e37 / 3.8e24 at tp=2.
 
 set -xeuo pipefail
 
@@ -47,7 +49,7 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
     VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-4}"
     VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-8}"
     PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
-    ROLLOUT_N="${ROLLOUT_N:-2}"
+    ROLLOUT_N="${ROLLOUT_N:-8}"
     MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
