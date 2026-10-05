@@ -123,5 +123,5 @@ WORKDIR /app
 ENV PIP_EXTRA_INDEX_URL=""
 ENV PIP_INDEX_URL=""
 
-# Add /app, /vllm-torchtpu, and /torchtitan to PYTHONPATH.
-ENV PYTHONPATH="/vllm-torchtpu/src:/vllm-torchtpu:/torchtpu-vllm/src:/torchtpu-vllm:/app:/torchtitan:/torchtitan/torchtitan${PYTHONPATH:+:$PYTHONPATH}"
+# Add /app, /workspace/verl, /data/verl, /vllm-torchtpu, and /torchtitan to PYTHONPATH.
+ENV PYTHONPATH="/vllm-torchtpu/src:/vllm-torchtpu:/torchtpu-vllm/src:/torchtpu-vllm:/app:/workspace/verl:/data/verl:/torchtitan:/torchtitan/torchtitan${PYTHONPATH:+:$PYTHONPATH}"
