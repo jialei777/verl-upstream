@@ -989,14 +989,22 @@ async def update_raiden_weights(
     global_steps: Optional[int] = None,
 ) -> dict:
     """Orchestrator coordination for Raiden TPU P2P weight synchronization via central RaidenController."""
-    t_abort_start = time.perf_counter()
-    if global_steps and global_steps > 0:
-        try:
-            await manager.abort_replicas()
-        except Exception as e:
-            logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
-    t_abort = time.perf_counter() - t_abort_start
     parity = RaidenParityCheck.from_config(manager.config.engine_kwargs)
+
+    # 0. Quiesce the samplers *concurrently* with the trainer-side export below. The trainer's
+    #    update_weights(mode="raiden") only exports local shards, binds/creates its WeightSynchronizer and
+    #    registers with the RaidenController; nothing reads or writes sampler memory until step 2
+    #    (sampler init) at the earliest, so the pause does not need to be serialized in front of it.
+    async def _quiesce_samplers() -> float:
+        t0 = time.perf_counter()
+        if global_steps and global_steps > 0:
+            try:
+                await manager.abort_replicas()
+            except Exception as e:
+                logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
+        return time.perf_counter() - t0
+
+    quiesce_task = asyncio.create_task(_quiesce_samplers())
 
     t_total_start = time.perf_counter()
 
@@ -1009,6 +1017,9 @@ async def update_raiden_weights(
     if actor_refs is not None:
         await asyncio.to_thread(ray.get, actor_refs)
     t_init_trainer = time.perf_counter() - t_init_trainer_start
+
+    # The samplers must be quiesced before anything below touches them.
+    t_abort = await quiesce_task
 
     parallelism = 8
     if hasattr(manager, "config") and hasattr(manager.config, "engine_kwargs"):
