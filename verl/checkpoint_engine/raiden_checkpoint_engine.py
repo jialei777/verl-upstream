@@ -789,12 +789,24 @@ async def update_raiden_weights(
         await asyncio.gather(
             *[replica.server_handle.set_global_steps.remote(global_steps) for replica in manager.replicas]
         )
+
+    # 6. Resume generation as soon as the samplers hold the new weights and carry the new global_steps tag.
+    #    Do not wait for the trainer-side buffer release below: it only frees trainer HBM (gc + TPU sync,
+    #    ~2s at 8B) and would otherwise keep the samplers idle for that long on every sync.
+    t_resume_start = time.perf_counter()
+    await manager.resume_generation_replicas()
+    t_resume = time.perf_counter() - t_resume_start
+
+    # 7. Wait for the trainer to hand its staging HBM back before the next training step starts.
+    t_release_start = time.perf_counter()
     if release_refs is not None:
         await asyncio.to_thread(ray.get, release_refs)
+    t_release = time.perf_counter() - t_release_start
 
     t_total = time.perf_counter() - t_total_start
 
-    # 5. Parity Verification (Optional, default=False)
+    # 8. Parity Verification (Optional, default=False). Read-only on both sides, so it may run while the
+    #    samplers are already generating.
     if verify_parity:
         try:
             await _verify_parity_async(manager, global_steps)
@@ -809,11 +821,10 @@ async def update_raiden_weights(
         f"  * Raiden Barrier Check   : {t_barrier:.4f}s\n"
         f"  * RaidenController P2P   : {t_transfer:.4f}s\n"
         f"  * Sampler H2D DMA        : {t_install:.4f}s\n"
+        f"  * Sampler Resume         : {t_resume:.4f}s\n"
+        f"  * Trainer Buffer Release : {t_release:.4f}s (samplers already generating)\n"
         f"  * Total End-to-End Sync  : {t_total:.4f}s"
     )
-
-    # 6. Resume generation immediately
-    await manager.resume_generation_replicas()
 
     # Surface the phase timers as step metrics. The trainer stashes this dict in _pending_sync_metrics and
     # merges it into the same step's metrics, so they are logged next to timing_s/update_weights by every
@@ -825,6 +836,8 @@ async def update_raiden_weights(
         "timing_s/tpu-sync/barrier": t_barrier,
         "timing_s/tpu-sync/p2p_transfer": t_transfer,
         "timing_s/tpu-sync/sampler_h2d": t_install,
+        "timing_s/tpu-sync/sampler_resume": t_resume,
+        "timing_s/tpu-sync/trainer_release": t_release,
         "timing_s/tpu-sync/total_sync": t_total,
     }
     if t_h2d_pure is not None:
