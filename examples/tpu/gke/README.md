@@ -4,6 +4,7 @@ This directory contains the Docker image definition and KubeRay manifest for run
 
 - [`Dockerfile.tpu`](Dockerfile.tpu): Builds the unified TPU runtime image containing `torch==2.11.0`, `torch_tpu`, `torchtitan`, `vllm==0.14.0`, `vllm_tpu`, `jax==0.9.0`, `libtpu`, and `verl` (`us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20260918-fi0918`).
 - [`ray-tpu-v6e8-2slice.yaml`](ray-tpu-v6e8-2slice.yaml): KubeRay `RayCluster` manifest provisioning 1 CPU Ray head pod (`ray-head`) and 2 multi-host TPU v6e-8 slices (`numOfHosts: 2`, `google.com/tpu: 4` per host = 16 TPU v6e chips total) with GCS Fuse mounted at `/data` and `400Gi` host memory per TPU pod.
+- [`ray-tpu-v6e32-2slice.yaml`](ray-tpu-v6e32-2slice.yaml): 2 x TPU v6e-32 slices (`4x8`, `numOfHosts: 8` = 64 chips) as one worker group (`replicas: 2`), RayCluster `ray-tpu-v6e32-cluster`, image `verl-tpu:v20261006-tsync1006`; used by [`run_qwen3_32b_torchtitan.sh`](../grpo/run_qwen3_32b_torchtitan.sh) (Qwen3-32B, FSDP32 trainer + vLLM TP32 rollout).
 
 ---
 
