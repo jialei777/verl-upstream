@@ -14,7 +14,7 @@ The training setup uses:
 
 ### Step 1. Clone `verl` and `verl-hardware-plugin`
 
-On the machine from which you submit Ray jobs, clone both repositories:
+On the machine from which you submit Ray jobs, clone both repositories (no Docker image rebuild or `pip install` on the cluster is required):
 
 ```bash
 # 1. Clone verl and check out the branch
@@ -51,9 +51,7 @@ Ensure the model and dataset paths referenced by `examples/tpu/grpo/run_qwen3_0_
 
 ### Step 3. Submit the GRPO Training Job
 
-#### Option A: Ship `verl-hardware-plugin` via Ray `runtime_env.py_modules` (No Image Rebuild Required)
-
-From the root of the `verl` repository, submit the job with `py_modules` pointing to `${PLUGIN_REPO}/verl_hardware_plugin` and `"VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin"`. Ray packages both `verl` and `verl_hardware_plugin` and distributes them to the head pod and all TPU worker pods automatically:
+From the root of the `verl` repository, submit the job with `py_modules` pointing to `${PLUGIN_REPO}/verl_hardware_plugin` and `"VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin"`. Ray packages both `verl` and `verl_hardware_plugin` from your local checkout and distributes them to the head pod and all TPU worker pods automatically:
 
 ```bash
 export RAY_ADDRESS="http://localhost:23333"
@@ -100,36 +98,6 @@ ray job submit --address "${RAY_ADDRESS}" \
     }
   }" \
   -- bash -c "SMOKE_TEST=1 bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh"
-```
-
-#### Option B: Pre-install `verl-hardware-plugin` in the Container / Environment
-
-If you pre-install `verl-hardware-plugin` across all Ray nodes (or in your Docker image):
-
-```bash
-git clone https://github.com/verl-project/verl-hardware-plugin.git
-pip install --no-build-isolation -e ./verl-hardware-plugin
-```
-
-`verl` automatically loads the plugin via the `verl.plugins` entry point (`VERL_USE_EXTERNAL_PLUGINS=auto`), so `py_modules` can be omitted when submitting:
-
-```bash
-ray job submit --address "${RAY_ADDRESS}" \
-  --working-dir . \
-  --runtime-env-json '{
-    "excludes": [".git", "logs", "*.log", "*.pt", "*.bin", ".venv", "__pycache__"],
-    "env_vars": {
-      "PYTHONPATH": ".",
-      "PYTHONUNBUFFERED": "1",
-      "VERL_PLATFORM": "tpu",
-      "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin",
-      "RAY_memory_monitor_refresh_ms": "0",
-      "RAY_memory_usage_threshold": "0.99",
-      "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS": "1",
-      "RAY_OVERRIDE_JOB_RUNTIME_ENV": "1"
-    }
-  }' \
-  -- bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
 ```
 
 ---
