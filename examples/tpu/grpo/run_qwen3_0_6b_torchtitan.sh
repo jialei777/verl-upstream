@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
-# V1 PPOTrainer (Separate Async Overlap)
+# V1 PPOTrainer (Separate Async Overlap) — requires verl-hardware-plugin:
+#   ray job submit --working-dir . --runtime-env-json '{
+#     "py_modules": ["/path/to/verl-hardware-plugin/verl_hardware_plugin"],
+#     "env_vars": {"VERL_PLATFORM": "tpu", "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin", ...}
+#   }' -- bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
+# See examples/tpu/grpo/README.md for full instructions.
 #
 # By default this runs a realistic 100-step GRPO job whose reward curve actually
 # moves. Set SMOKE_TEST=1 for the 5-step configuration used to validate that the
