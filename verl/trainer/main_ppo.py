@@ -104,15 +104,20 @@ def run_ppo(config, task_runner_class) -> None:
             DEFAULT_TASK_RUNNER_CPUS,
         )
 
-        # Forward platform env_vars (e.g., WANDB_*, VERL_FILE_LOGGER_ROOT) and pin TaskRunner to the Ray head node.
-        # Without this, RAY_OVERRIDE_JOB_RUNTIME_ENV=1 strips WandB/logger env vars and schedules TaskRunner on a
-        # worker node lacking credentials or head-local storage, causing wandb.init() and file logging to fail.
+        # Forward platform env_vars (e.g., WANDB_*, VERL_FILE_LOGGER_ROOT) to TaskRunner, and pin it to the Ray head
+        # node only when the head node advertises enough CPUs (>= DEFAULT_TASK_RUNNER_CPUS). On GKE KubeRay clusters
+        # with a lightweight CPU head pod (e.g., 4 CPUs), leaving resources=None schedules TaskRunner on a TPU worker
+        # pod instead of deadlocking on {'node:__internal_head__': 1e-4, 'CPU': 10}.
         runner_env_vars = (
             get_platform().get_ray_init_kwargs().get("runtime_env", {}).get("env_vars", {"VERL_PLATFORM": "tpu"})
         )
-        runner_resources = (
-            {"node:__internal_head__": 1e-4} if "node:__internal_head__" in ray.cluster_resources() else None
+        head_has_enough_cpus = any(
+            node.get("Alive", False)
+            and "node:__internal_head__" in node.get("Resources", {})
+            and node.get("Resources", {}).get("CPU", 0) >= DEFAULT_TASK_RUNNER_CPUS
+            for node in ray.nodes()
         )
+        runner_resources = {"node:__internal_head__": 1e-4} if head_has_enough_cpus else None
         runner = task_runner_class.options(
             num_cpus=DEFAULT_TASK_RUNNER_CPUS,
             max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY,
