@@ -5,7 +5,7 @@ set -euo pipefail
 # 250 steps; 128 prompts x 16 rollouts; 32 trainer + 32 generator chips.
 # Seed 1 for data, trainer, reference, and generator; rollout TP1; prefix off.
 # PPO clipping +/-0.2; dual clipping 3.0; KL coefficient 0.001 (low_var_kl).
-# Validate GSM8K (1319), MATH-500 (500), AIME2024 (30) at step0, every20,
+# Validate GSM8K (1319), MATH-500 (500), frozen OpenMathInstruct-2 (1000) at step0, every20,
 # and the final step250. Checkpoint saving and automatic resume stay disabled.
 # Snapshot this VERL checkout and the sibling patched hardware plugin.
 #

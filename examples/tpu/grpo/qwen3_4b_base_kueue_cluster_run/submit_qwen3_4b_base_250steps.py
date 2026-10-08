@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import copy
 import hashlib
 import json
+import netrc
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +21,7 @@ import tarfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parents[3]
@@ -34,7 +38,9 @@ DEFAULT_CONFIG = {
     "artifact_gcs_uri": "gs://ubench-logs/lixali/verl-ray-kueue/results",
     "backup_gcs_uri": "gs://lixali-tpu-storage/grpo/tpu-v6e",
     "artifact_upload_interval_seconds": 60,
-    "run_id_stem": "qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-plugin",
+    "run_id_stem": (
+        "qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-plugin-openmath1000"
+    ),
     "name_stem": "verl-qwen3-base-plugin",
     "source_snapshot": "source-snapshot",
     "manifest_file": "jobset.yaml",
@@ -64,13 +70,15 @@ DEFAULT_CONFIG = {
         "worker_ephemeral_storage_limit": "35Gi",
     },
     "training": {
+        "logger": ["console", "tensorboard", "file", "wandb"],
+        "project_name": "verl_tpu_grpo",
         "steps": 250,
         "prompts_per_step": 128,
         "rollouts_per_prompt": 16,
         "responses_per_step": 2048,
         "micro_batch_size_per_gpu": 4,
         "validation": True,
-        "validation_samples": 1849,
+        "validation_samples": 2819,
         "test_freq": 20,
         "val_before_train": True,
         "save_freq": -1,
@@ -114,8 +122,9 @@ DEFAULT_CONFIG = {
             "actor_rollout_ref.actor.clip_ratio_high=0.2",
             "actor_rollout_ref.actor.clip_ratio_c=3.0",
             "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
-            "data.val_files=/data/jialei/data/validation/gsm8k_math500_aime2024.parquet",
+            "data.val_files=/data/jialei/data/validation/gsm8k_math500_openmathinstruct2_1000.parquet",
             "data.val_max_samples=-1",
+            "+data.validation_expected_rows=2819",
             "data.custom_cls.path=/opt/run/source/recipe_validation_dataset.py",
             "data.custom_cls.name=FullValidationDataset",
             "actor_rollout_ref.rollout.prompt_length=1024",
@@ -124,8 +133,8 @@ DEFAULT_CONFIG = {
             "actor_rollout_ref.rollout.val_kwargs.do_sample=False",
             "actor_rollout_ref.rollout.val_kwargs.temperature=0.0",
             "actor_rollout_ref.rollout.val_kwargs.n=1",
-            "custom_reward_function.path=/opt/run/source/recipe_reward_score.py",
-            "custom_reward_function.name=compute_score",
+            "reward.custom_reward_function.path=/opt/run/source/recipe_reward_score.py",
+            "reward.custom_reward_function.name=compute_score",
         ],
     },
     "expected_worker_ids": [
@@ -169,8 +178,8 @@ DEFAULT_CONFIG = {
     "validation": {
         "gsm8k": 1319,
         "math500": 500,
-        "aime2024": 30,
-        "total": 1849,
+        "openmathinstruct2": 1000,
+        "total": 2819,
         "manifest": "assets/qwen3-4b-base-validation/validation_manifest.json",
         "prompt_limit": 1024,
         "generation": "greedy",
@@ -188,19 +197,26 @@ DEFAULT_CONFIG = {
         "trainer_and_generator": True,
         "validation_generator": True,
     },
+    "wandb": {
+        "mode": "online",
+        "entity": None,
+        "base_url": "https://api.wandb.ai",
+        "api_key_secret": "verl-wandb-lixali",
+        "api_key_secret_key": "api-key",
+    },
     "model_cache_gcs_uri": "gs://lixali-tpu-storage/models/Qwen3-4B-Base/906bfd4b4dc7f14ee4320094d8b41684abff8539",
     "model_cache_reuse": True,
 }
 
-# Immutable validation data verified against the working recipe and its private cloud backup.
+# Frozen validation: preserve GSM8K/MATH-500 and reuse exactly1000 selected OpenMath questions.
 VALIDATION_INPUT = {
-    "source": "gs://lixali-tpu-storage/grpo/tpu-v6e/qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-20261007-115648-f776b0/backup-auto/inputs/jialei/data/validation/gsm8k_math500_aime2024.parquet",
-    "destination": "/data/jialei/data/validation/gsm8k_math500_aime2024.parquet",
-    "generation": "1791374250149415",
-    "bytes": 753286,
-    "sha256": "5899a3605cbd6f2326bd692e3c9de6a99c2ea6bb50715fd03e9056aa12800c52",
-    "md5Hash": "AU7AfS+D5wYVCdLhnRbXig==",
-    "crc32c": "64ZDiw==",
+    "source": "gs://ubench-logs/lixali/verl-ray-kueue/assets/qwen3-4b-gsm8k-math500-openmath1000-v1/inputs/data/gsm8k_math500_openmathinstruct2_1000.parquet",
+    "destination": "/data/jialei/data/validation/gsm8k_math500_openmathinstruct2_1000.parquet",
+    "generation": "1791442026168356",
+    "bytes": 729951,
+    "sha256": "27b4b6f17171771cf41a3045485d4afb5c2c5fd747abdb84b9cafb655c1e45c9",
+    "md5Hash": "7RgynKzmcLTB9OMNbRC6MA==",
+    "crc32c": "KuMwrQ==",
 }
 
 
@@ -220,9 +236,73 @@ def run(command, cwd=None):
     subprocess.run(command, cwd=cwd, check=True)
 
 
+def configure_wandb(cfg):
+    """Keep only nonsecret W&B settings in the packaged configuration."""
+    settings = cfg.setdefault("wandb", copy.deepcopy(DEFAULT_CONFIG["wandb"]))
+    for name, field in (("WANDB_MODE", "mode"), ("WANDB_ENTITY", "entity"), ("WANDB_BASE_URL", "base_url")):
+        if os.environ.get(name):
+            settings[field] = os.environ[name]
+    if settings.get("mode", "online") not in {"online", "offline", "disabled"}:
+        raise ValueError("WANDB_MODE must be online, offline, or disabled")
+    if os.environ.get("WANDB_PROJECT"):
+        cfg["training"]["project_name"] = os.environ["WANDB_PROJECT"]
+    cfg["training"].setdefault("logger", DEFAULT_CONFIG["training"]["logger"].copy())
+    cfg["training"].setdefault("project_name", DEFAULT_CONFIG["training"]["project_name"])
+
+
+def ensure_wandb_secret(cfg, kubectl):
+    """Reuse/create a cluster Secret; never archive or print the login key."""
+    if "wandb" not in cfg["training"]["logger"] or cfg["wandb"].get("mode", "online") != "online":
+        return
+    settings = cfg["wandb"]
+    name = settings.get("api_key_secret", "verl-wandb-lixali")
+    key_name = settings.get("api_key_secret_key", "api-key")
+    listing = subprocess.run(
+        kubectl + ["get", "secret", name, "-o", 'go-template={{range $key, $value := .data}}{{$key}}{{"\\n"}}{{end}}'],
+        capture_output=True,
+        text=True,
+    )
+    if listing.returncode == 0:
+        if key_name not in listing.stdout.splitlines():
+            raise RuntimeError(f"W&B Secret {name} must contain the key {key_name}")
+        return
+    if "NotFound" not in listing.stderr:
+        raise RuntimeError("Cannot check the configured W&B Secret in the target namespace")
+    token = os.environ.get("WANDB_API_KEY")
+    if not token:
+        host = urlsplit(settings.get("base_url", "https://api.wandb.ai")).hostname
+        try:
+            credentials = netrc.netrc().authenticators(host)
+        except (OSError, netrc.NetrcParseError):
+            credentials = None
+        if credentials:
+            token = credentials[2]
+    if not token:
+        raise RuntimeError("Run 'wandb login', set WANDB_API_KEY, or create the configured W&B Kubernetes Secret")
+    secret = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {"name": name, "namespace": cfg["namespace"]},
+        "data": {key_name: base64.b64encode(token.encode()).decode()},
+    }
+    created = subprocess.run(kubectl + ["create", "-f", "-"], input=json.dumps(secret), capture_output=True, text=True)
+    if created.returncode:
+        raise RuntimeError(
+            "Could not create the configured W&B Secret; Kubernetes output withheld to protect credentials"
+        )
+    print(f"W&B login available through Secret {name} in namespace {cfg['namespace']}", flush=True)
+
+
+def plugin_layout(plugin):
+    from qwen3_4b_base_250steps_runtime import tpu_plugin_layout
+
+    return tpu_plugin_layout(plugin)
+
+
 def precision_file(plugin):
-    for name in ("tpu_vllm_precision.py", "tpu_vllm_patches.py"):
-        relative = "verl_hardware_plugin/rollout/" + name
+    layout = plugin_layout(plugin)
+    for relative in (layout["precision"], layout["patches"]):
         path = plugin / relative
         if path.is_file():
             functions = {node.name for node in ast.parse(path.read_text()).body if isinstance(node, ast.FunctionDef)}
@@ -308,6 +388,7 @@ def snapshot_source(source, plugin, destination, cfg, launcher):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
         plugin_records[name] = digest(path)
+    layout = plugin_layout(plugin)
     sampler = precision_file(plugin)
     original_precision = precision_function_hashes(plugin / sampler)
     # Adapt runtime placement only in the isolated snapshot.
@@ -321,11 +402,7 @@ def snapshot_source(source, plugin, destination, cfg, launcher):
         "verl/workers/engine_workers.py",
         "verl/trainer/ppo/v1/trainer_base.py",
     }
-    allowed = {
-        "verl_hardware_plugin/platforms/platform_tpu.py",
-        "verl_hardware_plugin/rollout/tpu_vllm.py",
-        "verl_hardware_plugin/rollout/tpu_vllm_patches.py",
-    } | logging_files
+    allowed = {layout["platform"], layout["rollout"], layout["patches"]} | logging_files
     if set(modified) - allowed:
         raise ValueError(f"Unexpected computation/source modifications: {set(modified) - allowed}")
     if precision_function_hashes(destination / sampler) != original_precision:
@@ -334,7 +411,7 @@ def snapshot_source(source, plugin, destination, cfg, launcher):
         "verl/utils/torch_functional.py": source,
         "verl/workers/engine/torchtitan/transformer_impl.py": source,
         sampler: plugin,
-        "verl_hardware_plugin/rollout/tpu_vllm_patches.py": plugin,
+        layout["patches"]: plugin,
     }
     cfg["required_source_files"] = {
         name: {
@@ -350,14 +427,15 @@ def snapshot_source(source, plugin, destination, cfg, launcher):
             raise ValueError(f"Runtime placement changed a precision fix: {name}")
     shutil.copy2(TOOLS / "recipe_validation_dataset.py", destination / "recipe_validation_dataset.py")
     shutil.copy2(TOOLS / "recipe_reward_score.py", destination / "recipe_reward_score.py")
+    shutil.copy2(TOOLS / "recipe_tpu_plugin_layout.py", destination / "recipe_tpu_plugin_layout.py")
     shutil.copy2(TOOLS / "source_runtime_check.py", destination / "source-runtime-check.py")
     shutil.copy2(CONTROL / "tpu_preflight.py", destination / "tpu-preflight.py")
     shutil.copy2(CONTROL / "runtime-env.yaml", destination / "runtime-env-kueue.yaml")
     entry = (CONTROL / "train.sh").read_text()
     check = (
         "python3 source-runtime-check.py "
-        f"--model-path {cfg['training']['model_path']} "
-        "--validation-file /data/jialei/data/validation/gsm8k_math500_aime2024.parquet "
+        f"--model-path {shlex.quote(cfg['training']['model_path'])} "
+        f"--validation-file {shlex.quote(cfg['validation']['cloud_input']['destination'])} "
         '--output "/tmp/verl_metrics/${RUN_ID}/source-runtime-check.json"\n'
     )
     entry = entry.replace('python3 - "$@"', check + 'python3 - "$@"', 1)
@@ -388,6 +466,7 @@ def snapshot_source(source, plugin, destination, cfg, launcher):
             "recipe_validation_dataset.py",
             "recipe_reward_score.py",
             "recipe_response_logging.py",
+            "recipe_tpu_plugin_layout.py",
             "recipe_v6e_runtime.py",
             "source-runtime-check.py",
             "train-kueue.sh",
@@ -409,7 +488,6 @@ def snapshot_source(source, plugin, destination, cfg, launcher):
 
 def validate_configuration(snapshot, cfg):
     """Resolve the actual training command with Hydra, without Torch or Ray."""
-    import shlex
     import tempfile
     from unittest.mock import patch
 
@@ -458,6 +536,8 @@ def validate_configuration(snapshot, cfg):
     actor = resolved["actor_rollout_ref"]["actor"]
     rollout = resolved["actor_rollout_ref"]["rollout"]
     assert resolved["trainer"]["total_training_steps"] == cfg["training"]["steps"]
+    assert resolved["trainer"]["logger"] == cfg["training"]["logger"]
+    assert resolved["trainer"]["project_name"] == cfg["training"]["project_name"]
     assert resolved["trainer"]["val_before_train"] == cfg["training"]["val_before_train"]
     assert resolved["trainer"]["test_freq"] == cfg["training"]["test_freq"]
     assert actor["clip_ratio_low"] == actor["clip_ratio_high"] == 0.2 and actor["clip_ratio_c"] == 3.0
@@ -465,8 +545,15 @@ def validate_configuration(snapshot, cfg):
     assert actor["policy_loss"]["rollout_correction"]["loss_type"] == "ppo_clip"
     assert rollout["tensor_model_parallel_size"] == 1 and rollout["prompt_length"] == 1024
     assert resolved["data"]["max_prompt_length"] == 512 and resolved["data"]["val_max_samples"] == -1
-    assert resolved["data"]["seed"] == actor["data_loader_seed"] == actor["torchtitan"]["seed"] == rollout["seed"] == 1
-    assert resolved["actor_rollout_ref"]["ref"]["torchtitan"]["seed"] == rollout["engine_kwargs"]["vllm"]["seed"] == 1
+    assert resolved["data"]["validation_expected_rows"] == cfg["validation"]["total"]
+    assert resolved["data"]["val_files"] == cfg["validation"]["cloud_input"]["destination"]
+    seed = cfg["training"]["seed"]
+    assert (
+        resolved["data"]["seed"] == actor["data_loader_seed"] == actor["torchtitan"]["seed"] == rollout["seed"] == seed
+    )
+    assert (
+        resolved["actor_rollout_ref"]["ref"]["torchtitan"]["seed"] == rollout["engine_kwargs"]["vllm"]["seed"] == seed
+    )
     write_json(snapshot.parent.parent / "resolved-config.json", resolved)
     write_json(snapshot.parent.parent / "training-command.json", argv)
 
@@ -498,6 +585,7 @@ def main():
     )
     args = parser.parse_args()
     cfg = json.loads(args.config.read_text()) if args.config else copy.deepcopy(DEFAULT_CONFIG)
+    configure_wandb(cfg)
     if args.steps is not None:
         if args.steps <= 0:
             parser.error("--steps must be positive.")
@@ -565,9 +653,21 @@ def main():
     if (
         not validation_input
         or validation_input["sha256"] != validation_proof["combined"]["sha256"]
-        or validation_proof["combined"]["rows"] != 1849
+        or validation_proof["combined"]["rows"] != cfg["validation"]["total"]
+        or cfg["training"]["validation_samples"] != cfg["validation"]["total"]
+        or validation_proof["combined"]["counts_by_data_source"]
+        != {"openai/gsm8k": 1319, "HuggingFaceH4/MATH-500": 500, "nvidia/OpenMathInstruct-2": 1000}
     ):
-        raise ValueError("Validation cloud input does not match its verified 1849-row manifest.")
+        raise ValueError("Validation cloud input and configured row count do not match the frozen manifest.")
+    selection = validation_proof["benchmarks"]["openmathinstruct2"]["selection"]
+    if (
+        selection["dataset"] != "nvidia/OpenMathInstruct-2"
+        or selection["split"] != "train_1M"
+        or selection["count"] != 1000
+        or not selection["independent_of_training_seed"]
+        or not selection["no_exact_training_or_original_validation_overlap"]
+    ):
+        raise ValueError("Expected the frozen 1000-question OpenMathInstruct-2 selection without training overlap.")
     cfg["validation"]["cloud_input"] = validation_input
 
     if not validation_proof["token_length_audit"]["all_rows_fit"]:
@@ -632,7 +732,7 @@ def main():
         "model": cfg["model"],
         "response_log_probs": "per-response trainer/generator min,max,mean and token counts",
         "validation": cfg["validation"],
-        "seed": 1,
+        "seed": cfg["training"]["seed"],
         "configuration_verified": True,
         "mode": "render-only" if args.render_only else "prepare-only" if args.prepare_only else "submit",
     }
@@ -645,6 +745,7 @@ def main():
     run(kubectl + ["get", "localqueue", cfg["queue"]])
     # Catch admission/schema errors before cloud input preparation.
     run(kubectl + ["apply", "--dry-run=server", "-f", str(root / cfg["manifest_file"])])
+    ensure_wandb_secret(cfg, kubectl)
     sys.path.insert(0, str(launcher))
     from artifact_mirror import CloudStorage
 
@@ -687,7 +788,7 @@ def main():
     entries.append(
         {
             "source": asset_prefix + "/data/validation.parquet",
-            "destination": "/data/jialei/data/validation/gsm8k_math500_aime2024.parquet",
+            "destination": validation_input["destination"],
             "generation": meta["generation"],
             "bytes": validation_input["bytes"],
             "sha256": validation_input["sha256"],

@@ -10,79 +10,295 @@ Helper sources retain their normal layout under that workspace for inspection.
 
 from pathlib import Path
 
+
+def tpu_plugin_layout(root: str | Path | None = None) -> dict[str, str]:
+    """Resolve source paths and imports for either hardware-plugin TPU layout."""
+    root = Path(root) if root is not None else Path(__file__).resolve().parent
+    for directory, platform in (
+        ("verl_hardware_plugin/accelerators/tpu", "platform_tpu.py"),
+        ("verl_hardware_plugin", "platforms/platform_tpu.py"),
+    ):
+        paths = {
+            name: str(Path(directory) / relative)
+            for name, relative in (
+                ("platform", platform),
+                ("rollout", "rollout/tpu_vllm.py"),
+                ("patches", "rollout/tpu_vllm_patches.py"),
+                ("precision", "rollout/tpu_vllm_precision.py"),
+                ("engine", "engines/torchtitan_tpu.py"),
+                ("checkpoint", "engines/tpu_checkpoint_engine.py"),
+            )
+        }
+        if all((root / paths[name]).is_file() for name in ("platform", "rollout", "patches")):
+            return paths | {name + "_module": path[:-3].replace("/", ".") for name, path in paths.items()}
+    raise ValueError("The hardware-plugin checkout has no supported TPU source layout.")
+
+
 # Each literal contains an ordinary source file. Adjacent literals preserve any
 # triple-quote delimiters inside that source without encoding or archiving it.
 TEMPLATES: dict[str, str] = {
+    "recipe_tpu_plugin_layout.py": (
+        r'''# Copyright (c) 2026 Google LLC. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+"""Resolve legacy and accelerator-specific TPU plugin source paths."""
+
+from pathlib import Path
+
+
+def tpu_plugin_layout(root: str | Path | None = None) -> dict[str, str]:
+    """Resolve source paths and imports for either hardware-plugin TPU layout."""
+    root = Path(root) if root is not None else Path(__file__).resolve().parent
+    for directory, platform in (
+        ("verl_hardware_plugin/accelerators/tpu", "platform_tpu.py"),
+        ("verl_hardware_plugin", "platforms/platform_tpu.py"),
+    ):
+        paths = {
+            name: str(Path(directory) / relative)
+            for name, relative in (
+                ("platform", platform),
+                ("rollout", "rollout/tpu_vllm.py"),
+                ("patches", "rollout/tpu_vllm_patches.py"),
+                ("precision", "rollout/tpu_vllm_precision.py"),
+                ("engine", "engines/torchtitan_tpu.py"),
+                ("checkpoint", "engines/tpu_checkpoint_engine.py"),
+            )
+        }
+        if all((root / paths[name]).is_file() for name in ("platform", "rollout", "patches")):
+            return paths | {name + "_module": path[:-3].replace("/", ".") for name, path in paths.items()}
+    raise ValueError("The hardware-plugin checkout has no supported TPU source layout.")
+'''
+    ),
     "assets/qwen3-4b-base-validation/validation_manifest.json": (
         r"""{
+  "format_version": 1,
+  "profile_id": "gsm8k-math500-openmathinstruct2-1000-v1",
+  "frozen": true,
+  "source_inputs": [
+    {
+      "file": "source_inputs/train.parquet",
+      "source": "gs://lixali-tpu-storage/grpo/tpu-v6e/qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-20261007-115648-f776b0/backup-auto/inputs/jialei/data/gsm8k/train.parquet",
+      "generation": "1791374247949787",
+      "bytes": 6555601,
+      "sha256": "89cd3cb8d28e5274e7f0bf71ff541ea5654ac9e30589ac4b5d19c3f783a3858c"
+    },
+    {
+      "file": "source_inputs/original-validation.parquet",
+      "source": "gs://lixali-tpu-storage/grpo/tpu-v6e/qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-20261007-115648-f776b0/backup-auto/inputs/jialei/data/validation/gsm8k_math500_aime2024.parquet",
+      "generation": "1791374250149415",
+      "bytes": 753286,
+      "sha256": "5899a3605cbd6f2326bd692e3c9de6a99c2ea6bb50715fd03e9056aa12800c52"
+    }
+  ],
+  "upstream_metadata": {
+    "file": "upstream_metadata.json",
+    "bytes": 16007,
+    "sha256": "5c3b8d6e5db1ef114a8c56f019307f0254f434ba483523b12a5b47bd9b2d9ddd",
+    "declared_shard_sha256": [
+      {
+        "file": "data/train_1M-00000-of-00003.parquet",
+        "bytes": 212931526,
+        "sha256": "93700f39cdc87994f2c9a6ad62e1d62e09467793f57d376cfab722757ff26e1c"
+      },
+      {
+        "file": "data/train_1M-00001-of-00003.parquet",
+        "bytes": 213248631,
+        "sha256": "c208b3cda82903d9923cb0b1286b30ce9de0d2e56641cac32435b171be36b912"
+      },
+      {
+        "file": "data/train_1M-00002-of-00003.parquet",
+        "bytes": 212872872,
+        "sha256": "1a42cf7139b60ece5e14623626e1a0b9cdaadd5460704183395780ce26849e51"
+      }
+    ]
+  },
   "benchmarks": {
-    "aime2024": {
-      "data_source": "aime2024",
-      "grader": "verl.utils.reward_score.math_dapo.compute_score",
-      "label_normalization": "str(int(answer))",
-      "output": "aime2024.parquet",
-      "output_sha256": "716c017fd9db7624d09e6a4603c5182c47a85b870f588ad9f244b5434d1de215",
-      "raw_filename": "aime2024-train.parquet",
-      "repo": "HuggingFaceH4/aime_2024",
-      "revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a",
-      "rows": 30,
-      "sha256": "26139847601a5037c237d5928b195e7260ca8074cf4f264b794af42847f79ccf",
-      "split": "train (used exclusively for validation; 15 AIME I + 15 AIME II)",
-      "url": "https://huggingface.co/datasets/HuggingFaceH4/aime_2024/resolve/2fe88a2f1091d5048c0f36abc874fb997b3dd99a/data/train-00000-of-00001.parquet"
+    "gsm8k": {
+      "rows": 1319,
+      "preserved_original_fields": true
     },
     "math500": {
-      "data_source": "HuggingFaceH4/MATH-500",
-      "grader": "verl.utils.reward_score.math_reward.compute_score",
-      "label_normalization": "unchanged answer field",
-      "output": "math500.parquet",
-      "output_sha256": "79216e6edc6912edf0d854924b6165eb01a79215fcb6cc380aa1aee04e2048c1",
-      "raw_filename": "math500-test.jsonl",
-      "repo": "HuggingFaceH4/MATH-500",
-      "revision": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be",
       "rows": 500,
-      "sha256": "35dc41080a3680858b27fa7e0533d2d547825316fc5dafe5d316f4ccc5a06132",
-      "split": "test",
-      "url": "https://huggingface.co/datasets/HuggingFaceH4/MATH-500/resolve/6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be/test.jsonl"
+      "preserved_original_fields": true
+    },
+    "openmathinstruct2": {
+      "rows": 1000,
+      "selection": {
+        "count": 1000,
+        "seed": 0,
+        "dataset": "nvidia/OpenMathInstruct-2",
+        "revision": "469216e3f46f4dacf476b382e192485ea51a143e",
+        "config": "default",
+        "split": "train_1M",
+        "manifest_file": "openmathinstruct2_1000_selection.json",
+        "manifest_sha256": "f9ace2ecc95250f662c64e7b357c4acb4fbb59b34db44891bfb8c6fd93bb4e7c",
+        "manifest_uri": "gs://ubench-logs/lixali/verl-ray-kueue/assets/qwen3-4b-gsm8k-math500-openmath1000-v1/provenance/openmathinstruct2_1000_selection.json",
+        "ordered_problem_hashes_sha256": "d9fd61249cc43094d9572850325e3b89a1d1a578a31c48c2d8d66a7b3287a2c4",
+        "considered_rows": 1010,
+        "exclusions": {
+          "exact_training_or_original_validation_match": 8,
+          "prompt_exceeds_1024_qwen_tokens": 1,
+          "duplicate_selected_question": 1
+        },
+        "independent_of_training_seed": true,
+        "no_exact_training_or_original_validation_overlap": true,
+        "manifest_generation": "1791442030477217"
+      },
+      "labels": "expected_answer (original or majority-vote); custom validation from a training split"
     }
   },
   "combined": {
+    "file": "gsm8k_math500_openmathinstruct2_1000.parquet",
+    "bytes": 729951,
+    "sha256": "27b4b6f17171771cf41a3045485d4afb5c2c5fd747abdb84b9cafb655c1e45c9",
+    "rows": 2819,
     "counts_by_data_source": {
+      "openai/gsm8k": 1319,
       "HuggingFaceH4/MATH-500": 500,
-      "aime2024": 30,
-      "openai/gsm8k": 1319
-    },
-    "output": "validation.parquet",
-    "rows": 1849,
-    "sha256": "5899a3605cbd6f2326bd692e3c9de6a99c2ea6bb50715fd03e9056aa12800c52"
-  },
-  "grader_smoke_test": {
-    "correct_and_incorrect_responses": 1060,
-    "passed": true
-  },
-  "gsm8k": {
-    "rows": 1319,
-    "sha256": "e801bce6b15925630ea9976dc14419e49735a90fd54d267911e6701ebdc0d489",
-    "unchanged_rows": true
-  },
-  "instruction": "Let's think step by step and output the final answer within \\boxed{}.",
-  "token_length_audit": {
-    "HuggingFaceH4/MATH-500": {
-      "maximum": 814,
-      "over_limit": 0,
-      "rows": 500
-    },
-    "aime2024": {
-      "maximum": 416,
-      "over_limit": 0,
-      "rows": 30
-    },
-    "all_rows_fit": true,
-    "max_prompt_length": 1024,
-    "openai/gsm8k": {
-      "maximum": 211,
-      "over_limit": 0,
-      "rows": 1319
+      "nvidia/OpenMathInstruct-2": 1000
     }
+  },
+  "openmathinstruct2": {
+    "file": "openmathinstruct2_1000.parquet",
+    "bytes": 199654,
+    "sha256": "2fddb6ad0732bcb4cd5f3646df1780197c0038cc72b5b5a9fd39954ef776f3d8",
+    "rows": 1000
+  },
+  "token_length_audit": {
+    "tokenizer": {
+      "repo": "Qwen/Qwen3-4B-Base",
+      "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+      "files": [
+        {
+          "file": "config.json",
+          "bytes": 727,
+          "sha256": "304b2545a258d35620f1d4bf46940c0471d9baa00715ff8e77f84c2fca5057c1"
+        },
+        {
+          "file": "tokenizer_config.json",
+          "bytes": 9678,
+          "sha256": "3c04ed3ca964ea2f6b2b5faf0dc4d31aec1cb1e8b4bcf63f402d295046b422b5"
+        },
+        {
+          "file": "tokenizer.json",
+          "bytes": 7031645,
+          "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+        },
+        {
+          "file": "vocab.json",
+          "bytes": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        },
+        {
+          "file": "merges.txt",
+          "bytes": 1671853,
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+        }
+      ],
+      "math_scorer_sha256": "085eb67055c6976fea529d5ed9c8f0c63a989e85295d532db0d41fde8db50974"
+    },
+    "max_prompt_length": 1024,
+    "add_generation_prompt": true,
+    "enable_thinking": true,
+    "all_rows_fit": true,
+    "rows": 2819,
+    "max_prompt_tokens": 824,
+    "by_data_source": {
+      "openai/gsm8k": {
+        "rows": 1319,
+        "min_prompt_tokens": 46,
+        "max_prompt_tokens": 211,
+        "mean_prompt_tokens": 84.30780894617135
+      },
+      "HuggingFaceH4/MATH-500": {
+        "rows": 500,
+        "min_prompt_tokens": 31,
+        "max_prompt_tokens": 814,
+        "mean_prompt_tokens": 93.94
+      },
+      "nvidia/OpenMathInstruct-2": {
+        "rows": 1000,
+        "min_prompt_tokens": 34,
+        "max_prompt_tokens": 824,
+        "mean_prompt_tokens": 89.826
+      }
+    }
+  },
+  "grader_audit": {
+    "scorer": "verl.utils.reward_score.math_reward.compute_score",
+    "scorer_sha256": "085eb67055c6976fea529d5ed9c8f0c63a989e85295d532db0d41fde8db50974",
+    "correct_boxed_passed": 1000,
+    "wrong_boxed_passed": 1000,
+    "unboxed_first_answer_score": 0.0,
+    "all_selected_labels_roundtrip_gradeable": true
+  },
+  "preserved_rows_canonical_sha256": "2feadafad4a8b3f5ead4ad81c4d7f5f05ebba38328550721bd9208762f834e8b",
+  "builder_sha256": "563c91afc45f883f8edc2efc5de500dcc0431f6f4edeeec80e2c2e78c473b347",
+  "artifacts": [
+    {
+      "file": "gsm8k_math500_openmathinstruct2_1000.parquet",
+      "bytes": 729951,
+      "sha256": "27b4b6f17171771cf41a3045485d4afb5c2c5fd747abdb84b9cafb655c1e45c9"
+    },
+    {
+      "file": "openmathinstruct2_1000.parquet",
+      "bytes": 199654,
+      "sha256": "2fddb6ad0732bcb4cd5f3646df1780197c0038cc72b5b5a9fd39954ef776f3d8"
+    },
+    {
+      "file": "openmathinstruct2_1000_selection.json",
+      "bytes": 666761,
+      "sha256": "f9ace2ecc95250f662c64e7b357c4acb4fbb59b34db44891bfb8c6fd93bb4e7c"
+    },
+    {
+      "file": "upstream_metadata.json",
+      "bytes": 16007,
+      "sha256": "5c3b8d6e5db1ef114a8c56f019307f0254f434ba483523b12a5b47bd9b2d9ddd"
+    },
+    {
+      "file": "upstream_range_audit.json",
+      "bytes": 624504,
+      "sha256": "c793248f218ebf4554394716fc0d8ae3e2b8250aa734a74d3f624ad4f2e29e95"
+    },
+    {
+      "file": "token_length_audit.json",
+      "bytes": 1688,
+      "sha256": "f51d7df92cc89b91511186cee5793bd1a4a5ba85af8d380dcc3c184b58e78ba3"
+    },
+    {
+      "file": "grader_audit.json",
+      "bytes": 305,
+      "sha256": "2408dace71aa36a81fb8d1e4ebd917fbe2c43f3b87591f4e3aed779f7148a789"
+    },
+    {
+      "file": "source_inputs/train.parquet",
+      "source": "gs://lixali-tpu-storage/grpo/tpu-v6e/qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-20261007-115648-f776b0/backup-auto/inputs/jialei/data/gsm8k/train.parquet",
+      "generation": "1791374247949787",
+      "bytes": 6555601,
+      "sha256": "89cd3cb8d28e5274e7f0bf71ff541ea5654ac9e30589ac4b5d19c3f783a3858c"
+    },
+    {
+      "file": "source_inputs/original-validation.parquet",
+      "source": "gs://lixali-tpu-storage/grpo/tpu-v6e/qwen3-4b-base-grpo-v6e-250steps-32trainer32sampler-ppo-clip02-dual3-kl1e-3-no-prefix-seed1-20261007-115648-f776b0/backup-auto/inputs/jialei/data/validation/gsm8k_math500_aime2024.parquet",
+      "generation": "1791374250149415",
+      "bytes": 753286,
+      "sha256": "5899a3605cbd6f2326bd692e3c9de6a99c2ea6bb50715fd03e9056aa12800c52"
+    }
+  ],
+  "full_manifest": {
+    "generation": "1791442028066980",
+    "bytes": 26041,
+    "sha256": "afabfceb1f8001b21f65c2369ace73b7896069ace0f44ed216c98e883d593ac1",
+    "md5Hash": "TaY3UNEYOgj8CJnJRJcgnA==",
+    "crc32c": "1xC1mw==",
+    "uri": "gs://ubench-logs/lixali/verl-ray-kueue/assets/qwen3-4b-gsm8k-math500-openmath1000-v1/provenance/validation_manifest.json"
+  },
+  "cloud_input": {
+    "source": "gs://ubench-logs/lixali/verl-ray-kueue/assets/qwen3-4b-gsm8k-math500-openmath1000-v1/inputs/data/gsm8k_math500_openmathinstruct2_1000.parquet",
+    "generation": "1791442026168356",
+    "bytes": 729951,
+    "sha256": "27b4b6f17171771cf41a3045485d4afb5c2c5fd747abdb84b9cafb655c1e45c9",
+    "md5Hash": "7RgynKzmcLTB9OMNbRC6MA==",
+    "crc32c": "KuMwrQ=="
   }
 }
 """
@@ -888,6 +1104,8 @@ STATE = {
 }
 SOURCE_BUNDLE_PATH = None
 ARTIFACT_MANAGER = None
+STORAGE_DOWNLOAD_CHUNK_BYTES = 32 * 1024 * 1024
+STORAGE_RANGE_MIN_BYTES = 64 * 1024 * 1024
 
 
 def startup_deadline():
@@ -979,14 +1197,58 @@ def storage_download(uri, target, generation=None):
 
         gcsfs.GCSFileSystem(token="google_default").get(uri, str(target))
     else:
+        import base64
+        import google_crc32c
+        from google.cloud.storage.retry import DEFAULT_RETRY
+        from requests.exceptions import ChunkedEncodingError
+
         bucket_name, blob_name = uri[5:].split("/", 1)
         bucket = storage.Client().bucket(bucket_name)
-        if generation is None:
-            bucket.blob(blob_name).download_to_filename(str(target))
-        else:
-            bucket.blob(blob_name, generation=generation).download_to_filename(
-                str(target), if_generation_match=generation
+        blob = bucket.blob(blob_name, generation=generation)
+        retry = DEFAULT_RETRY.with_deadline(600)
+        blob.reload(if_generation_match=generation, timeout=(20, 120), retry=retry)
+        generation = int(blob.generation)
+        size = int(blob.size)
+        if size < STORAGE_RANGE_MIN_BYTES:
+            blob.download_to_filename(
+                str(target), if_generation_match=generation, timeout=(20, 120), retry=retry
             )
+            return
+
+        if not blob.crc32c:
+            raise RuntimeError("Large download requires the pinned object's CRC32C checksum")
+        expected_crc = blob.crc32c
+        partial = Path(target).with_name(Path(target).name + ".download-part")
+        checksum = google_crc32c.Checksum()
+        try:
+            with partial.open("wb") as destination:
+                for offset in range(0, size, STORAGE_DOWNLOAD_CHUNK_BYTES):
+                    end = min(size, offset + STORAGE_DOWNLOAD_CHUNK_BYTES) - 1
+                    expected_bytes = end - offset + 1
+                    def read_range():
+                        # Each retry gets a fresh SDK byte buffer, never partial bytes from a prior response.
+                        data = blob.download_as_bytes(
+                            start=offset, end=end, raw_download=True, checksum=None,
+                            if_generation_match=generation, timeout=(20, 120), retry=None,
+                        )
+                        if len(data) != expected_bytes:
+                            raise ChunkedEncodingError(
+                                f"Model range {offset}-{end}: {len(data)}/{expected_bytes} bytes"
+                            )
+                        return data
+
+                    data = retry(read_range)()
+                    destination.write(data)
+                    checksum.update(data)
+                    if end + 1 == size or (offset // STORAGE_DOWNLOAD_CHUNK_BYTES + 1) % 16 == 0:
+                        log(f"Downloaded {Path(target).name}: {end + 1}/{size} bytes")
+            if partial.stat().st_size != size:
+                raise RuntimeError("Large download byte count differs from pinned object metadata")
+            if base64.b64encode(checksum.digest()).decode("ascii") != expected_crc:
+                raise RuntimeError("Large download CRC32C differs from pinned object metadata")
+            partial.replace(target)
+        finally:
+            partial.unlink(missing_ok=True)
 
 
 def initialize_data():
@@ -1720,7 +1982,8 @@ def runtime_env():
         "LOGICAL_TPU_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
         "WANDB_MODE",
-        "WANDB_DISABLED",
+        "WANDB_ENTITY",
+        "WANDB_BASE_URL",
     ]
     for key in keys:
         if key in os.environ:
@@ -2031,6 +2294,13 @@ def main():
         "START_TIMEOUT_SECONDS": str(sizing.get("start_timeout_seconds", 900)),
         "WORKER_ACK_TIMEOUT_SECONDS": str(sizing.get("worker_ack_timeout_seconds", 900)),
     }
+    wandb_settings = config.get("wandb", {})
+    wandb_mode = wandb_settings.get("mode", "online")
+    environment["WANDB_MODE"] = wandb_mode
+    environment["WANDB_DISABLED"] = "false"
+    for field, variable in (("entity", "WANDB_ENTITY"), ("base_url", "WANDB_BASE_URL")):
+        if wandb_settings.get(field):
+            environment[variable] = str(wandb_settings[field])
     if runtime_accelerator == "v6e":
         # GKE treats JobSet replicated jobs as MegaScale slices by default.
         # These roles are one trainer slice and independent sampler hosts.
@@ -2110,6 +2380,15 @@ def main():
                 {"name": "data", "mountPath": "/data"},
             ],
         }
+        if "wandb" in config.get("training", {}).get("logger", ["wandb"]) and wandb_mode == "online":
+            # Credentials stay in Kubernetes, outside source/config archives and Ray's printed env_vars.
+            container["env"].append({
+                "name": "WANDB_API_KEY",
+                "valueFrom": {"secretKeyRef": {
+                    "name": wandb_settings.get("api_key_secret", "verl-wandb-lixali"),
+                    "key": wandb_settings.get("api_key_secret_key", "api-key"),
+                }},
+            })
         selector = (
             sizing.get("head_node_selector", {"cloud.google.com/gke-nodepool": "cpu-np"})
             if is_head
@@ -2315,6 +2594,7 @@ def main():
     packaged_config = json.loads((staged_source / "run-training.json").read_text())
     for key in (
         "training",
+        "wandb",
         "resources",
         "geometry",
         "actor_memory",
@@ -2516,9 +2796,12 @@ def verify_required_sampler_patch(required_source_files):
 
     if not isinstance(required_source_files, dict):
         raise ValueError("required_source_files must map bundled relative paths to SHA256 values")
+    from recipe_tpu_plugin_layout import tpu_plugin_layout
+
     source_root = Path.cwd().resolve()
-    entrypoint_relative = "verl_hardware_plugin/rollout/tpu_vllm_patches.py"
-    separated_relative = "verl_hardware_plugin/rollout/tpu_vllm_precision.py"
+    layout = tpu_plugin_layout(source_root)
+    entrypoint_relative = layout["patches"]
+    separated_relative = layout["precision"]
     patch_relative = separated_relative if (source_root / separated_relative).is_file() else entrypoint_relative
     if not {patch_relative, entrypoint_relative}.issubset(required_source_files):
         raise ValueError("The sampler gate requires SHA256s for the submitted TPU precision source and entrypoint")
@@ -2539,7 +2822,7 @@ def verify_required_sampler_patch(required_source_files):
 
     # TPUvLLMHttpServer installs this entrypoint before constructing the engine;
     # apply the same entrypoint here without constructing a model or sampling.
-    entrypoint = importlib.import_module("verl_hardware_plugin.rollout.tpu_vllm_patches")
+    entrypoint = importlib.import_module(layout["patches_module"])
     entrypoint_file = Path(entrypoint.__file__).resolve(strict=True)
     if entrypoint_file != (source_root / entrypoint_relative).resolve(strict=True):
         raise RuntimeError(f"TPU patch entrypoint imported outside the submitted bundle: {entrypoint_file}")
@@ -2547,7 +2830,7 @@ def verify_required_sampler_patch(required_source_files):
     if entrypoint._PATCHES_APPLIED is not True:
         raise RuntimeError("The submitted patch_vllm_for_tpu entrypoint did not activate")
     patch_module = (
-        importlib.import_module("verl_hardware_plugin.rollout.tpu_vllm_precision")
+        importlib.import_module(layout["precision_module"])
         if patch_relative == separated_relative
         else entrypoint
     )
@@ -2587,7 +2870,7 @@ def verify_required_sampler_patch(required_source_files):
         "runner_module_file": str(runner_module.__file__),
         "source_root": str(source_root),
         "source_files": checked,
-        "activation": "verl_hardware_plugin.rollout.tpu_vllm_patches.patch_vllm_for_tpu()",
+        "activation": layout["patches_module"] + ".patch_vllm_for_tpu()",
     }
 
 
@@ -2656,9 +2939,10 @@ class TPUProbe:
             os.environ.update(env)
         # Preserve the proven trainer import order. For TP1 samplers the native
         # selector is already scoped to the actual allocation before this import.
-        from verl_hardware_plugin.platforms.platform_tpu import patch_ray_worker
+        import importlib
+        from recipe_tpu_plugin_layout import tpu_plugin_layout
 
-        patch_ray_worker()
+        importlib.import_module(tpu_plugin_layout()["platform_module"]).patch_ray_worker()
         os.environ.update(env)
         if any(key.startswith("MEGASCALE_") for key in os.environ):
             raise RuntimeError("GKE Multislice settings survived the worker cleanup")
@@ -3130,7 +3414,8 @@ overrides = [
     f"trainer.val_before_train={bool(training.get('val_before_train', False))}",
     f"trainer.save_freq={save_freq}",
     f"trainer.default_local_dir=/tmp/verl_checkpoints/{run_id}",
-    "trainer.logger=[console,tensorboard,file]",
+    "trainer.logger=" + json.dumps(training.get("logger", ["console", "tensorboard", "file", "wandb"])),
+    "trainer.project_name=" + str(training.get("project_name", "verl_tpu_grpo")),
     f"hydra.run.dir=/tmp/verl_hydra/{run_id}",
     "trainer.resume_mode=disable",
     "data.dataloader_num_workers=0",
@@ -3332,7 +3617,7 @@ def worker_environment(worker_ips, base_port, physical_chips=None):
 
 def single_chip_worker_class(wrapper_class):
     # Capture strings and geometry, never the native class or source helper functions.
-    # The actor is serialized by value; its constructor binds VFIO before native imports.
+    # Disable backend autoload at process startup, then bind before explicit native imports.
     wrapper_module, wrapper_name = wrapper_class.__module__, wrapper_class.__name__
     geometry = slice_geometry(1, 1, 1)
 
@@ -3357,6 +3642,24 @@ def single_chip_worker_class(wrapper_class):
                 raise ValueError("TP1 wrapper requires one valid physical TPU chip")
             chip = next(iter(chips))
             ip = ray.util.get_node_ip_address()
+            torch_imported = "torch" in sys.modules
+            torch_tpu_imported = "torch_tpu" in sys.modules
+            tpu_module = getattr(sys.modules.get("torch"), "tpu", None)
+            is_initialized = getattr(tpu_module, "is_initialized", None)
+            if torch_tpu_imported and not callable(is_initialized):
+                native_device = sys.modules.get("torch_tpu._internal.device._device_module")
+                native_ops = sys.modules.get("torch_tpu._internal.device._device_ops_backend")
+                if native_ops is None:
+                    native_ops = getattr(native_device, "_device_ops_backend", None)
+                is_initialized = getattr(native_ops, "_is_initialized", None)
+                internal_imported = any(name.startswith("torch_tpu._internal") for name in tuple(sys.modules))
+                # The pinned package's bare __init__ only installs its loader and library path.
+                # Once internals are imported, require a native initialization-state query.
+                if not callable(is_initialized) and (tpu_module is not None or internal_imported):
+                    raise RuntimeError("Cannot verify whether the imported TorchTPU runtime is initialized")
+            runtime_initialized = bool(is_initialized()) if callable(is_initialized) else False
+            if runtime_initialized:
+                raise RuntimeError("TP1 wrapper must bind its physical chip before initializing TorchTPU")
             for name in tuple(os.environ):
                 if name.startswith("MEGASCALE_"):
                     os.environ.pop(name, None)
@@ -3369,13 +3672,23 @@ def single_chip_worker_class(wrapper_class):
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES": f"{ip}:{8070 + chip}",
                 "TPU_PROCESS_ADDRESSES": f"{ip}:{8070 + chip}",
             })
-            if "torch_tpu" in sys.modules:
-                raise RuntimeError("TP1 wrapper must bind its physical chip before importing TorchTPU")
             print(json.dumps({"event": "v6e_tp1_binding_before_wrapper_import",
                               "physical_tpu_ids": [chip], "node_id": context.get_node_id(),
-                              "torch_imported_before_binding": "torch" in sys.modules,
-                              "torch_tpu_imported_before_binding": False}), flush=True)
-            patches = importlib.import_module("verl_hardware_plugin.rollout.tpu_vllm_patches")
+                              "torch_imported_before_binding": torch_imported,
+                              "torch_tpu_imported_before_binding": torch_tpu_imported,
+                              "tpu_runtime_initialized_before_binding": runtime_initialized,
+                              "torch_device_backend_autoload": os.environ.get("TORCH_DEVICE_BACKEND_AUTOLOAD"),
+                              "tpu_visible_chips": os.environ["TPU_VISIBLE_CHIPS"]}), flush=True)
+            # Bare torch_tpu import does not register torch.tpu when autoload is disabled.
+            # Invoke the pinned image's backend entrypoint only after binding its chip.
+            torch_module = importlib.import_module("torch")
+            if not hasattr(torch_module, "tpu"):
+                importlib.import_module("torch_tpu._loader").load()
+            if not hasattr(torch_module, "tpu"):
+                raise RuntimeError("TorchTPU backend registration failed after TP1 chip binding")
+            from recipe_tpu_plugin_layout import tpu_plugin_layout
+
+            patches = importlib.import_module(tpu_plugin_layout()["patches_module"])
             patches.patch_vllm_for_tpu()
             image_class = getattr(importlib.import_module(wrapper_module), wrapper_name)
             self._image_worker = image_class(*args, **kwargs)
@@ -3440,20 +3753,21 @@ def precision_functions(source):
 
 
 def precision_fingerprint(snapshot):
-    precision = snapshot / "verl_hardware_plugin/rollout/tpu_vllm_precision.py"
+    from recipe_tpu_plugin_layout import tpu_plugin_layout
+
+    layout = tpu_plugin_layout(snapshot)
+    precision = snapshot / layout["precision"]
     if precision.is_file():
         return {"precision_module": hashlib.sha256(precision.read_bytes()).hexdigest()}
-    patches = snapshot / "verl_hardware_plugin/rollout/tpu_vllm_patches.py"
+    patches = snapshot / layout["patches"]
     return precision_functions(patches.read_text())
 
 
 def prepare(snapshot):
-    plugin = snapshot / "verl_hardware_plugin"
-    paths = [
-        plugin / "platforms/platform_tpu.py",
-        plugin / "rollout/tpu_vllm.py",
-        plugin / "rollout/tpu_vllm_patches.py",
-    ]
+    from recipe_tpu_plugin_layout import tpu_plugin_layout
+
+    layout = tpu_plugin_layout(snapshot)
+    paths = [snapshot / layout[name] for name in ("platform", "rollout", "patches")]
     platform, rollout, patches = [path.read_text() for path in paths]
     original_precision = precision_fingerprint(snapshot)
     if any(MARKER in source for source in (platform, rollout, patches)):
@@ -3518,6 +3832,8 @@ def prepare(snapshot):
         + '    runtime_env["env_vars"] = dict(runtime_env.get("env_vars") or {})\n'
         + '    runtime_env["worker_process_setup_hook"] = "builtins.dict"\n'
         + '    runtime_env["env_vars"]["RAY_RUNTIME_ENV_WORKER_PROCESS_SETUP_HOOK"] = "builtins.dict"\n'
+        # Ray may import torch while deserializing actors; defer its native backend autoload.
+        + '    runtime_env["env_vars"]["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"\n'
         + '    ray_remote_kwargs["runtime_env"] = runtime_env\n',
         "executor subpool selection",
     )
@@ -3919,12 +4235,17 @@ from verl.utils.reward_score import default_compute_score
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
-    result = default_compute_score(
-        data_source=data_source,
-        solution_str=solution_str,
-        ground_truth=ground_truth,
-        extra_info=extra_info,
-    )
+    if data_source == "nvidia/OpenMathInstruct-2":
+        from verl.utils.reward_score import math_reward
+
+        result = math_reward.compute_score(solution_str, ground_truth)
+    else:
+        result = default_compute_score(
+            data_source=data_source,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+        )
     if isinstance(result, dict):
         return {"score": result["score"], "acc": result["acc"], "pred": result.get("pred", "")}
     return {"score": result, "acc": result, "pred": ""}
@@ -3950,6 +4271,9 @@ class FullValidationDataset(RLHFDataset):
         if is_validation:
             config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
             config.max_prompt_length = 1024
+            expected_rows = int(config.get("validation_expected_rows", 2819))
+            if expected_rows < 1:
+                raise ValueError("validation_expected_rows must be positive")
             max_samples = -1
         super().__init__(
             data_files=data_files,
@@ -3958,8 +4282,8 @@ class FullValidationDataset(RLHFDataset):
             processor=processor,
             max_samples=max_samples,
         )
-        if is_validation and len(self) != 1849:
-            raise ValueError(f"Expected all 1849 validation problems, loaded {len(self)}")
+        if is_validation and len(self) != expected_rows:
+            raise ValueError(f"Expected all {expected_rows} validation problems, loaded {len(self)}")
 '''
     ),
     "run_qwen3_4b_torchtitan.sh": (
@@ -4008,7 +4332,7 @@ else
 fi
 
 # Project details
-project_name='verl_tpu_grpo'
+project_name="${WANDB_PROJECT:-verl_tpu_grpo}"
 
 # Paths
 RAY_DATA_HOME="/data/jialei"
@@ -4109,7 +4433,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_seqs="${MAX_NUM_SEQS}" \
     trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
-    trainer.logger="['console','tensorboard']" \
+    trainer.logger="['console','tensorboard','file','wandb']" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.log_val_generations=4 \
@@ -4583,19 +4907,18 @@ def run(args):
     try:
         # Import the actual source used by the recipe; version numbers alone
         # cannot guarantee image compatibility with the user's current tree.
-        precision_modules = (
-            ("verl_hardware_plugin.rollout.tpu_vllm_precision",)
-            if (source / "verl_hardware_plugin/rollout/tpu_vllm_precision.py").is_file()
-            else ()
-        )
+        from recipe_tpu_plugin_layout import tpu_plugin_layout
+
+        layout = tpu_plugin_layout(source)
+        precision_modules = (layout["precision_module"],) if (source / layout["precision"]).is_file() else ()
         for name in (
             "verl.trainer.main_ppo",
-            "verl_hardware_plugin.engines.torchtitan_tpu",
-            "verl_hardware_plugin.rollout.tpu_vllm",
-            "verl_hardware_plugin.engines.tpu_checkpoint_engine",
-            "verl_hardware_plugin.platforms.platform_tpu",
+            layout["engine_module"],
+            layout["rollout_module"],
+            layout["checkpoint_module"],
+            layout["platform_module"],
             "verl.utils.dataset.rl_dataset",
-            "verl_hardware_plugin.rollout.tpu_vllm_patches",
+            layout["patches_module"],
             *precision_modules,
             "verl.utils.reward_score.math_reward",
             "verl.utils.reward_score.math_dapo",
