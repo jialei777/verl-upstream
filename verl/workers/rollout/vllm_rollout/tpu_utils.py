@@ -214,8 +214,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         worker = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
-        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController."""
+    def init_raiden_sync_on_worker(self, parallelism: int = 8, job_name: str = "sampler") -> bool:
+        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
+
+        ``job_name`` is the Raiden job this replica registers under; the orchestrator gives every rollout replica
+        its own name when there are several, so their ranks ``0..TP-1`` do not collide on the controller.
+        """
         if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
             return True
 
@@ -232,7 +236,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = 12000 + rank_val
+        # Let the OS pick the control listener port, as the trainer side does. ``rank`` is the rank inside this
+        # replica, so a fixed ``12000 + rank`` collides as soon as two replicas share a host. The port actually
+        # bound is read back from the synchronizer and registered with the controller below.
+        listener_port = 0
 
         # 1. Fetch RaidenController address and un-fused global shapes from TPUWeightRegistry
         from verl.checkpoint_engine.tpu_weight_registry import get_tpu_weight_registry
@@ -278,8 +285,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         # every sync. Unfused tensors (o_proj, down_proj, norms, embed_tokens, lm_head) could bind the vLLM
         # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
         # weights need tpu_sync to write into a slice or layout of the target tensor.
-        from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling, raiden_is_tile_aligned
-
         ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
 
         staging_tensors = {}
@@ -312,8 +317,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
             staging_tensors[name] = t
             valid_params.append((name, t))
-            # Tile-aligned local shards can skip the CPU (de)tiling pass and DMA straight to HBM.
-            skip_tiling_plan.append(raiden_is_tile_aligned(local_shape))
 
             variable_protos.append(
                 raiden_service_pb2.VariableMetadataProto(
@@ -352,14 +355,17 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             bind_ip=bind_ip,
         )
 
-        self._skip_tiling_plan = skip_tiling_plan
-        apply_raiden_skip_tiling(self._raiden_ws, skip_tiling_plan)
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # SOURCE and destination slices together, and delivered to this listener with the transfer. Setting it here
+        # from the local shape alone made the two sides disagree whenever a trainer shard was not 8-row aligned
+        # (e.g. Qwen3's embedding at 32+ FSDP ranks): the sender de-tiled to row-major and h2d() copied those bytes
+        # raw into tiled HBM, permuting the weights while leaving every norm unchanged.
 
         try:
             from tpu_sync.rpc import raiden_controller
 
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],
@@ -403,11 +409,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
-        # Re-apply the skip_tiling plan right before H2D: the network listener overwrites it with its default.
-        if getattr(self, "_skip_tiling_plan", None):
-            from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling
-
-            apply_raiden_skip_tiling(self._raiden_ws, self._skip_tiling_plan)
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 

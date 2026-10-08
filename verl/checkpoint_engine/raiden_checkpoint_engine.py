@@ -599,16 +599,16 @@ class RaidenCheckpointEngine(CheckpointEngine):
         self._registered_signature = None
         self._bound_tensors = None
         self._shard_info = {}
-        # Free the device tensors bound for a transfer, and the WeightSynchronizer that references them, once
-        # the controller push has read them, instead of keeping them until the next sync. With the local-shard
-        # export that is the bf16 copy of this rank's shards plus the full q/k/v, which the fused-wqkv save hook
-        # still all-gathers to every rank: ~3.4 GiB per chip for Qwen3-8B on 8 chips (~1.7 GiB of shards plus
-        # ~1.7 GiB of q/k/v, see get_per_tensor_param_shard). With an all-gathered weights iterable it is the
-        # full bf16 model on every chip. The synchronizer pins the device buffers of every bound tensor
-        # (dropping the Python references frees nothing), and tpu_sync has no unbind, so destroying it is the
-        # only way to return that HBM before the next sync, which then re-creates and re-registers the
-        # synchronizer instead of rebinding it. On by default so the trainer keeps that headroom as models grow;
-        # opt out with the engine kwarg or VERL_RAIDEN_RELEASE_BUFFERS=0 to trade HBM for the cheaper rebind.
+        # Free the device tensors bound for a transfer once the controller push has read them, instead of keeping
+        # them until the next sync. With the local-shard export that is the bf16 copy of this rank's shards plus
+        # the full q/k/v, which the fused-wqkv save hook still all-gathers to every rank: ~3.4 GiB per chip for
+        # Qwen3-8B on 8 chips (~1.7 GiB of shards plus ~1.7 GiB of q/k/v, see get_per_tensor_param_shard). With
+        # an all-gathered weights iterable it is the full bf16 model on every chip. The synchronizer pins the
+        # device buffers of every bound tensor (dropping the Python references frees nothing), so the release
+        # goes through WeightSynchronizer.unbind_weights(): the HBM holds are dropped while the synchronizer, its
+        # pinned host staging buffers and its controller registration stay alive for the next sync to rebind.
+        # On by default so the trainer keeps that headroom as models grow; opt out with the engine kwarg or
+        # VERL_RAIDEN_RELEASE_BUFFERS=0 to keep the send tensors resident between syncs.
         release = _as_bool(kwargs.get("release_buffers_after_sync", True))
         env_release = os.environ.get("VERL_RAIDEN_RELEASE_BUFFERS", "")
         if env_release:
@@ -810,9 +810,9 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         # Reuse the WeightSynchronizer across steps when the tensor signature is unchanged: rebinding keeps
         # the DMA-mapped host buffers, listener/threads, and controller registration, and only swaps the
-        # device buffers the D2H reads from. Rebuilding every step re-allocates, pins, and first-touches
-        # a model-sized host buffer per rank (~1s/step at 0.6B). Rebuild only on first use, if the
-        # (name, shape, dtype, shard) signature changes, or after release_sync_buffers() dropped it.
+        # device buffers the D2H reads from (release_sync_buffers() unbinds them between syncs). Rebuilding
+        # every step re-allocates, pins, and first-touches a model-sized host buffer per rank (~1s/step at
+        # 0.6B). Rebuild only on first use or if the (name, shape, dtype, shard) signature changes.
         signature = [(name, tuple(t.shape), t.dtype, self._shard_info.get(name)) for name, t in valid_weights]
         if self._trainer_raiden_ws is not None and signature == self._registered_signature:
             self._trainer_raiden_ws.bind_weights([[t] for _, t in valid_weights])
@@ -853,35 +853,23 @@ class RaidenCheckpointEngine(CheckpointEngine):
             logger.warning(f"Failed to record trainer rank {self.rank} stats in TPUWeightRegistry: {e}")
 
     def release_sync_buffers(self) -> dict:
-        """Free this rank's bound send tensors and the WeightSynchronizer that references them.
+        """Free this rank's bound send tensors while keeping the WeightSynchronizer for the next sync.
 
         Must only be called after the controller transfer that reads them has completed. Runs by default; a
-        no-op when release_buffers_after_sync is disabled, in which case the synchronizer and its bound tensors
-        are kept and rebound on the next sync. After a release, the next send_weights re-creates and
-        re-registers it.
+        no-op when release_buffers_after_sync is disabled, in which case the bound tensors stay resident
+        between syncs.
 
-        TODO(tpu): Find a way to rebind on every step while still freeing the HBM between syncs, so the
-        synchronizer, its DMA-mapped host buffers and the controller registration are reused instead of being
-        torn down and rebuilt each sync. The synchronizer pins every bound device buffer, and bind_weights
-        only accepts same-size tensors (placeholders are rejected), so this needs a tpu_sync API to unbind or
-        drop the device buffers while keeping the rest.
-        Releasing every step costs sync latency, which we need to bring down. On Qwen3-8B (FSDP8 -> TP8, v6e-8
-        x2) a ~5 s end-to-end sync spends ~1.6-2.0 s in this release (the orchestrator waits for it after the
-        ~0.13 s sampler H2D, so it delays resuming generation) and ~2 s in "Trainer Raiden Init", which now
-        re-creates the synchronizer (allocating and pinning host buffers) and re-registers with the
-        controller on every sync. The transfer itself is ~0.9 s. Both costs grow with model size.
+        WeightSynchronizer.unbind_weights() drops the synchronizer's holds on the bound device buffers, so
+        dropping our own references returns the HBM. The synchronizer itself, its pinned host staging buffers
+        and its controller registration survive, and D2H/H2D are rejected until the next send_weights rebinds
+        through bind_weights(). Compared to destroying and re-creating the synchronizer each sync, this removes
+        the per-step rebuild (host buffer allocation, pinning and first touch, plus controller
+        re-registration: ~2 s "Trainer init" + ~2 s release on Qwen3-8B, v6e-8) from the sync critical path.
         """
         if not self.release_buffers_after_sync or self._trainer_raiden_ws is None:
             return {}
-        # The torch WeightSynchronizer has no close(); the C++ object (which holds references to the
-        # device tensors and the host staging memory) is destroyed when the last Python reference goes.
-        ws, self._trainer_raiden_ws = self._trainer_raiden_ws, None
+        self._trainer_raiden_ws.unbind_weights()
         self._bound_tensors = None
-        self._registered_signature = None
-        del ws
-        import gc
-
-        gc.collect()
         # No empty_cache(): on TPU it clears the eager-op compilation cache (forcing recompiles) and the
         # TPU runtime reuses freed HBM without it.
         try:
@@ -895,6 +883,26 @@ class RaidenCheckpointEngine(CheckpointEngine):
     @torch.no_grad()
     def receive_weights(self, global_steps: Optional[int] = None, **kwargs):
         return None
+
+
+def _replica_num_workers(replica) -> int:
+    """Number of Raiden work units a rollout replica registers: one per TP worker."""
+    if getattr(replica, "world_size", None):
+        return replica.world_size
+    if getattr(replica, "workers", None):
+        return len(replica.workers)
+    return 1
+
+
+def _sampler_job_name(replica_idx: int, num_replicas: int) -> str:
+    """Raiden job name of a rollout replica: ``sampler`` with one replica, ``sampler<idx>`` with several.
+
+    A rollout worker registers as (job name, rank within its replica). With several replicas the ranks
+    ``0..TP-1`` would all collide under one name, and the controller would wait for ranks ``TP..N*TP-1`` that
+    nothing ever registers. One job name per replica keeps every registration unique; a single replica keeps
+    the historical name.
+    """
+    return "sampler" if num_replicas == 1 else f"sampler{replica_idx}"
 
 
 async def update_raiden_weights(
@@ -933,9 +941,10 @@ async def update_raiden_weights(
     t_init_sampler_start = time.perf_counter()
     sampler_init_futures = [
         replica.server_handle.collective_rpc.remote(
-            method="init_raiden_sync_on_worker", kwargs={"parallelism": parallelism}
+            method="init_raiden_sync_on_worker",
+            kwargs={"parallelism": parallelism, "job_name": _sampler_job_name(replica_idx, len(manager.replicas))},
         )
-        for replica in manager.replicas
+        for replica_idx, replica in enumerate(manager.replicas)
     ]
     await asyncio.gather(*sampler_init_futures)
     t_init_sampler = time.perf_counter() - t_init_sampler_start
@@ -946,28 +955,25 @@ async def update_raiden_weights(
     # controller and does not need to be repeated on every weight sync iteration.
     t_barrier_start = time.perf_counter()
 
-    # Calculate total rollout workers across replicas and create their Raiden IDs ('0'..'N-1').
+    # One group of destination units per rollout replica: ranks '0'..'TP-1' under the replica's own job name.
     # Examples:
-    #   - 1 replica with TP=8 (our case): len(replicas)=1, r.world_size=8 -> 8 workers ['0'..'7'].
-    #   - 2 replicas with TP=4 (DP=2): len(replicas)=2, each world_size=4 -> 8 workers ['0'..'7'].
-    num_rollout_workers = 0
-    for r in manager.replicas:
-        if hasattr(r, "world_size") and r.world_size:
-            num_rollout_workers += r.world_size
-        elif hasattr(r, "workers") and r.workers:
-            num_rollout_workers += len(r.workers)
-        else:
-            num_rollout_workers += 1
-    if num_rollout_workers == 0:
-        num_rollout_workers = len(manager.replicas)
-    sampler_replica_ids = [str(i) for i in range(num_rollout_workers)]
+    #   - 1 replica with TP=8: one group ['0'..'7'] under job "sampler".
+    #   - 3 replicas with TP=8: groups ['0'..'7'] under "sampler0", "sampler1", "sampler2".
+    num_replicas = len(manager.replicas)
     trainer_replica_ids = [str(i) for i in range(manager.actor_wg.world_size)]
 
     from tpu_sync.api.common import RaidenId
     from tpu_sync.rpc.raiden_controller import RaidenMemoryType
 
     src_units = [RaidenId(job_name="trainer", job_replica_id=r_id, data_name="weights") for r_id in trainer_replica_ids]
-    dst_units = [RaidenId(job_name="sampler", job_replica_id=r_id, data_name="weights") for r_id in sampler_replica_ids]
+    dst_unit_groups = [
+        [
+            RaidenId(job_name=_sampler_job_name(replica_idx, num_replicas), job_replica_id=str(k), data_name="weights")
+            for k in range(_replica_num_workers(replica))
+        ]
+        for replica_idx, replica in enumerate(manager.replicas)
+    ]
+    dst_units = [unit for group in dst_unit_groups for unit in group]
 
     if not hasattr(manager, "raiden_controller") or manager.raiden_controller is None:
         raise RuntimeError(
@@ -999,17 +1005,27 @@ async def update_raiden_weights(
 
     # 4. Trigger coordinated P2P network transfers via central RaidenController
     t_transfer_start = time.perf_counter()
-    transfer_future = manager.raiden_controller.start_transfer(
-        src_units=src_units,
-        dst_units=dst_units,
-        dst_mem_type=RaidenMemoryType.DRAM,
-        use_block_chunks=True,
-        is_sender=True,
-        expected_block_count=0,
-        parallelism=parallelism,
-        req_id=f"verl_step_{global_steps or 0}",
-    )
-    await transfer_future.wait()
+    # One transfer per replica. Each has the destination mesh of the validated single-replica case ([1, TP]),
+    # instead of one transfer whose destination mixes the ranks of several meshes. The transfers are issued
+    # together and awaited together: the controller tracks each by its own req_id / uuid and the trainer ranks
+    # keep their D2H and skip-tiling state per uuid, so the replicas overlap instead of paying the per-transfer
+    # latency one after another. The trainer buffers are only released after every transfer has finished.
+    transfer_futures = []
+    for replica_idx, dst_group in enumerate(dst_unit_groups):
+        req_id = f"verl_step_{global_steps or 0}" + (f"_replica{replica_idx}" if num_replicas > 1 else "")
+        transfer_futures.append(
+            manager.raiden_controller.start_transfer(
+                src_units=src_units,
+                dst_units=dst_group,
+                dst_mem_type=RaidenMemoryType.DRAM,
+                use_block_chunks=True,
+                is_sender=True,
+                expected_block_count=0,
+                parallelism=parallelism,
+                req_id=req_id,
+            )
+        )
+    await asyncio.gather(*[future.wait() for future in transfer_futures])
     t_transfer = time.perf_counter() - t_transfer_start
 
     # The trainer buffers are no longer read once the transfer is done; free them (unless disabled)
