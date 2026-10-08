@@ -291,7 +291,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         variable_protos = []
         valid_params = []
         replicas = {}
-        skip_tiling_plan = []
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
