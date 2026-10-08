@@ -718,25 +718,68 @@ class TorchTitanEngine(BaseEngine):
             )
         # TP, EP and HSDP replicate all stay blocks, so derive_dtensor_placement handles them.
 
+    @staticmethod
+    def _can_split_qkv_locally(tensor: torch.Tensor, n_kv: int) -> bool:
+        """True when ``tensor``'s local shard is a contiguous dim-0 slice of whole KV groups.
+
+        A ``FusedQKVLinear`` weight is laid out as ``[n_kv, heads_per_kv + 2, head_dim, ...]``.
+        When every sharded mesh dim cuts dim 0 with a plain ``Shard(0)`` (not ``_StridedShard``) and
+        the total dim-0 shard degree divides ``n_kv``, each rank holds ``n_kv // num_shards`` contiguous
+        KV groups, so reshaping to ``(n_kv, r, hd, ...)`` and slicing ``wq``/``wk``/``wv`` stays purely
+        local and yields ``Shard(0)`` DTensors without all-gathering ``wqkv``.
+        """
+        if not isinstance(tensor, DTensor):
+            return True
+        num_shards = 1
+        for mesh_dim, p in enumerate(tensor.placements):
+            if p.is_replicate():
+                continue
+            if type(p) is torch.distributed.tensor.Shard and p.dim == 0:
+                num_shards *= tensor.device_mesh.size(mesh_dim)
+            else:
+                return False
+        return n_kv % num_shards == 0
+
+    @classmethod
+    def _split_qkv_on_save_local(cls, module, state_dict, prefix, local_metadata) -> None:
+        """``FusedQKVLinear._split_qkv_on_save`` that skips the ``Replicate()`` all-gather when each rank
+        holds whole KV groups (e.g. Qwen3-8B ``n_kv_heads=8`` on ``dp_shard <= 8``)."""
+        from torch.distributed.tensor import Replicate
+
+        hd, hpk, r = module.head_dim, module.heads_per_kv, module.r_dim
+        for param, ndim in (("weight", 4), ("bias", 3)):
+            key = f"{prefix}wqkv.{param}"
+            if key not in state_dict:
+                continue
+            tensor = state_dict.pop(key)
+            n_kv = tensor.shape[0] // (r * hd)
+            if isinstance(tensor, DTensor) and not cls._can_split_qkv_locally(tensor, n_kv):
+                tensor = tensor.redistribute(tensor.device_mesh, [Replicate()] * tensor.device_mesh.ndim)
+            tail = (tensor.shape[1],) if ndim == 4 else ()
+            w = tensor.reshape(n_kv, r, hd, *tail)
+            state_dict[f"{prefix}wq.{param}"] = w[:, :hpk].reshape(-1, *tail).contiguous()
+            state_dict[f"{prefix}wk.{param}"] = w[:, hpk].reshape(-1, *tail).contiguous()
+            state_dict[f"{prefix}wv.{param}"] = w[:, hpk + 1].reshape(-1, *tail).contiguous()
+
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield this rank's *local* shard ``(hf_name, local_flat_bf16, ShardSpec)`` instead of the full tensor."""
+        from torchtitan.models.common.attention import FusedQKVLinear
+
         self._assert_shard_export_supported()
-        # TODO: skip the q/k/v all-gather. torchtitan builds Qwen3 with a fused ``wqkv`` (FusedQKVLinear,
-        # Shard(0) over KV-group-interleaved rows), and ``state_dict()`` runs its ``_split_qkv_on_save`` hook,
-        # which redistributes every layer's ``wqkv`` to Replicate() (an fp32 all-gather) before splitting it
-        # into wq/wk/wv. So q/k/v come back fully replicated and every rank exports (and raiden binds) the full
-        # tensors: ~1.8 GB bf16 per rank plus a ~3.6 GB fp32 transient at 8B, ~6.7 GB plus ~13.4 GB at 32B,
-        # however many trainer ranks there are. Options:
-        #   - build the model with fuse_qkv=False: works for any dp_shard, but torchtitan's model_registry
-        #     does not expose the flag yet;
-        #   - split the local ``wqkv`` shard without the hook: if n_kv_heads % dp_shard == 0 each rank holds
-        #     whole KV groups, i.e. Shard(0) blocks of q_proj/k_proj/v_proj (8B on 8 ranks: one group of
-        #     4 q + 1 k + 1 v heads). Qwen3-32B also has 8 KV heads, so this caps dp_shard at 8;
-        #   - patch the hook to skip the gather in that case.
-        # Check: at 8B, rank 0 should export q_proj as [512, 4096] instead of [4096, 4096].
         raw = {}
-        for module in self.module:
-            raw.update(module.state_dict())
+        orig_hook = FusedQKVLinear._split_qkv_on_save
+        patched_hooks = []
+        try:
+            for module in self.module:
+                for sub in module.modules():
+                    for k, fn in list(sub._state_dict_hooks.items()):
+                        if fn is orig_hook:
+                            sub._state_dict_hooks[k] = self._split_qkv_on_save_local
+                            patched_hooks.append((sub, k))
+                raw.update(module.state_dict())
+        finally:
+            for sub, k in patched_hooks:
+                sub._state_dict_hooks[k] = orig_hook
 
         # Expert stacks go WHOLE with a slot table; to_hf would name only the local experts, breaking lockstep.
         stacks = {}
