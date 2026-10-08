@@ -21,6 +21,18 @@ SMOKE_TEST=1 bash examples/tpu/grpo/run_grpo_v5p_nap.sh
 
 # Full 100-step Qwen3-0.6B GSM8K GRPO run:
 bash examples/tpu/grpo/run_grpo_v5p_nap.sh
+
+# Heterogeneous slices: Qwen3-4B with 1 x 8-chip Trainer slice (2x2x2, 2 hosts)
+# + 2 separate 4-chip Sampler slices (2x2x1, 1 host each, 2 x TP=4 vLLM replicas):
+SMOKE_TEST=1 \
+JOB_SCRIPT=examples/tpu/grpo/run_qwen3_4b_torchtitan.sh \
+TRAINER_HOSTS_PER_SLICE=2 \
+TRAINER_NODE_TOPOLOGY=2x2x2 \
+ROLLOUT_SLICE_REPLICAS=2 \
+ROLLOUT_HOSTS_PER_SLICE=1 \
+ROLLOUT_NODE_TOPOLOGY=2x2x1 \
+ROLLOUT_TP=4 \
+bash examples/tpu/grpo/run_grpo_v5p_nap.sh
 ```
 
 See [`examples/tpu/grpo/README.md`](../grpo/README.md) for full details and step-by-step manual commands.

@@ -26,17 +26,31 @@ On shared GKE Node Auto-Provisioning (NAP) clusters managed by **Kueue + JobSet*
 ### 1. One-Command Automated Run
 
 ```bash
-# Fast 5-step smoke test (validates TorchTitan trainer + vLLM rollout + Raiden weight sync in ~8-10 min):
+# Fast 5-step Qwen3-0.6B smoke test (1 x 4-chip Trainer slice + 1 x 4-chip Sampler slice = 8 chips):
 SMOKE_TEST=1 bash examples/tpu/grpo/run_grpo_v5p_nap.sh
 
 # Full 100-step Qwen3-0.6B GSM8K GRPO training run:
 bash examples/tpu/grpo/run_grpo_v5p_nap.sh
+
+# Heterogeneous slices: Qwen3-4B with 1 x 8-chip Trainer slice (2x2x2, 2 hosts)
+# + 2 separate 4-chip Sampler slices (2x2x1, 1 host each, 2 x TP=4 vLLM replicas):
+SMOKE_TEST=1 \
+JOB_SCRIPT=examples/tpu/grpo/run_qwen3_4b_torchtitan.sh \
+TRAINER_HOSTS_PER_SLICE=2 \
+TRAINER_NODE_TOPOLOGY=2x2x2 \
+ROLLOUT_SLICE_REPLICAS=2 \
+ROLLOUT_HOSTS_PER_SLICE=1 \
+ROLLOUT_NODE_TOPOLOGY=2x2x1 \
+ROLLOUT_TP=4 \
+bash examples/tpu/grpo/run_grpo_v5p_nap.sh
 ```
 
 Useful environment variable overrides for `run_grpo_v5p_nap.sh`:
+- `JOB_SCRIPT=examples/tpu/grpo/run_qwen3_4b_torchtitan.sh`: Switch the training recipe (e.g., `Qwen3-0.6B`, `Qwen3-4B`, `Qwen3-8B`).
+- `TRAINER_SLICE_REPLICAS=1 TRAINER_HOSTS_PER_SLICE=2 TRAINER_NODE_TOPOLOGY=2x2x2`: Configure the Trainer TPU slice topology (`1` host = `2x2x1` = 4 chips; `2` hosts = `2x2x2` = 8 chips; `4` hosts = `2x2x4` = 16 chips).
+- `ROLLOUT_SLICE_REPLICAS=2 ROLLOUT_HOSTS_PER_SLICE=1 ROLLOUT_NODE_TOPOLOGY=2x2x1 ROLLOUT_TP=4`: Provision multiple independent Sampler slices (`tpu-group-1`, `tpu-group-2`, ...) and run one `TP=4` vLLM replica per slice, synced concurrently via Raiden P2P.
 - `LOG_FILE=/path/to/local.log`: Custom local path for the pulled Ray job log (default: `/tmp/verl_nap_logs/<cluster_name>-grpo.log`).
 - `KEEP_CLUSTER=1`: Skip automatic teardown on exit so you can inspect or submit additional jobs to the Ray cluster.
-- `WORKER_NODE_TOPOLOGY=2x2x2 HOSTS_PER_SLICE=2`: Scale each slice from 1 host (4 chips) to 2 hosts (8 chips, 16 TPU v5p chips total).
 
 ### 2. Step-by-Step Manual Workflow on `bodaborg-v5p-nap`
 
@@ -57,12 +71,13 @@ export PRIORITY_CLASS="medium"
 export SERVICE_ACCOUNT="default"
 export HEAD_NODEPOOL="cpu-np"
 export TPU_NODE_SELECTOR_ACCEL="tpu-v5p-slice"
-export WORKER_NODE_TOPOLOGY="2x2x1"
+export TRAINER_SLICE_REPLICAS="1" TRAINER_HOSTS_PER_SLICE="1" TRAINER_NODE_TOPOLOGY="2x2x1"
+export ROLLOUT_SLICE_REPLICAS="1" ROLLOUT_HOSTS_PER_SLICE="1" ROLLOUT_NODE_TOPOLOGY="2x2x1"
+export PREWARM_MODEL_PATH="/data/jialei/assets/hf/Qwen3-0.6B"
 export RESERVATION_NAME="cloudtpu-20260902214500-1810493672"
 export GCS_BUCKET="torchprime"
 export IMAGE="us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006"
 export HEAD_CPU="12" HEAD_MEMORY="48Gi"
-export WORKER_REPLICAS="2" HOSTS_PER_SLICE="1"
 export WORKER_CPU="48" WORKER_MEMORY="400Gi" WORKER_TPU_CHIPS="4"
 export TPU_ACCELERATOR_TYPE="v5p"
 export RUN_ID="manual" RUN_OWNER="${USER}"

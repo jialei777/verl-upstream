@@ -36,6 +36,14 @@
 #
 #   # Full 100-step Qwen3-0.6B GSM8K GRPO training run:
 #   bash examples/tpu/grpo/run_grpo_v5p_nap.sh
+#
+#   # Heterogeneous slices: Qwen3-4B with 1 x 8-chip Trainer slice (2x2x2) + 2 x 4-chip Sampler slices (2x2x1):
+#   SMOKE_TEST=1 \
+#   JOB_SCRIPT=examples/tpu/grpo/run_qwen3_4b_torchtitan.sh \
+#   TRAINER_HOSTS_PER_SLICE=2 TRAINER_NODE_TOPOLOGY=2x2x2 \
+#   ROLLOUT_SLICE_REPLICAS=2 ROLLOUT_HOSTS_PER_SLICE=1 ROLLOUT_NODE_TOPOLOGY=2x2x1 \
+#   ROLLOUT_TP=4 \
+#   bash examples/tpu/grpo/run_grpo_v5p_nap.sh
 # ===================================================================================
 
 set -euo pipefail
@@ -65,7 +73,7 @@ RESERVATION_NAME="${RESERVATION_NAME:-cloudtpu-20260902214500-1810493672}"
 GCS_BUCKET="${GCS_BUCKET:-torchprime}"
 IMAGE="${IMAGE:-${VERL_TPU_CI_IMAGE:-us-west2-docker.pkg.dev/tpu-pytorch/raycluster/verl-tpu:v20261006-tsync1006}}"
 
-# --- Ray cluster sizing (default: 2 x single-host 2x2x1 v5p slices = 8 TPU v5p chips) ---
+# --- Ray cluster sizing (default: 1 x 2x2x1 trainer slice + 1 x 2x2x1 rollout slice = 8 TPU v5p chips) ---
 HEAD_CPU="${HEAD_CPU:-12}"
 HEAD_MEMORY="${HEAD_MEMORY:-48Gi}"
 WORKER_REPLICAS="${WORKER_REPLICAS:-2}"
@@ -75,13 +83,33 @@ WORKER_MEMORY="${WORKER_MEMORY:-400Gi}"
 WORKER_TPU_CHIPS="${WORKER_TPU_CHIPS:-4}"
 TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v5p}"
 
-NNODES_TRAINER="${NNODES_TRAINER:-${HOSTS_PER_SLICE}}"
+# Per-role slice sizing (defaults inherit from WORKER_REPLICAS / HOSTS_PER_SLICE / WORKER_NODE_TOPOLOGY)
+TRAINER_SLICE_REPLICAS="${TRAINER_SLICE_REPLICAS:-1}"
+TRAINER_HOSTS_PER_SLICE="${TRAINER_HOSTS_PER_SLICE:-${HOSTS_PER_SLICE}}"
+TRAINER_NODE_TOPOLOGY="${TRAINER_NODE_TOPOLOGY:-${WORKER_NODE_TOPOLOGY}}"
+
+DEFAULT_ROLLOUT_SLICES=$(( WORKER_REPLICAS > TRAINER_SLICE_REPLICAS ? WORKER_REPLICAS - TRAINER_SLICE_REPLICAS : 1 ))
+ROLLOUT_SLICE_REPLICAS="${ROLLOUT_SLICE_REPLICAS:-${DEFAULT_ROLLOUT_SLICES}}"
+ROLLOUT_HOSTS_PER_SLICE="${ROLLOUT_HOSTS_PER_SLICE:-${HOSTS_PER_SLICE}}"
+ROLLOUT_NODE_TOPOLOGY="${ROLLOUT_NODE_TOPOLOGY:-${WORKER_NODE_TOPOLOGY}}"
+
+NNODES_TRAINER="${NNODES_TRAINER:-$((TRAINER_SLICE_REPLICAS * TRAINER_HOSTS_PER_SLICE))}"
 N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-${WORKER_TPU_CHIPS}}"
-NNODES_ROLLOUT="${NNODES_ROLLOUT:-${HOSTS_PER_SLICE}}"
+NNODES_ROLLOUT="${NNODES_ROLLOUT:-$((ROLLOUT_SLICE_REPLICAS * ROLLOUT_HOSTS_PER_SLICE))}"
 N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-${WORKER_TPU_CHIPS}}"
 
 # --- Job & verification configuration ---
 JOB_SCRIPT="${JOB_SCRIPT:-examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh}"
+if [[ -n "${MODEL_PATH:-}" ]]; then
+  DEFAULT_PREWARM_PATH="${MODEL_PATH}"
+elif [[ "${JOB_SCRIPT}" == *"8b"* || "${JOB_SCRIPT}" == *"8B"* ]]; then
+  DEFAULT_PREWARM_PATH="/data/jialei/assets/hf/Qwen3-8B"
+elif [[ "${JOB_SCRIPT}" == *"4b"* || "${JOB_SCRIPT}" == *"4B"* ]]; then
+  DEFAULT_PREWARM_PATH="/data/jialei/assets/hf/Qwen3-4B"
+else
+  DEFAULT_PREWARM_PATH="/data/jialei/assets/hf/Qwen3-0.6B"
+fi
+PREWARM_MODEL_PATH="${PREWARM_MODEL_PATH:-${DEFAULT_PREWARM_PATH}}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 VERIFY_LOG="${VERIFY_LOG:-1}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
@@ -184,9 +212,10 @@ echo "[NAP Runner] GKE NAP TPU v5p GRPO Runner"
 echo "  Project / Cluster : ${GCP_PROJECT} / ${GKE_CLUSTER} (${GKE_REGION})"
 echo "  Namespace / Queue : ${RAY_NAMESPACE} / ${KUEUE_QUEUE}"
 echo "  Ray JobSet Name   : ${RAY_CLUSTER_NAME} (owner=${RUN_OWNER}, run_id=${RUN_ID})"
-echo "  TPU Topology      : ${WORKER_REPLICAS} slices x ${HOSTS_PER_SLICE} host(s) (${WORKER_NODE_TOPOLOGY}, ${WORKER_TPU_CHIPS} chips/host)"
+echo "  Trainer Topology  : ${TRAINER_SLICE_REPLICAS} slice(s) x ${TRAINER_HOSTS_PER_SLICE} host(s) (${TRAINER_NODE_TOPOLOGY}, ${WORKER_TPU_CHIPS} chips/host)"
+echo "  Rollout Topology  : ${ROLLOUT_SLICE_REPLICAS} slice(s) x ${ROLLOUT_HOSTS_PER_SLICE} host(s) (${ROLLOUT_NODE_TOPOLOGY}, ${WORKER_TPU_CHIPS} chips/host, ROLLOUT_TP=${ROLLOUT_TP:-all})"
 echo "  Container Image   : ${IMAGE}"
-echo "  Job Script        : ${JOB_SCRIPT} (SMOKE_TEST=${SMOKE_TEST})"
+echo "  Job Script        : ${JOB_SCRIPT} (SMOKE_TEST=${SMOKE_TEST}, prewarm=${PREWARM_MODEL_PATH})"
 echo "  Local Log File    : ${LOG_FILE}"
 echo "==================================================================================="
 
@@ -201,6 +230,8 @@ fi
 export RAY_CLUSTER_NAME RAY_NAMESPACE KUEUE_QUEUE PRIORITY_CLASS SERVICE_ACCOUNT
 export HEAD_NODEPOOL TPU_NODE_SELECTOR_ACCEL WORKER_NODE_TOPOLOGY RESERVATION_NAME
 export GCS_BUCKET IMAGE HEAD_CPU HEAD_MEMORY WORKER_REPLICAS HOSTS_PER_SLICE
+export TRAINER_SLICE_REPLICAS TRAINER_HOSTS_PER_SLICE TRAINER_NODE_TOPOLOGY
+export ROLLOUT_SLICE_REPLICAS ROLLOUT_HOSTS_PER_SLICE ROLLOUT_NODE_TOPOLOGY PREWARM_MODEL_PATH
 export WORKER_CPU WORKER_MEMORY WORKER_TPU_CHIPS TPU_ACCELERATOR_TYPE RUN_ID RUN_OWNER
 
 python3 - "${JOBSET_TEMPLATE}" "${RENDERED_YAML}" <<'PY'
@@ -223,9 +254,10 @@ else
   kubectl apply -f "${RENDERED_YAML}"
 fi
 
-EXPECTED_WORKER_PODS=$((WORKER_REPLICAS * HOSTS_PER_SLICE))
+EXPECTED_WORKER_PODS=$(( TRAINER_SLICE_REPLICAS * TRAINER_HOSTS_PER_SLICE + ROLLOUT_SLICE_REPLICAS * ROLLOUT_HOSTS_PER_SLICE ))
 EXPECTED_TOTAL_PODS=$((1 + EXPECTED_WORKER_PODS))
 EXPECTED_TPU_CHIPS=$((EXPECTED_WORKER_PODS * WORKER_TPU_CHIPS))
+EXPECTED_TPU_SLICES=$((TRAINER_SLICE_REPLICAS + ROLLOUT_SLICE_REPLICAS))
 
 echo "[NAP Runner] Waiting up to ${CLUSTER_READY_TIMEOUT}s for Kueue admission, NAP node scale-up, and ${EXPECTED_TOTAL_PODS} pods (1 head + ${EXPECTED_WORKER_PODS} TPU workers)..."
 StartWait=$(date +%s)
@@ -350,7 +382,7 @@ ensure_port_forward
 echo "[NAP Runner] Ray Dashboard / Jobs API port-forwarded to http://127.0.0.1:${LOCAL_PORT} (PID=${PF_PID})"
 
 # 4. Wait for Ray head + TPU workers to register all TPU chips and tpu-group-* slices via HTTP API
-echo "[NAP Runner] Waiting for Ray cluster to register ${EXPECTED_TPU_CHIPS} TPU chips across ${WORKER_REPLICAS} slices..."
+echo "[NAP Runner] Waiting for Ray cluster to register ${EXPECTED_TPU_CHIPS} TPU chips across ${EXPECTED_TPU_SLICES} slices..."
 while true; do
   Elapsed=$(( $(date +%s) - StartWait ))
   if (( Elapsed >= CLUSTER_READY_TIMEOUT )); then
@@ -378,12 +410,12 @@ except Exception:
   RegisteredSlices="${RestCluster%%|*}"
   ClusterSummary="${RestCluster#*|}"
 
-  if (( RegisteredTPUs >= EXPECTED_TPU_CHIPS && RegisteredSlices >= WORKER_REPLICAS )); then
+  if (( RegisteredTPUs >= EXPECTED_TPU_CHIPS && RegisteredSlices >= EXPECTED_TPU_SLICES )); then
     echo "[NAP Runner] Ray cluster ready! ${ClusterSummary}"
     break
   fi
 
-  echo "[NAP Runner] Waiting for Ray workers (${Elapsed}s): ${RegisteredTPUs}/${EXPECTED_TPU_CHIPS} TPUs, ${RegisteredSlices}/${WORKER_REPLICAS} tpu-group slices..."
+  echo "[NAP Runner] Waiting for Ray workers (${Elapsed}s): ${RegisteredTPUs}/${EXPECTED_TPU_CHIPS} TPUs, ${RegisteredSlices}/${EXPECTED_TPU_SLICES} tpu-group slices..."
   sleep 5
 done
 
@@ -413,6 +445,8 @@ env_vars = {
     "N_CHIPS_ROLLOUT": "${N_CHIPS_ROLLOUT}",
 }
 for k, v in {
+    "ROLLOUT_TP": "${ROLLOUT_TP:-}",
+    "MODEL_PATH": "${MODEL_PATH:-}",
     "MAX_RESPONSE_LEN": "${MAX_RESPONSE_LEN:-}",
     "ROLLOUT_N": "${ROLLOUT_N:-}",
     "TRAIN_BATCH_SIZE": "${TRAIN_BATCH_SIZE:-}",

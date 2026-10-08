@@ -20,6 +20,7 @@ device-specific environment configuration, resource options, and memory manageme
 
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import ray
@@ -395,7 +396,11 @@ class PlatformTPU(PlatformCUDA):
                 if clean_prefix in p_name:
                     matching_pgs.append(p)
 
-        target_pgs = matching_pgs if matching_pgs else pgs
+        matching_bundles = sum(
+            len(ray._private.state.state.placement_group_table(p.id).get("bundles_to_node_id", {}))
+            for p in matching_pgs
+        )
+        target_pgs = matching_pgs if (matching_pgs and matching_bundles == world_size) else pgs
 
         for pg in target_pgs:
             specs = ray._private.state.state.placement_group_table(pg.id)
@@ -474,13 +479,15 @@ class PlatformTPU(PlatformCUDA):
         if accelerator_type is not None:
             return accelerator_type
 
-        is_rollout_pool = any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"])
+        prefix_lower = (name_prefix or "").lower()
+        is_rollout_pool = any(k in prefix_lower for k in ["rollout", "reward", "teacher"])
 
         try:
             if ray.is_initialized():
                 tpu_nodes = [n for n in ray.nodes() if n.get("Alive") and "TPU" in n.get("Resources", {})]
                 tpu_slices = sorted(
-                    {res for n in tpu_nodes for res in n.get("Resources", {}) if res.startswith("tpu-group-")}
+                    {res for n in tpu_nodes for res in n.get("Resources", {}) if res.startswith("tpu-group-")},
+                    key=lambda s: (0, int(s.rsplit("-", 1)[-1])) if s.rsplit("-", 1)[-1].isdigit() else (1, s),
                 )
                 if not tpu_slices:
                     # Single-host slices (numOfHosts=1) omit tpu-group-* resources; pin by node:<ip> instead.
@@ -488,7 +495,12 @@ class PlatformTPU(PlatformCUDA):
                         f"node:{n['NodeManagerAddress']}" for n in tpu_nodes if n.get("NodeManagerAddress")
                     )
                 if tpu_slices:
-                    return tpu_slices[1] if (len(tpu_slices) >= 2 and is_rollout_pool) else tpu_slices[0]
+                    if is_rollout_pool and len(tpu_slices) >= 2:
+                        rollout_slices = tpu_slices[1:]
+                        match = re.search(r"(?:rollout_pool(?:_reward|_teacher)?_)(\d+)", prefix_lower)
+                        replica_idx = int(match.group(1)) if match else 0
+                        return rollout_slices[replica_idx % len(rollout_slices)]
+                    return tpu_slices[0]
         except Exception:
             pass
 
