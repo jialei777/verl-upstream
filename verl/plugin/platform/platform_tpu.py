@@ -64,6 +64,28 @@ TPU_TOPOLOGY_MAP = {
     1: "1,1,1",
 }
 
+# TPU v5p 3D mesh topology mappings (X, Y, Z) by pod type or total chips (1 logical device per chip in Megacore mode).
+# Each host is 2x2x1 (4 chips = 8 TensorCores); multi-host slices stack along Z then X/Y (2x2x2 = 8 chips,
+# 2x2x4 = 16 chips, 2x4x4 = 32 chips, 4x4x4 = 64 chips, 4x4x8 = 128 chips, 4x8x8 = 256 chips).
+TPU_V5P_TOPOLOGY_MAP = {
+    "v5p-512": "4,8,8",
+    "v5p-256": "4,4,8",
+    "v5p-128": "4,4,4",
+    "v5p-64": "2,4,4",
+    "v5p-32": "2,2,4",
+    "v5p-16": "2,2,2",
+    "v5p-8": "2,2,1",
+    256: "4,8,8",
+    128: "4,4,8",
+    64: "4,4,4",
+    32: "2,4,4",
+    16: "2,2,4",
+    8: "2,2,2",
+    4: "2,2,1",
+    2: "1,2,1",
+    1: "1,1,1",
+}
+
 # TPU 7x (Ironwood) 4D mesh topology mappings (X, Y, Z, CoresPerChip=2), keyed by device count.
 # A host has 4 chips (2x2x1) and 8 devices; the multi-host entries follow the GKE slice shapes
 # (2x2x2 = 2 hosts, 2x2x4 = 4, 2x4x4 = 8, 4x4x4 = 16).
@@ -80,9 +102,13 @@ TPU_V7X_TOPOLOGY_MAP = {
 
 
 def get_tpu_topology_map() -> dict:
-    """Returns the topology map for the configured TPU generation (4D for TPU 7x, 3D otherwise)."""
+    """Returns the topology map for the configured TPU generation (4D for TPU 7x, 3D for v5p/v6e)."""
     tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v6e").lower()
-    return TPU_V7X_TOPOLOGY_MAP if any(k in tpu_type for k in ("tpu7x", "v7x")) else TPU_TOPOLOGY_MAP
+    if any(k in tpu_type for k in ("tpu7x", "v7x")):
+        return TPU_V7X_TOPOLOGY_MAP
+    if "v5p" in tpu_type:
+        return TPU_V5P_TOPOLOGY_MAP
+    return TPU_TOPOLOGY_MAP
 
 
 def get_tpu_chip_hbm_bytes() -> int:
@@ -439,6 +465,8 @@ class PlatformTPU(PlatformCUDA):
             if world_size > 1:
                 env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
 
+        env_vars["LIBTPU_INIT_ARGS"] = _ensure_slicebuilder_insecure_grpc(os.environ.get("LIBTPU_INIT_ARGS", ""))
+
         return env_vars
 
     def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
@@ -520,13 +548,16 @@ class PlatformTPU(PlatformCUDA):
         have to be named to survive. The caller appends VERL_TPU_EXTRA_<VAR> and
         falls back to the value forwarded off the worker.
         """
-        return {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+        env_vars = {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+        env_vars["LIBTPU_INIT_ARGS"] = _ensure_slicebuilder_insecure_grpc(env_vars.get("LIBTPU_INIT_ARGS", ""))
+        return env_vars
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Return Ray initialization arguments with runtime_env configured for GKE TPU workers."""
         env_vars = {
             "VERL_PLATFORM": "tpu",
             "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
+            "LIBTPU_INIT_ARGS": _ensure_slicebuilder_insecure_grpc(os.environ.get("LIBTPU_INIT_ARGS", "")),
         }
         for key in (
             "WANDB_API_KEY",
@@ -546,3 +577,13 @@ class PlatformTPU(PlatformCUDA):
                 "env_vars": env_vars,
             }
         }
+
+
+def _ensure_slicebuilder_insecure_grpc(raw_args: str) -> str:
+    """Ensure LIBTPU_INIT_ARGS enables insecure SliceBuilder gRPC to avoid GKE ALTS handshake hangs."""
+    tokens = raw_args.split()
+    if not any(t.startswith("--slicebuilder_use_insecure_grpc") for t in tokens):
+        tokens.append("--slicebuilder_use_insecure_grpc=true")
+    if not any(t.startswith("--undefok=") and "slicebuilder_use_insecure_grpc" in t for t in tokens):
+        tokens.append("--undefok=slicebuilder_use_insecure_grpc")
+    return " ".join(tokens)
