@@ -90,12 +90,19 @@ def initialize_global_process_group_ray(timeout_second=None, backend=None):
     if not torch.distributed.is_initialized():
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
+        # TP1 CUDA rollout workers need only a local CPU group. Avoid the race
+        # between Ray releasing an allocated port and TCPStore binding it.
+        rendezvous_kwargs: dict[str, Any]
+        if backend == "cpu:gloo" and rank == 0 and world_size == 1 and get_device_name() == "cuda":
+            rendezvous_kwargs = {"store": torch.distributed.HashStore()}
+        else:
+            rendezvous_kwargs = {"init_method": os.environ.get("DIST_INIT_METHOD", None)}
         torch.distributed.init_process_group(
             backend=backend,
             rank=rank,
             world_size=world_size,
             timeout=timeout,
-            init_method=os.environ.get("DIST_INIT_METHOD", None),
+            **rendezvous_kwargs,
         )
 
 
