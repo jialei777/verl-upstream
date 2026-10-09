@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from megatron.core import ModelParallelConfig, mpu, parallel_state, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -39,7 +38,6 @@ from transformers import PretrainedConfig
 
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fs import local_mkdir_safe
-from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.config import HFModelConfig, McoreEngineConfig
 
 logger = logging.getLogger(__file__)
@@ -337,7 +335,6 @@ class McoreModuleWrapperConfig:
     """Configuration for Mcore module wrapper."""
 
     is_value_model: bool = False
-    share_embeddings_and_output_weights: bool = False
     wrap_with_ddp: bool = True
     use_distributed_optimizer: bool = True
     use_layer_wise_distributed_optimizer: bool = False
@@ -346,7 +343,6 @@ class McoreModuleWrapperConfig:
 
 def make_megatron_module(
     wrap_config: McoreModuleWrapperConfig,
-    tf_config: TransformerConfig,
     hf_config: PretrainedConfig,
     bridge: Any = None,
     provider: Any = None,
@@ -367,190 +363,131 @@ def make_megatron_module(
     if override_model_config is None:
         override_model_config = {}
 
-    if bridge is not None:
-        if provider is None:
-            from verl.models.mcore.mbridge import freeze_moe_router, make_value_model
+    if bridge is None or provider is None:
+        raise ValueError("Megatron-Bridge and its model provider are required")
 
-            value_model_hook = make_value_model
-        else:
-            from verl.models.mcore.bridge import freeze_moe_router, make_value_model
+    from verl.models.mcore.bridge import freeze_moe_router, make_value_model
 
-            hidden_size = get_hf_config_attr(hf_config, "hidden_size")
-            value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
+    hidden_size = get_hf_config_attr(hf_config, "hidden_size")
+    value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
+    post_model_creation_callbacks = []
+    if wrap_config.is_value_model:
+        post_model_creation_callbacks.append(value_model_hook)
+    if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):
+        post_model_creation_callbacks.append(freeze_moe_router)
 
-        post_model_creation_callbacks = []
-        if wrap_config.is_value_model:
-            post_model_creation_callbacks.append(value_model_hook)
-        if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):
-            post_model_creation_callbacks.append(freeze_moe_router)
-        if provider is not None:
-            # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
-            # BEFORE wrapping the model in DDP. This is required because:
-            # 1. PEFT freezes base model parameters (requires_grad=False)
-            # 2. DDP must be aware of which parameters are trainable when building gradient buckets
-            # 3. The distributed optimizer must only track trainable (adapter) parameters
-            # See Megatron-Bridge docs: training/peft.md
+    # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
+    # BEFORE wrapping the model in DDP. This is required because:
+    # 1. PEFT freezes base model parameters (requires_grad=False)
+    # 2. DDP must be aware of which parameters are trainable when building gradient buckets
+    # 3. The distributed optimizer must only track trainable (adapter) parameters
+    # See Megatron-Bridge docs: training/peft.md
 
-            # Register PEFT transformation as pre-wrap hook if peft_cls is specified
-            # This must happen BEFORE DDP wrapping to avoid KeyError with frozen parameters
-            if peft_cls is not None:
-                from megatron.bridge.peft.utils import create_peft_hook, load_peft_adapter_checkpoint
+    # Register PEFT transformation as pre-wrap hook if peft_cls is specified
+    # This must happen BEFORE DDP wrapping to avoid KeyError with frozen parameters
+    if peft_cls is not None:
+        from megatron.bridge.peft.utils import create_peft_hook, load_peft_adapter_checkpoint
 
-                from verl.utils.megatron_peft_utils import print_adapter_info
+        from verl.utils.megatron_peft_utils import print_adapter_info
 
-                provider.register_pre_wrap_hook(create_peft_hook(peft_cls, training=True))
+        provider.register_pre_wrap_hook(create_peft_hook(peft_cls, training=True))
 
-                adapter_path = peft_config.get("adapter_path", None)
-                if adapter_path:
+        adapter_path = peft_config.get("adapter_path", None)
+        if adapter_path:
 
-                    def adapter_checkpoint_hook(model):
-                        print(f"Loading adapter weights from: {adapter_path}")
-                        load_peft_adapter_checkpoint(
-                            model,
-                            adapter_path,
-                            peft=peft_cls,
-                            strict=False,
-                        )
-                        return model
-
-                    provider.register_pre_wrap_hook(adapter_checkpoint_hook)
-
-                def peft_info_hook(model):
-                    if torch.distributed.get_rank() == 0:
-                        print_adapter_info(model)
-                    return model
-
-                provider.register_pre_wrap_hook(peft_info_hook)
-
-            # Register post-creation callbacks (make_value_model, freeze_moe_router) as pre-wrap hooks
-            for callback in post_model_creation_callbacks:
-                provider.register_pre_wrap_hook(callback)
-
-            layer_wise_ddp = wrap_config.wrap_with_ddp and wrap_config.use_layer_wise_distributed_optimizer
-            if layer_wise_ddp:
-                if wrap_config.use_megatron_fsdp:
-                    raise ValueError(
-                        "Muon layer-wise distributed optimizer is incompatible with Megatron FSDP. "
-                        "Set use_megatron_fsdp=False or disable use_layer_wise_distributed_optimizer."
-                    )
-                _assert_muon_layer_wise_ddp_supported()
-
-            # Create DDP config if needed
-
-            # Megatron-Bridge >= v0.5.0 provides apply_overrides_and_finalize.
-            # Megatron-Bridge <  v0.5.0 does not, so we fall back to manual setattr + finalize.
-            try:
-                from megatron.bridge.training.utils.config_utils import create_ddp_config
-
-                ddp_config = create_ddp_config(
-                    wrap_with_ddp=wrap_config.wrap_with_ddp and not layer_wise_ddp,
-                    use_distributed_optimizer=wrap_config.use_distributed_optimizer,
-                    use_megatron_fsdp=wrap_config.use_megatron_fsdp,
-                    overrides=override_ddp_config,
-                )
-            except ImportError:
-                ddp_config = None
-                if wrap_config.wrap_with_ddp and not layer_wise_ddp:
-                    from megatron.bridge.training.config import DistributedDataParallelConfig
-
-                    ddp_config_dict = {
-                        "use_distributed_optimizer": wrap_config.use_distributed_optimizer,
-                    }
-                    if wrap_config.use_megatron_fsdp:
-                        ddp_config_dict["use_distributed_optimizer"] = True
-                        ddp_config_dict.setdefault("check_for_nan_in_grad", True)
-                        ddp_config_dict.setdefault("use_megatron_fsdp", True)
-                        ddp_config_dict.setdefault("data_parallel_sharding_strategy", "optim_grads_params")
-                        ddp_config_dict.setdefault("overlap_grad_reduce", True)
-                    if override_ddp_config is not None:
-                        ddp_config_dict.update(override_ddp_config)
-                    ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
-                    ddp_config.finalize()
-
-            # Now call provide_distributed_model with all hooks registered
-            # Hooks will be applied automatically before DDP wrapping
-            model = provider.provide_distributed_model(
-                wrap_with_ddp=wrap_config.wrap_with_ddp and not layer_wise_ddp,
-                ddp_config=ddp_config,
-                fp16=provider.fp16,
-                bf16=provider.bf16,
-                use_megatron_fsdp=wrap_config.use_megatron_fsdp,
-            )
-
-            if layer_wise_ddp:
-                if not isinstance(model, list):
-                    model = [model]
-                bridge_tf_config = get_model_config(model[0])
-                model = wrap_model_chunks_with_layerwise_aware_ddp(
+            def adapter_checkpoint_hook(model):
+                print(f"Loading adapter weights from: {adapter_path}")
+                load_peft_adapter_checkpoint(
                     model,
-                    bridge_tf_config,
-                    use_distributed_optimizer=wrap_config.use_distributed_optimizer,
-                    use_layer_wise_distributed_optimizer=True,
-                    override_ddp_config=override_ddp_config,
+                    adapter_path,
+                    peft=peft_cls,
+                    strict=False,
                 )
+                return model
 
-            # Extract TransformerConfig from the created model
-            tf_config = get_model_config(model[0] if isinstance(model, list) else model)
-        else:
-            # Build ddp_config dict with use_distributed_optimizer, same as provider path
-            ddp_config = None
-            if wrap_config.wrap_with_ddp:
-                ddp_config_dict = {
-                    "use_distributed_optimizer": wrap_config.use_distributed_optimizer,
-                }
-                if override_ddp_config is not None:
-                    ddp_config_dict.update(override_ddp_config)
-                ddp_config = ddp_config_dict
+            provider.register_pre_wrap_hook(adapter_checkpoint_hook)
 
-            model = bridge.get_model(
-                post_model_creation_callbacks=post_model_creation_callbacks,
-                wrap_with_ddp=wrap_config.wrap_with_ddp and not wrap_config.use_layer_wise_distributed_optimizer,
-                fp16=tf_config.fp16,
-                bf16=tf_config.bf16,
-                ddp_config=ddp_config,
+        def peft_info_hook(model):
+            if torch.distributed.get_rank() == 0:
+                print_adapter_info(model)
+            return model
+
+        provider.register_pre_wrap_hook(peft_info_hook)
+
+    # Register post-creation callbacks (make_value_model, freeze_moe_router) as pre-wrap hooks
+    for callback in post_model_creation_callbacks:
+        provider.register_pre_wrap_hook(callback)
+
+    layer_wise_ddp = wrap_config.wrap_with_ddp and wrap_config.use_layer_wise_distributed_optimizer
+    if layer_wise_ddp:
+        if wrap_config.use_megatron_fsdp:
+            raise ValueError(
+                "Muon layer-wise distributed optimizer is incompatible with Megatron FSDP. "
+                "Set use_megatron_fsdp=False or disable use_layer_wise_distributed_optimizer."
             )
-            if wrap_config.wrap_with_ddp and wrap_config.use_layer_wise_distributed_optimizer:
-                if not isinstance(model, list):
-                    model = [model]
-                mbridge_tf_config = get_model_config(model[0])
-                model = wrap_model_chunks_with_layerwise_aware_ddp(
-                    model,
-                    mbridge_tf_config,
-                    use_distributed_optimizer=wrap_config.use_distributed_optimizer,
-                    use_layer_wise_distributed_optimizer=True,
-                    override_ddp_config=override_ddp_config,
-                )
+        _assert_muon_layer_wise_ddp_supported()
 
-        if isinstance(tf_config, MLATransformerConfig):
-            # Keep the same behavior as hf_to_mcore_config_dpskv3
-            from verl.models.mcore.patch import apply_patch
+    # Create DDP config if needed
 
-            apply_patch()
-    else:
+    # Megatron-Bridge >= v0.5.0 provides apply_overrides_and_finalize.
+    # Megatron-Bridge <  v0.5.0 does not, so we fall back to manual setattr + finalize.
+    try:
+        from megatron.bridge.training.utils.config_utils import create_ddp_config
 
-        def megatron_model_provider(pre_process, post_process, vp_stage=None):
-            from verl.models.mcore import init_mcore_model
-
-            parallel_model = init_mcore_model(
-                tf_config,
-                hf_config,
-                pre_process,
-                post_process,
-                share_embeddings_and_output_weights=wrap_config.share_embeddings_and_output_weights,
-                value=wrap_config.is_value_model,
-                freeze_moe_router=override_model_config.get("moe_config", {}).get("freeze_moe_router", False),
-                vp_stage=vp_stage,
-            )
-            parallel_model.to(get_device_name())
-            return parallel_model
-
-        model = get_model(
-            megatron_model_provider,
-            wrap_with_ddp=wrap_config.wrap_with_ddp,
+        ddp_config = create_ddp_config(
+            wrap_with_ddp=wrap_config.wrap_with_ddp and not layer_wise_ddp,
             use_distributed_optimizer=wrap_config.use_distributed_optimizer,
-            use_layer_wise_distributed_optimizer=wrap_config.use_layer_wise_distributed_optimizer,
+            use_megatron_fsdp=wrap_config.use_megatron_fsdp,
+            overrides=override_ddp_config,
+        )
+    except ImportError:
+        ddp_config = None
+        if wrap_config.wrap_with_ddp and not layer_wise_ddp:
+            from megatron.bridge.training.config import DistributedDataParallelConfig
+
+            ddp_config_dict = {
+                "use_distributed_optimizer": wrap_config.use_distributed_optimizer,
+            }
+            if wrap_config.use_megatron_fsdp:
+                ddp_config_dict["use_distributed_optimizer"] = True
+                ddp_config_dict.setdefault("check_for_nan_in_grad", True)
+                ddp_config_dict.setdefault("use_megatron_fsdp", True)
+                ddp_config_dict.setdefault("data_parallel_sharding_strategy", "optim_grads_params")
+                ddp_config_dict.setdefault("overlap_grad_reduce", True)
+            if override_ddp_config is not None:
+                ddp_config_dict.update(override_ddp_config)
+            ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
+            ddp_config.finalize()
+
+    # Now call provide_distributed_model with all hooks registered
+    # Hooks will be applied automatically before DDP wrapping
+    model = provider.provide_distributed_model(
+        wrap_with_ddp=wrap_config.wrap_with_ddp and not layer_wise_ddp,
+        ddp_config=ddp_config,
+        fp16=provider.fp16,
+        bf16=provider.bf16,
+        use_megatron_fsdp=wrap_config.use_megatron_fsdp,
+    )
+
+    if layer_wise_ddp:
+        if not isinstance(model, list):
+            model = [model]
+        bridge_tf_config = get_model_config(model[0])
+        model = wrap_model_chunks_with_layerwise_aware_ddp(
+            model,
+            bridge_tf_config,
+            use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+            use_layer_wise_distributed_optimizer=True,
             override_ddp_config=override_ddp_config,
         )
+
+    # Extract TransformerConfig from the created model
+    tf_config = get_model_config(model[0] if isinstance(model, list) else model)
+    if isinstance(tf_config, MLATransformerConfig):
+        # Keep the same behavior as hf_to_mcore_config_dpskv3
+        from verl.models.mcore.patch import apply_patch
+
+        apply_patch()
     return model, tf_config
 
 
@@ -576,62 +513,6 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     if not return_list:
         return unwrapped_model[0]
     return unwrapped_model
-
-
-def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerConfig:
-    """[Deprecated] convert config
-
-    Args:
-        hf_config (PretrainedConfig): _description_
-        megatron_config (_type_): _description_
-
-    Returns:
-        TransformerConfig: _description_
-    """
-
-    warnings.warn("[deprecated] use config converter for more model support", stacklevel=2)
-    print(f"megatron config {megatron_config}")
-    dt = PrecisionType.to_dtype(megatron_config.params_dtype)
-    print(f"pipeline_dtype=megatron_config {dt}")
-    qkv_bias = True if "Qwen2ForCausalLM" in hf_config.architectures else getattr(hf_config, "attention_bias", False)
-    overlap_p2p_comm = (
-        mpu.get_virtual_pipeline_model_parallel_world_size() is not None
-        and mpu.get_virtual_pipeline_model_parallel_world_size() > 1
-    )
-    batch_p2p_comm = False
-    transformer_config = TransformerConfig(
-        num_layers=hf_config.num_hidden_layers,
-        hidden_size=hf_config.hidden_size,
-        num_attention_heads=hf_config.num_attention_heads,
-        num_query_groups=hf_config.num_key_value_heads,
-        ffn_hidden_size=hf_config.intermediate_size,
-        #    max_position_embeddings=hf_config.max_position_embeddings,
-        activation_func=F.silu,
-        normalization="RMSNorm",
-        #    rotary_percent=False, # default,
-        gated_linear_unit=True,  # for llama
-        use_cpu_initialization=True,
-        apply_residual_connection_post_layernorm=False,  # check what's this mean
-        add_bias_linear=False,
-        tensor_model_parallel_size=mpu.get_tensor_model_parallel_world_size(),
-        pipeline_model_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
-        virtual_pipeline_model_parallel_size=mpu.get_virtual_pipeline_model_parallel_world_size(),
-        context_parallel_size=mpu.get_context_parallel_world_size(),
-        overlap_p2p_comm=overlap_p2p_comm,
-        batch_p2p_comm=batch_p2p_comm,
-        pipeline_dtype=dt,
-        params_dtype=dt,
-        sequence_parallel=mpu.get_tensor_model_parallel_world_size() > 1,
-        variable_seq_lengths=True,
-        masked_softmax_fusion=True,
-        moe_token_dispatcher_type="alltoall",
-        attention_dropout=hf_config.attention_dropout,
-        hidden_dropout=getattr(hf_config, "hidden_dropout", 0.0),
-        add_qkv_bias=qkv_bias,
-        bf16=dt is torch.bfloat16,
-    )
-
-    return transformer_config
 
 
 def mcore_model_parallel_config(
@@ -1012,8 +893,8 @@ def load_megatron_optimizer(optimizers):
 #     ├── ckpt_contents.json           # manifest (authoritative mapping)
 #     ├── transformer_config.json      # rank-0, when 'extra' is saved
 #     ├── model/
-#     │   ├── huggingface/             # mbridge-saved HF weights + config + tokenizer
-#     │   └── dist_ckpt/               # Megatron sharded model shards (mbridge off or PEFT)
+#     │   ├── huggingface/             # Megatron-Bridge HF weights + config + tokenizer
+#     │   └── dist_ckpt/               # Megatron sharded model or PEFT adapter shards
 #     ├── optimizer/
 #     │   └── dist_ckpt/               # optimizer state + lr_scheduler
 #     └── extra/
@@ -1056,7 +937,7 @@ def get_extra_checkpoint_path(checkpoint_path):
 
 
 def get_model_dist_checkpoint_path(checkpoint_path):
-    """``model/dist_ckpt/`` — used when mbridge is disabled or for PEFT adapter shards."""
+    """``model/dist_ckpt/`` — Megatron model or PEFT adapter shards."""
     p = os.path.join(get_model_checkpoint_path(checkpoint_path), _DIST_CKPT_SUBDIR)
     local_mkdir_safe(p)
     return p
