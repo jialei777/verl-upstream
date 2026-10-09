@@ -17,10 +17,9 @@ The training setup uses:
 On the machine from which you submit Ray jobs, clone both repositories (no Docker image rebuild or `pip install` on the cluster is required):
 
 ```bash
-# 1. Clone verl and check out the branch
-git clone https://github.com/jialei777/verl-upstream.git
-cd verl-upstream
-git checkout pr34-grpo-0.6b-core-fixes
+# 1. Clone verl 
+git clone https://github.com/verl-project/verl
+
 
 # 2. Clone verl-hardware-plugin alongside verl
 git clone https://github.com/verl-project/verl-hardware-plugin.git ../verl-hardware-plugin
