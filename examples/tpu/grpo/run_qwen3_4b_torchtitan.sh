@@ -37,6 +37,7 @@ set -xeuo pipefail
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
 export VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin
+export VERL_TPU_VLLM_ATTN_FP32_STATS=1
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
