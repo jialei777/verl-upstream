@@ -373,21 +373,43 @@ class PlatformTPU(PlatformCUDA):
         pgs: list,
     ) -> dict[str, str]:
         """Generates TPU-specific distributed environment variables for PJRT mesh initialization."""
-        node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive", False)]
+        node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in alive_nodes}
         bundle_ips = []
         local_ip = ray.util.get_node_ip_address()
         clean_prefix = name_prefix.lower().split("_")[0] if name_prefix else ""
         matching_pgs = []
 
-        # 1. Primary filter: Select placement group containing current worker's node IP
+        # 0. Single-slice pool: if every placement group of this pool is on the same TPU slice (Ray node label
+        # ray.io/tpu-slice-name), they all form one PJRT mesh, so keep all of them. This method runs in the driver
+        # (TaskRunner), so `local_ip` is the driver's node, not the worker's. When the driver shares a host with a
+        # multi-host pool, filter 1 alone keeps only that host's placement group and every worker gets one host's
+        # TPU_PROCESS_ADDRESSES (libtpu: "Expected 16 worker addresses, got 8").
+        node_slice_map = {
+            node["NodeID"]: node.get("Labels", {}).get("ray.io/tpu-slice-name", "") for node in alive_nodes
+        }
+        pg_slices = set()
         for p in pgs:
             specs = ray._private.state.state.placement_group_table(p.id)
             if specs.get("state") != "CREATED":
                 continue
-            bundles_map = specs.get("bundles_to_node_id", {})
-            pg_ips = [node_ip_map[node_id] for b_idx, node_id in sorted(bundles_map.items()) if node_id in node_ip_map]
-            if local_ip in pg_ips:
-                matching_pgs.append(p)
+            bundle_nodes = specs.get("bundles_to_node_id", {}).values()
+            pg_slices.update(node_slice_map.get(node_id, "") for node_id in bundle_nodes)
+        if len(pg_slices) == 1 and "" not in pg_slices:
+            matching_pgs = list(pgs)
+
+        # 1. Primary filter: Select placement group containing current worker's node IP
+        if not matching_pgs:
+            for p in pgs:
+                specs = ray._private.state.state.placement_group_table(p.id)
+                if specs.get("state") != "CREATED":
+                    continue
+                bundles_map = specs.get("bundles_to_node_id", {})
+                pg_ips = [
+                    node_ip_map[node_id] for b_idx, node_id in sorted(bundles_map.items()) if node_id in node_ip_map
+                ]
+                if local_ip in pg_ips:
+                    matching_pgs.append(p)
 
         # 2. Secondary fallback: Filter by clean_prefix if placement group names are explicitly set
         if not matching_pgs and clean_prefix:
