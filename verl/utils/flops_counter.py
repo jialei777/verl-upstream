@@ -41,6 +41,10 @@ _DEVICE_FLOPS = {
     "Ascend950DT": 432e12,
     "Ascend910": 354e12,
     "RTX 3070 Ti": 21.75e12,
+    "v5p": 459e12,
+    "v6e": 918e12,
+    "tpu7x": 2307e12,
+    "v7x": 2307e12,
 }
 
 
@@ -80,9 +84,10 @@ def get_device_flops(unit="T", device_name=None):
             device_name = get_torch_device().get_device_name()
 
     flops = float("inf")  # INF flops for unkown gpu type
+    device_name_lower = device_name.lower()
 
     for key, value in sorted(_DEVICE_FLOPS.items(), reverse=True):
-        if key in device_name:
+        if key.lower() in device_name_lower:
             flops = value
             break
     flops_unit = unit_convert(flops, unit)

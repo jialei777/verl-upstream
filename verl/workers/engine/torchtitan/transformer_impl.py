@@ -30,7 +30,12 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import CrossEntropyLoss
-from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
+
+try:
+    from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
+except ImportError:
+    from torchtitan.components.lr_scheduler import LRSchedulersContainer
+    from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC

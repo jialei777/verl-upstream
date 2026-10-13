@@ -77,6 +77,10 @@ expert_parallel_size: 1
 # PP size for rollout.
 pipeline_model_parallel_size: 1
 
+# TPU slice selection for standalone rollout (`null` = all non-trainer slices; int `N` = N slices;
+# list of slice names or 0-based indices = explicit slices). Ignored off TPU.
+tpu_slices: null
+
 # max number of tokens in a batch
 max_num_batched_tokens: 8192
 

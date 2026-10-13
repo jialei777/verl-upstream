@@ -28,4 +28,7 @@ torchtitan:
   use_torch_compile: ${oc.select:actor_rollout_ref.actor.torchtitan.use_torch_compile,True}
   pad_to_length: ${oc.select:actor_rollout_ref.actor.torchtitan.pad_to_length,False}
   pad_to_length_bucket: ${oc.select:actor_rollout_ref.actor.torchtitan.pad_to_length_bucket,1024}
+  use_splash_attention: ${oc.select:actor_rollout_ref.actor.torchtitan.use_splash_attention,null}
+  tpu_eager_mode: ${oc.select:actor_rollout_ref.actor.torchtitan.tpu_eager_mode,null}
+  use_simple_fsdp: ${oc.select:actor_rollout_ref.actor.torchtitan.use_simple_fsdp,null}
   forward_only: True

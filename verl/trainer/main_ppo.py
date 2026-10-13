@@ -165,6 +165,16 @@ class TaskRunnerV1:
                     tracking.finish(exit_code=0 if succeeded else 1)
             finally:
                 tq.close()
+                if get_platform().device_name == "tpu":
+                    import sys
+                    import time
+
+                    # When TaskRunnerV1 runs on a remote worker node (e.g., when ray-head has --num-cpus=0),
+                    # flush stdout/stderr and allow Ray's log_monitor (1s poll interval) to ship the final
+                    # step/validation metric lines to the driver before ray.shutdown() disconnects.
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    time.sleep(2.5)
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)

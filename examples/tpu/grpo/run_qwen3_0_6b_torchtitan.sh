@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v6e-8 x2 Slices
-# V1 PPOTrainer (Separate Async Overlap) — requires verl-hardware-plugin:
-#   ray job submit --working-dir . --runtime-env-json '{
-#     "py_modules": ["/path/to/verl-hardware-plugin/verl_hardware_plugin"],
-#     "env_vars": {"VERL_PLATFORM": "tpu", "VERL_USE_EXTERNAL_MODULES": "verl_hardware_plugin", ...}
-#   }' -- bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
-# See examples/tpu/grpo/README.md for full instructions.
+# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v5p, TPU v6e & TPU 7x
+# V1 PPOTrainer (Separate Async Overlap)
 #
 # By default this runs a realistic 100-step GRPO job whose reward curve actually
 # moves. Set SMOKE_TEST=1 for the 5-step configuration used to validate that the
@@ -13,6 +8,11 @@
 #
 # The settings that separate the two modes, and why they matter:
 #
+#   rollout.n              2  -> 8     GRPO estimates the advantage as the spread of
+#                                      rewards *within* a group of samples for the same
+#                                      prompt. With n=2 the group is almost always all-
+#                                      correct or all-wrong, the advantage collapses to
+#                                      zero and no gradient flows.
 #   train_batch_size       4  -> 32    4 prompts/step is far too noisy to show a trend.
 #   max_response_length  512  -> 1024  At 512 the smoke test truncated 87.5% of responses
 #                                      (`response_length/clip_ratio: 0.875`), so the model
@@ -20,30 +20,29 @@
 #                                      line and scored zero regardless of correctness.
 #   total_training_steps   5  -> 100   Enough steps for the reward curve to move.
 #
-# Both modes sample rollout.n=8 responses per prompt. GRPO estimates the advantage as the
-# spread of rewards *within* a group of samples for the same prompt. With n=2 the group is
-# almost always all-correct or all-wrong, the advantage collapses to zero and no gradient
-# flows: one smoke run at n=2 had grad_norm 0.0 on all 5 steps, so it never updated the
-# actor or sent changed weights to the rollout.
-#
 # Parallelism: the actor runs pure FSDP (tensor_parallel_size=1,
 # data_parallel_shard_size=8). Do not re-enable tensor parallelism without re-testing.
 # Under tensor_parallel_size=2 the actor produced non-finite gradients on most steps, and
 # because optimizer_step() silently skips the update when grad_norm is not finite, the job
-# still reported SUCCEEDED while the policy never changed. The smoke config (then at
-# rollout.n=2) gave grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and
-# inf / 8.3e37 / 3.8e24 at tp=2.
+# still reported SUCCEEDED while the policy never changed. The same smoke config gives
+# grad_norm 1.47 / 0.0 / 1.65 / 0.0 / 0.0 at tp=1 and inf / 8.3e37 / 3.8e24 at tp=2.
 
 set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-verl_hardware_plugin}"
+# TPU generation: defaults to v6e (2D/3D topology map). Pass TPU_ACCELERATOR_TYPE=v5p on TPU v5p
+# (3D torus topology map) or TPU_ACCELERATOR_TYPE=tpu7x on TPU 7x (4D topology map).
+export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
+export VLLM_USE_V1=1
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
-# JAX/XLA Launch Barrier Configuration
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
+# JAX/XLA Launch Barrier & Compilation Configuration
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536"
+export XLA_FLAGS="--xla_disable_hlo_passes=instruction-fusion,fusion-merger,multi-output-fusion,horizontal-fusion"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
@@ -53,7 +52,7 @@ if [[ "${SMOKE_TEST}" == "1" ]]; then
     VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-4}"
     VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-8}"
     PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-4}"
-    ROLLOUT_N="${ROLLOUT_N:-8}"
+    ROLLOUT_N="${ROLLOUT_N:-2}"
     MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-5}"
@@ -77,20 +76,45 @@ fi
 project_name='verl_tpu_grpo'
 
 # Paths
-RAY_DATA_HOME="/data/jialei"
+RAY_DATA_HOME="${RAY_DATA_HOME:-/data/jialei}"
 MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 
 TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k/train.parquet}"
 TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k/test.parquet}"
 
-# TPU 2-slice v6e-8 configurations
-export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
-export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+# TPU topology. Defaults target 2 x v6e-8 slices (trainer on slice 0, rollout on slice 1);
+# override e.g. NNODES_TRAINER=1 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=1 N_CHIPS_ROLLOUT=4 to run
+# on 2 x v6e-4 single-host slices (as the TPU CI does).
+export NNODES_TRAINER="${NNODES_TRAINER:-2}"      # physical VM hosts for the training slice
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"    # TPU chips per training host
 
-export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"      # physical VM hosts for the rollout slice(s)
+export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"    # TPU chips per rollout host
 
+TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
+
+# Rollout parallelism. By default one vLLM replica spans every rollout chip. Several replicas (data parallelism
+# across replicas) can be asked for in two equivalent ways; a replica always occupies whole hosts of one slice:
+#   * ROLLOUT_TP=<chips per replica> with ROLLOUT_DP=<replicas>: NNODES_ROLLOUT x N_CHIPS_ROLLOUT must equal
+#     ROLLOUT_DP x ROLLOUT_TP, e.g. NNODES_ROLLOUT=2 N_CHIPS_ROLLOUT=4 ROLLOUT_TP=4 ROLLOUT_DP=2 -> one TP=4
+#     replica per host of the rollout v6e-8 slice. ROLLOUT_DP=1 (default) keeps verl's own
+#     TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP replica count.
+#   * ROLLOUT_SLICES=<slice indices or names, comma separated> with ROLLOUT_TP: the sampler runs on exactly those
+#     slices (e.g. ROLLOUT_SLICES=1,2 -> tpu-group-1 and tpu-group-2), NNODES_ROLLOUT / N_CHIPS_ROLLOUT are derived
+#     from them and the replica count is chips / ROLLOUT_TP. TRAINER_SLICES picks the trainer slice (default: the
+#     first slice not used by the rollout).
+ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
+ROLLOUT_DP="${ROLLOUT_DP:-1}"
+ROLLOUT_SLICES="${ROLLOUT_SLICES:-}"
+TRAINER_SLICES="${TRAINER_SLICES:-}"
+TPU_SLICE_ARGS=()
+if [[ -n "${ROLLOUT_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("actor_rollout_ref.rollout.tpu_slices=[${ROLLOUT_SLICES}]")
+fi
+if [[ -n "${TRAINER_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("+trainer.tpu_slices=[${TRAINER_SLICES}]")
+fi
 
 # Sequence budget. max_model_len must cover prompt + response, otherwise vLLM
 # silently truncates the generation and the reward is always zero.
@@ -100,7 +124,7 @@ MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 # Actor parallelism. Pure FSDP is the only configuration that has been validated
 # on TPU; see the note at the top of this file before changing these.
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-8}"
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${TOTAL_TRAINER_CHIPS}}"
 
 if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
     set +x
@@ -115,12 +139,20 @@ if [[ "${TENSOR_PARALLEL_SIZE}" != "1" ]]; then
     set -x
 fi
 
+# TorchTitan trainer, following torchtitan's TPU recipes
+# (see torchtitan/experiments/tpu/torch-tpu-optimization-guide.md):
+#   * per-TransformerBlock torch.compile(backend="tpu") with the splash attention Pallas kernel (compile on
+#     TPU requires splash: compiled SDPA yields NaN gradients on torch_tpu);
+#   * SimpleFSDP: the FSDP all-gather/reduce-scatter are traced into each compiled block;
+#   * torch_tpu DEFER_AND_FUSE eager mode: ops outside the compiled blocks are fused into larger XLA programs.
+
 python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
     trainer.v1.separate_async.num_warmup_batches=1 \
     trainer.v1.separate_async.parameter_sync_step=1 \
     transfer_queue.enable=True \
+    transfer_queue.backend.SimpleStorage.total_storage_size="${TOTAL_STORAGE_SIZE:-100000}" \
     model_engine=torchtitan \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
@@ -140,8 +172,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.use_torch_compile=False \
-    actor_rollout_ref.actor.torchtitan.use_torch_compile=False \
+    actor_rollout_ref.actor.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_torch_compile=True \
+    actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
+    actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
+    actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -157,7 +192,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.pipeline_parallel_size=1 \
     actor_rollout_ref.actor.torchtitan.attn_type=varlen \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
+    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    actor_rollout_ref.rollout.data_parallel_size="${ROLLOUT_DP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -167,7 +205,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.checkpoint_engine.backend=tpu \
+    actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
@@ -188,4 +227,4 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.nnodes="${NNODES_ROLLOUT}" \
     actor_rollout_ref.rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" \
     +rollout.nnodes="${NNODES_ROLLOUT}" \
-    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" "$@"
+    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" ${TPU_SLICE_ARGS[@]+"${TPU_SLICE_ARGS[@]}"} "$@"

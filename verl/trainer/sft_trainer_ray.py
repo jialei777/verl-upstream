@@ -380,7 +380,9 @@ class SFTTrainer:
 
 
 def run_sft(config):
-    ray.init()
+    from verl.plugin.platform import get_platform
+
+    ray.init(**get_platform().get_ray_init_kwargs())
     trainer = SFTTrainer(config=config)
     trainer.fit()
 
