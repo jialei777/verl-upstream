@@ -457,15 +457,21 @@ env_vars = {
 }
 for k, v in {
     "ROLLOUT_TP": "${ROLLOUT_TP:-}",
+    "ROLLOUT_DP": "${ROLLOUT_DP:-}",
+    "ROLLOUT_SLICES": "${ROLLOUT_SLICES:-}",
+    "TRAINER_SLICES": "${TRAINER_SLICES:-}",
     "MODEL_PATH": "${MODEL_PATH:-}",
     "MAX_RESPONSE_LEN": "${MAX_RESPONSE_LEN:-}",
+    "MAX_NUM_SEQS": "${MAX_NUM_SEQS:-}",
     "ROLLOUT_N": "${ROLLOUT_N:-}",
     "TRAIN_BATCH_SIZE": "${TRAIN_BATCH_SIZE:-}",
     "PPO_MINI_BATCH_SIZE": "${PPO_MINI_BATCH_SIZE:-}",
     "VAL_BATCH_SIZE": "${VAL_BATCH_SIZE:-}",
     "VAL_MAX_SAMPLES": "${VAL_MAX_SAMPLES:-}",
+    "VAL_BEFORE_TRAIN": "${VAL_BEFORE_TRAIN:-}",
     "TEST_FREQ": "${TEST_FREQ:-}",
     "TOTAL_TRAINING_STEPS": "${TOTAL_TRAINING_STEPS:-}",
+    "EXPERIMENT_NAME": "${EXPERIMENT_NAME:-}",
 }.items():
     if v:
         env_vars[k] = v
