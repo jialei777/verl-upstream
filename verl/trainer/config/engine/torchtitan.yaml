@@ -91,6 +91,18 @@ seed: 42
 # Whether to enable full determinism for distributed training, only for debugging
 full_determinism: false
 
+# TPU only: use the splash attention Pallas kernel (torchtitan.experiments.tpu) for attention.
+# When null, defaults to use_torch_compile on TPU.
+use_splash_attention: null
+
+# TPU only: torch_tpu eager execution mode for forward/backward and optimizer step
+# (null defaults to DEFER_AND_FUSE when use_torch_compile=true on TPU)
+tpu_eager_mode: null
+
+# TPU only: shard parameters with torchtitan's SimpleFSDP instead of FSDP2 hooks.
+# When null, defaults to true when use_torch_compile=true and pure FSDP/HSDP on TPU.
+use_simple_fsdp: null
+
 # Whether to use forward only
 forward_only: false
 

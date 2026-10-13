@@ -87,6 +87,7 @@ ALLOWED_BACKENDS = (
 DEFAULT_IGNORE_DIRS = (
     "examples/data_preprocess",
     "examples/profile",
+    "examples/tpu",
     "examples/tutorial",
     "examples/vllm_omni",
     # MTP scripts encode async/multinode dispatch in the filename; they pre-

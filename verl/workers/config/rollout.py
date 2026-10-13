@@ -13,7 +13,7 @@
 # limitations under the License.
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING, DictConfig, OmegaConf
 
@@ -193,6 +193,7 @@ class RolloutConfig(BaseConfig):
     tensor_model_parallel_size: int = 2
     pipeline_model_parallel_size: int = 1
     moe_tensor_parallel_size: int = 1
+    tpu_slices: Optional[Any] = None
     max_num_batched_tokens: int = 8192
     logprobs_mode: Optional[str] = "processed_logprobs"
     scheduling_policy: Optional[str] = "fcfs"

@@ -27,6 +27,7 @@ import numpy as np
 import ray
 from omegaconf import DictConfig
 
+from verl.plugin.platform import get_platform
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
@@ -441,11 +442,21 @@ class LLMServerManager:
         """
         if start_rank is None:
             start_rank = self.start_rank
-        rollout_world_size = (
-            self.rollout_config.tensor_model_parallel_size
-            * self.rollout_config.data_parallel_size
-            * self.rollout_config.pipeline_model_parallel_size
-        )
+        current_platform = get_platform()
+        if hasattr(current_platform, "replica_rollout_config"):
+            # vLLM on TPU has no engine-internal DP, so data_parallel_size is folded into the replica
+            # count and each replica gets a TP * PP resource pool with data_parallel_size=1.
+            rollout_world_size = (
+                self.rollout_config.tensor_model_parallel_size * self.rollout_config.pipeline_model_parallel_size
+            )
+            replica_rollout_config = current_platform.replica_rollout_config(self.rollout_config)
+        else:
+            rollout_world_size = (
+                self.rollout_config.tensor_model_parallel_size
+                * self.rollout_config.data_parallel_size
+                * self.rollout_config.pipeline_model_parallel_size
+            )
+            replica_rollout_config = self.rollout_config
         # PD inflates per-replica footprint; miss this and init_hybrid slices
         # past worker_group → empty workers on replica_rank>=1.
         disagg = getattr(self.rollout_config, "disaggregation", None)
@@ -472,7 +483,7 @@ class LLMServerManager:
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=start_rank + replica_rank,
-                config=self.rollout_config,
+                config=replica_rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
             )

@@ -515,6 +515,11 @@ class TorchtitanEngineConfig(EngineConfig):
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results
             in distributed training. Important: this will negatively impact performance, so only use it for
             debugging.
+        use_splash_attention (Optional[bool]): TPU only: whether to use the splash attention Pallas kernel.
+            When None, defaults to use_torch_compile on TPU.
+        tpu_eager_mode (Optional[str]): TPU only: torch_tpu eager execution mode ("DEFER_AND_FUSE" or
+            "DEFER_NEVER").
+        use_simple_fsdp (Optional[bool]): TPU only: whether to shard parameters with TorchTitan's SimpleFSDP.
 
     """
 
@@ -545,14 +550,28 @@ class TorchtitanEngineConfig(EngineConfig):
     strategy: str = "torchtitan"
     seed: int = 42
     full_determinism: bool = False
+    use_splash_attention: Optional[bool] = None
+    tpu_eager_mode: Optional[str] = None
+    use_simple_fsdp: Optional[bool] = None
 
     def __post_init__(self):
         super().__post_init__()
         assert self.pad_to_length_bucket > 0, f"pad_to_length_bucket must be positive, got {self.pad_to_length_bucket}"
+        assert self.tpu_eager_mode in [None, "DEFER_AND_FUSE", "DEFER_NEVER"], (
+            f"tpu_eager_mode {self.tpu_eager_mode} not supported"
+        )
+        if self.use_simple_fsdp:
+            assert (
+                self.tensor_parallel_size
+                == self.pipeline_parallel_size
+                == self.context_parallel_size
+                == self.expert_parallel_size
+                == 1
+            ), "use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/context/expert parallel size 1)"
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )
-        assert self.spmd_backend in ["partial_dtensor", "full_dtensor", "spmd_types"], (
+        assert self.spmd_backend in ["default", "partial_dtensor", "full_dtensor", "spmd_types"], (
             f"spmd_backend {self.spmd_backend} not supported"
         )
         assert self.activation_checkpoint in ["selective", "full", "none"], (

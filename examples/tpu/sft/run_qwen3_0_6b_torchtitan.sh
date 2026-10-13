@@ -19,14 +19,21 @@
 set -xeuo pipefail
 
 export VERL_PLATFORM=tpu
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-verl_hardware_plugin}"
 export PYTHONUNBUFFERED=1
 
 # Project and Experiment details
 project_name="${PROJECT_NAME:-verl_tpu_sft}"
 exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_gsm8k_sft_torchtitan}"
 
-# Paths (overridable via env vars; defaults to /data)
-RAY_DATA_HOME="${RAY_DATA_HOME:-/data}"
+# Paths (overridable via env vars; defaults to /data/jialei when present on GKE GCS Fuse, else /data)
+if [[ -z "${RAY_DATA_HOME:-}" ]]; then
+    if [[ -d "/data/jialei" ]]; then
+        RAY_DATA_HOME="/data/jialei"
+    else
+        RAY_DATA_HOME="/data"
+    fi
+fi
 MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-0.6B}"
 TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/train.parquet}"
 TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k_sft/test.parquet}"
