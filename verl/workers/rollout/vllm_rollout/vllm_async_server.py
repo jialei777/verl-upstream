@@ -40,6 +40,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
+from verl.utils import timeline
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -685,9 +686,11 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
+        t_submit = time.time()
         rejected = await self._park_until_admitted(request_id)
         if rejected is not None:
             return rejected
+        t_admit = t_first = time.time()
 
         with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.replica_rank}"):
             generator = self.engine.generate(
@@ -706,11 +709,26 @@ class vLLMHttpServer:
                     if not admitted:
                         admitted = True
                         self._admitting -= 1
+                        t_first = time.time()
                     final_res = output
             finally:
                 if not admitted:
                     self._admitting -= 1
             assert final_res is not None
+
+        if timeline.enabled():
+            out = final_res.outputs[0] if final_res.outputs else None
+            timeline.emit(
+                "request",
+                t_submit,
+                time.time() - t_submit,
+                group=f"rollout_replica_{self.replica_rank}",
+                lane="requests",
+                admit=round(t_admit - t_submit, 4),  # waited at the closed submission gate
+                first=round(t_first - t_submit, 4),  # first token out of the engine (queue + prefill done)
+                out=len(out.token_ids) if out else 0,
+                stop=(out.finish_reason if out else "abort") or "none",
+            )
 
         extra_fields = {"global_steps": self.global_steps}
         # Handle abort case: when the request is aborted by pause_generation(abort),
@@ -985,6 +1003,7 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return {"aborted_count": 0, "request_ids": []}
 
+        t_close = time.time()
         try:
             # Close the gate first, then let admissions already past it land, so the pause
             # below actually covers them. Closing the gate and declaring how late arrivals
@@ -1001,6 +1020,16 @@ class vLLMHttpServer:
                     )
                     break
                 await asyncio.sleep(0.01)
+            # Gate closed, but the engine kept decoding until the admitted requests were covered (barrier above).
+            if timeline.enabled():
+                self._tl_paused_at = time.time()
+                timeline.emit(
+                    "drain",
+                    t_close,
+                    self._tl_paused_at - t_close,
+                    group=f"rollout_replica_{self.replica_rank}",
+                    lane="server",
+                )
 
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
@@ -1039,6 +1068,16 @@ class vLLMHttpServer:
         self._rejecting = False
         self._submission_paused = False
         self._resume_event.set()
+        paused_at = getattr(self, "_tl_paused_at", None)  # set by abort_all_requests only when the timeline is on
+        if paused_at is not None:  # engine paused (weight transfer/install) until the gate reopens
+            self._tl_paused_at = None
+            timeline.emit(
+                "paused",
+                paused_at,
+                time.time() - paused_at,
+                group=f"rollout_replica_{self.replica_rank}",
+                lane="server",
+            )
 
     async def resume_generation(self):
         """Resume generation after abort_all_requests (pause_generation)."""
