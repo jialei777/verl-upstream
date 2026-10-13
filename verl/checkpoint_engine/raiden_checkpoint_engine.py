@@ -552,6 +552,12 @@ def setup_raiden_controller() -> tuple[Any, Any, str]:
 
     try:
         registry = get_tpu_weight_registry()
+        # The registry is a detached actor, so on a reused Ray cluster it still holds the previous job's
+        # entries. Its stats are pruned by step number (keep the 5 highest), so a previous job's steps 6..10
+        # would evict this job's steps 1..5 as soon as they are posted: verify_norms would then wait out its
+        # 12.5 s poll (with the rollout paused) and skip the check. Reset it once per job, before anything is
+        # published, as the tpu backend does.
+        ray.get(registry.clear.remote())
         ray.get(registry.set_controller_address.remote(address))
         logger.info(f"Successfully stored RaidenController address ({address}) in TPUWeightRegistry")
     except Exception as reg_err:
