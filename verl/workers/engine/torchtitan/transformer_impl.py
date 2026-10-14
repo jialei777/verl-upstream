@@ -56,6 +56,7 @@ from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, Torchtita
 from verl.workers.engine.torchtitan.tpu_utils import (
     align_micro_batch_shapes_across_ranks,
     apply_splash_attention_tpu,
+    apply_tpu_precision_patches,
     bucket_length,
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
@@ -287,6 +288,9 @@ class TorchTitanEngine(BaseEngine):
 
         self._init_device_mesh()
 
+        if device_name == "tpu":
+            apply_tpu_precision_patches(self.trainer.model_parts)
+
         self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
         if self._use_splash_attention:
             apply_splash_attention_tpu(
@@ -516,7 +520,7 @@ class TorchTitanEngine(BaseEngine):
         # span backward too, since activation-checkpoint recompute re-runs the forward there.
         # record_function names each micro-batch so a forward-only stage (compute_log_prob /
         # compute_ref_log_prob) shows "micro_batch<i>" rows instead of a single anonymous forward.
-        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode) if is_tpu else nullcontext():
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with (
                     self.trainer.train_context(),
@@ -576,7 +580,7 @@ class TorchTitanEngine(BaseEngine):
     def optimizer_step(self):
         """Perform optimizer step with gradient clipping."""
         is_tpu = get_device_name() == "tpu"
-        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode if is_tpu else None):
+        with tpu_eager_mode_context(self.engine_config.tpu_eager_mode) if is_tpu else nullcontext():
             # torch._foreach_norm (the `foreach=True` path) is unreliable on the TPU backend:
             # it returns inf even when every gradient is exactly zero. Since a non-finite
             # grad_norm makes this method skip the update entirely, that silently froze the
