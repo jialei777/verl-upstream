@@ -602,6 +602,7 @@ class PlatformTPU(PlatformCUDA):
             "VERL_FILE_LOGGER_PATH",
             "TENSORBOARD_DIR",
             "VERL_TPU_VLLM_ATTN_FP32_STATS",
+            "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER",
         ):
             if os.environ.get(key):
                 env_vars[key] = os.environ[key]

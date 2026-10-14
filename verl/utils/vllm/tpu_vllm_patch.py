@@ -308,6 +308,50 @@ def patch_tpu_silu_and_mul() -> None:
     logger.info("Applied TPU generator FP32 SiLU computation with CUDA activation rounding.")
 
 
+RMSNORM_CUDA_ORDER_ENV = "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"
+
+
+def _cuda_order_rms_norm(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+    """Match CUDA: round the residual sum first, and round after the affine multiply."""
+    dtype = x.dtype
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        value = x.float()
+        if residual is not None:
+            residual = (value + residual.float()).to(dtype)
+            value = residual.float()
+        size = self.variance_size_override
+        variance_input = value if size is None else value[..., :size]
+        variance = variance_input.square().mean(dim=-1, keepdim=True)
+        value = value * torch.rsqrt(variance + self.variance_epsilon)
+        has_weight = self.pass_weight if residual is None else self.pass_weight_add
+        if has_weight:
+            value = value * self.weight.data.float()
+        output = value.to(dtype)
+    return output if residual is None else (output, residual)
+
+
+def patch_tpu_rms_norm() -> None:
+    """Opt in before TPU RMSNorm layers bind their native forward."""
+    if os.environ.get(RMSNORM_CUDA_ORDER_ENV) != "1":
+        return
+    try:
+        from vllm.model_executor.layers.layernorm import RMSNorm
+    except ImportError:
+        return
+    if getattr(RMSNorm, "_verl_cuda_order_rms_norm_patched", False):
+        return
+    original = RMSNorm.forward_native
+
+    def forward_native(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        if x.device.type != "tpu" or x.dtype not in (torch.bfloat16, torch.float16):
+            return original(self, x, residual)
+        return _cuda_order_rms_norm(self, x, residual)
+
+    RMSNorm.forward_native = forward_native
+    RMSNorm._verl_cuda_order_rms_norm_patched = True
+    logger.warning("Enabled TPU vLLM RMSNorm CUDA rounding (%s=1)", RMSNORM_CUDA_ORDER_ENV)
+
+
 def _tpu_runtime_present() -> bool:
     """True when this process runs against the TPU backend.
 
@@ -343,4 +387,5 @@ def apply_tpu_vllm_patches() -> None:
     patch_tpu_logprobs()
     patch_tpu_sampler()
     patch_tpu_silu_and_mul()
+    patch_tpu_rms_norm()
     patch_tpu_attention_fp32_stats()
