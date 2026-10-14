@@ -6,6 +6,7 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
+export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
@@ -52,15 +53,31 @@ MODEL_PATH="${MODEL_PATH:-${RAY_DATA_HOME}/assets/hf/Qwen3-4B}"
 TRAIN_FILE="${RAY_DATA_HOME}/data/gsm8k/train.parquet"
 TEST_FILE="${RAY_DATA_HOME}/data/gsm8k/test.parquet"
 
-# TPU 2-slice v6e-8 configurations
-export NNODES_TRAINER=2       # 2 physical VM hosts for training slice
-export N_CHIPS_TRAINER=4      # 4 TPU chips per training host
+# TPU slice configurations (default: 8 trainer chips across 2 hosts, 8 rollout chips across 2 hosts)
+export NNODES_TRAINER="${NNODES_TRAINER:-2}"       # Physical VM hosts for training slice
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"      # TPU chips per training host
 
-export NNODES_ROLLOUT=2       # 2 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT=4      # 4 TPU chips per rollout host
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"       # Physical VM hosts across rollout slice(s)
+export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"      # TPU chips per rollout host
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
+
+# Rollout parallelism. By default one vLLM replica spans every rollout chip. Several replicas can be asked for in
+# two equivalent ways (see run_qwen3_0_6b_torchtitan.sh): ROLLOUT_TP=4 ROLLOUT_DP=2 with NNODES_ROLLOUT=2
+# N_CHIPS_ROLLOUT=4 (one TP=4 replica per rollout host), or ROLLOUT_SLICES=1,2 ROLLOUT_TP=8 (one TP=8 replica per
+# rollout slice; nnodes / chips are derived from the slices). ROLLOUT_DP=1 keeps TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP.
+ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
+ROLLOUT_DP="${ROLLOUT_DP:-1}"
+ROLLOUT_SLICES="${ROLLOUT_SLICES:-}"
+TRAINER_SLICES="${TRAINER_SLICES:-}"
+TPU_SLICE_ARGS=()
+if [[ -n "${ROLLOUT_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("actor_rollout_ref.rollout.tpu_slices=[${ROLLOUT_SLICES}]")
+fi
+if [[ -n "${TRAINER_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("+trainer.tpu_slices=[${TRAINER_SLICES}]")
+fi
 
 # Sequence budget
 MAX_PROMPT_LEN=512
@@ -139,7 +156,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
-    actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    actor_rollout_ref.rollout.data_parallel_size="${ROLLOUT_DP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -150,6 +168,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.checkpoint_engine.backend=raiden \
+    +actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.raiden.verify_parity=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
@@ -170,4 +189,4 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.nnodes="${NNODES_ROLLOUT}" \
     actor_rollout_ref.rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" \
     +rollout.nnodes="${NNODES_ROLLOUT}" \
-    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" "$@"
+    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" ${TPU_SLICE_ARGS[@]+"${TPU_SLICE_ARGS[@]}"} "$@"
