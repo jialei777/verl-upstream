@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
-# TPU image for the GRPO examples in this directory (see README.md):
-#   docker buildx build -t verl-tpu examples/tpu/grpo
+# TPU image for the GRPO examples in this directory (see README.md), with build secrets for the TorchTPU registry and
+# the private torchtitan / vllm-torchtpu GitHub repos:
+#   export AUTH_TOKEN="$(gcloud auth print-access-token)" GITHUB_TOKEN=<token>
+#   docker buildx build --secret id=auth_token,env=AUTH_TOKEN --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN -t verl-tpu examples/tpu/grpo
 FROM rayproject/ray:2.56.0-py312
 
 ARG TORCH_TPU_VERSION=0.1.2.dev20261006000518
@@ -21,9 +23,9 @@ ADD https://github.com/vllm-project/vllm.git#v0.29.0 /vllm
 RUN sed -i '/tpu-inference/d' /vllm/requirements/tpu.txt
 
 ENV VLLM_TARGET_DEVICE=tpu
-RUN --mount=type=cache,target=/root/.cache/pip <<'EOF'
+RUN --mount=type=secret,id=auth_token,env=AUTH_TOKEN --mount=type=cache,target=/root/.cache/pip <<'EOF'
 set -e
-tpu_index=https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/
+tpu_index=https://oauth2accesstoken:${AUTH_TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/
 libtpu_links=https://storage.googleapis.com/jax-releases/libtpu_releases.html
 torch_index=https://download.pytorch.org/whl/cpu
 torch=2.13.0 torchvision=0.28.0 jax=0.10.2 libtpu=0.0.47
