@@ -195,6 +195,35 @@ validates that the stack comes up, prepend `SMOKE_TEST=1`:
   -- bash -c 'SMOKE_TEST=1 bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh'
 ```
 
+### 4. TPU7x bf16 Numerics: `--xla_tpu_bf16_emission_mode=PROMOTE_F32`
+
+All GRPO recipes export this flag in `LIBTPU_INIT_ARGS`. On **TPU7x**, XLA's default
+(`NATIVE_EMISSION`) compiles bf16 transcendental chains (sigmoid / SiLU / tanh-GELU) natively in
+bf16, rounding at every step; on **v6e** the default behaves as `PROMOTE_F32`, wrapping the same
+chains in `convert(bf16->f32) ... convert(f32->bf16)` with a single rounding at the end. The
+compiled-HLO difference is reproducible offline (AOT compile with libtpu 0.0.47 and 0.0.50) and
+its downstream effect on Qwen3 is large: ~1.8x SiLU error, ~5x logits relative RMS error vs an
+fp32 reference, greedy GSM8K inflated by ~8 pp, and trainer/sampler `ppo_kl` at 0.008–0.010
+instead of ~0.0015.
+
+With the flag, TPU7x compiles these chains exactly like v6e. Measured cost on TPU7x: sampler
+throughput −0.4%, trainer FFN step time unchanged. On v6e the flag is a no-op. A 10-step GRPO run
+with only this flag (no code patches) matched v6e end to end (step-0 GSM8K 0.5466 vs v6e 0.5504,
+`ppo_kl` 0.0011–0.0021).
+
+Caveats:
+
+- This is an internal, undocumented `xla_tpu_*` flag: pin it together with the image's libtpu
+  version and re-validate on libtpu upgrades.
+- It governs XLA-compiled ops only; hand-written Pallas/Mosaic kernels (e.g. attention) do their
+  own casting and are unaffected.
+- The flag must reach **both** trainer and rollout processes. The recipes' driver-shell `export`
+  is enough: `PlatformTPU` forwards `LIBTPU_INIT_ARGS` through the job-level Ray `runtime_env`,
+  the per-worker TPU env, and the rollout server actor's explicit `runtime_env`. To verify
+  delivery, check the `[TPU env] LIBTPU_INIT_ARGS: ...` preflight log line, or the
+  `argv[...]: '--xla_tpu_bf16_emission_mode=PROMOTE_F32'` line in the libtpu startup dump of a
+  rollout pod.
+
 ---
 
 ## 📊 Monitoring Progress
