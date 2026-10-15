@@ -77,6 +77,9 @@ def patch_tpu_rotary_emb():
             is_neox_style: bool = True,
             enable_fp32_compute: bool = False,
         ) -> torch.Tensor:
+            # Match CUDA: compute the rotation in FP32, then round once to the input dtype.
+            if x.device.type == "tpu" and x.dtype in (torch.bfloat16, torch.float16):
+                enable_fp32_compute = True
             origin_dtype = x.dtype
             if enable_fp32_compute:
                 x = x.float()

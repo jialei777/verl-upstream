@@ -55,6 +55,7 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
     align_micro_batch_shapes_across_ranks,
+    apply_fp32_logits_tpu,
     apply_splash_attention_tpu,
     apply_tpu_precision_patches,
     bucket_length,
@@ -244,6 +245,8 @@ class TorchTitanEngine(BaseEngine):
         )
 
         training_kwargs = {}
+        if self.engine_config.mixed_precision_param is not None:
+            training_kwargs["mixed_precision_param"] = self.engine_config.mixed_precision_param
         if total_steps > 0:
             training_kwargs["steps"] = total_steps
         if self.engine_config.max_seq_len is not None:
@@ -290,6 +293,8 @@ class TorchTitanEngine(BaseEngine):
 
         if device_name == "tpu":
             apply_tpu_precision_patches(self.trainer.model_parts)
+            if self.engine_config.fp32_logits:
+                apply_fp32_logits_tpu(self.trainer.model_parts)
 
         self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
         if self._use_splash_attention:

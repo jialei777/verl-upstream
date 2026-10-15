@@ -132,6 +132,58 @@ def apply_tpu_precision_patches(model_parts: list[torch.nn.Module]) -> None:
             _patch_feed_forward(module)
 
 
+class _TPUFp32LogitsLinear(torch.autograd.Function):
+    """Preserve FP32 projection accumulators with BF16 operands and backward matmuls."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        x_b = x.to(torch.bfloat16)
+        w_b = weight.to(torch.bfloat16)
+        ctx.save_for_backward(x_b, w_b)
+        ctx.x_dtype, ctx.w_dtype = x.dtype, weight.dtype
+        previous = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("medium")
+        try:
+            return torch.matmul(x_b.float(), w_b.float().t())
+        finally:
+            torch.set_float32_matmul_precision(previous)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_b, w_b = ctx.saved_tensors
+        g = grad.to(torch.bfloat16)
+        grad_x = torch.matmul(g, w_b).to(ctx.x_dtype)
+        grad_w = torch.matmul(g.reshape(-1, g.shape[-1]).t(), x_b.reshape(-1, x_b.shape[-1])).to(ctx.w_dtype)
+        return grad_x, grad_w
+
+
+def _tpu_fp32_logits_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if getattr(self, "bias", None) is not None:
+        raise ValueError("fp32_logits supports a bias-free LM head only")
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        return _TPUFp32LogitsLinear.apply(x, weight)
+
+
+def apply_fp32_logits_tpu(modules: Any) -> int:
+    """Patch each LM head before its first forward; leave its parameter storage unchanged."""
+    if modules is None:
+        return 0
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    patched = 0
+    for model in model_list:
+        head = getattr(model, "lm_head", None)
+        if not isinstance(head, torch.nn.Module):
+            continue
+        if getattr(head.forward, "__func__", None) is _tpu_fp32_logits_forward:
+            continue
+        head.forward = MethodType(_tpu_fp32_logits_forward, head)
+        patched += 1
+    if patched:
+        logger.warning("fp32 logits enabled on TPU: patched %d lm_head module(s)", patched)
+    return patched
+
+
 _attention_dtype_fallback_logged = False
 
 
