@@ -21,7 +21,7 @@
 #                  whole 1-chip ct6e-standard-1t node. Kueue keeps it suspended until the chip-count
 #                  queue has TPU quota, so concurrent CI runs queue (FIFO) instead of fighting for hosts.
 #   2. run       - submit the test as Ray job(s) the way examples/tpu/grpo/README.md does (this checkout
-#                  as the working dir, verl-hardware-plugin as a py_module) and verify the job log with
+#                  as the working dir, verl-hardware-plugin pip-installed) and verify the job log with
 #                  tests/special_tpu/verify_tpu_e2e_log.py.
 #   3. tear down - delete the RayCluster on exit, whether the test passed, failed, timed out or was
 #                  cancelled.
@@ -204,11 +204,22 @@ fetch_hardware_plugin() {
         exit 1
     fi
     log "verl-hardware-plugin: $(git -C "${plugin_dir}" log -1 --format='%H %s' 2>/dev/null || echo "?") (${plugin_source})"
-    # The runtime environment of examples/tpu/grpo/README.md (step 5), with the plugin path of this run.
-    RUNTIME_ENV="$(PLUGIN_PKG="${PLUGIN_PKG}" python3 -c '
+    # The runtime environment of examples/tpu/grpo/README.md (step 5). The plugin must be pip-installed, not
+    # shipped as a py_module: vLLM's EngineCore and workers load its TPU patches through the
+    # vllm.general_plugins entry point, which only an installed distribution registers.
+    local plugin_requirement
+    if [[ -z "${VERL_HARDWARE_PLUGIN_DIR:-}" ]]; then
+        plugin_requirement="verl-hardware-plugin @ git+${VERL_HARDWARE_PLUGIN_REPO}@$(git -C "${plugin_dir}" rev-parse HEAD)"
+    else
+        # A local checkout: build a wheel inside this checkout, which Ray uploads as the job's working dir.
+        rm -rf "${REPO_ROOT}/plugin_whl"
+        python3 -m pip wheel -q --no-deps --no-build-isolation -w "${REPO_ROOT}/plugin_whl" "${plugin_dir}"
+        plugin_requirement="\${RAY_RUNTIME_ENV_CREATE_WORKING_DIR}/plugin_whl/$(basename "${REPO_ROOT}"/plugin_whl/*.whl)"
+    fi
+    RUNTIME_ENV="$(PLUGIN_REQUIREMENT="${plugin_requirement}" python3 -c '
 import json, os
 print(json.dumps({
-    "py_modules": [os.environ["PLUGIN_PKG"]],
+    "pip": {"packages": [os.environ["PLUGIN_REQUIREMENT"]], "pip_install_options": ["--no-deps"]},
     "excludes": [".git", ".venv"],
     "env_vars": {
         "PYTHONPATH": ".",
