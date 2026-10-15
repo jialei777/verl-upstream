@@ -1,0 +1,109 @@
+# SFT on 1 Cloud TPU v6e-4 slice (TPU counterpart of e2e_sft_llm.yml / e2e_sft_llm_ascend.yml).
+#
+# Runs examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh (Qwen3-0.6B, GSM8K multi-turn SFT, TorchTitan FSDP2)
+# in both of its launch modes: torchrun (verl.trainer.sft_trainer, the default) and SFT_TRAINER_MODE=ray
+# (verl.trainer.sft_trainer_ray). See tpu_unit_tests.yml and tests/special_tpu/README.md for how the TPU
+# jobs work. The jobs only run in repositories that set the variable TPU_CI_RUNNER.
+
+name: e2e_sft_llm_tpu
+
+on:
+  push:
+    branches:
+      - main
+      - main-ci
+      - v0.*
+    paths:
+      - "verl/**/*.py"
+      - "verl/trainer/config/**"
+      # Not used on TPU
+      - "!verl/models/mcore/**"
+      - "!verl/workers/engine/automodel/**"
+      - "!verl/workers/engine/megatron/**"
+      - "!verl/workers/engine/mindspeed/**"
+      - "!verl/workers/engine/veomni/**"
+      - "!verl/workers/rollout/sglang_rollout/**"
+      - "!verl/workers/rollout/trtllm_rollout/**"
+      # Entrypoints
+      - "examples/tpu/sft/**"
+      - "tests/special_tpu/**"
+      - "!**/*.md"
+      - ".github/workflows/e2e_sft_llm_tpu.yml"
+  pull_request:
+    branches:
+      - main
+      - main-ci
+      - v0.*
+    paths:
+      - "verl/**/*.py"
+      - "verl/trainer/config/**"
+      # Not used on TPU
+      - "!verl/models/mcore/**"
+      - "!verl/workers/engine/automodel/**"
+      - "!verl/workers/engine/megatron/**"
+      - "!verl/workers/engine/mindspeed/**"
+      - "!verl/workers/engine/veomni/**"
+      - "!verl/workers/rollout/sglang_rollout/**"
+      - "!verl/workers/rollout/trtllm_rollout/**"
+      # Entrypoints
+      - "examples/tpu/sft/**"
+      - "tests/special_tpu/**"
+      - "!**/*.md"
+      - ".github/workflows/e2e_sft_llm_tpu.yml"
+  workflow_dispatch:
+    inputs:
+      plugin_repo:
+        description: "verl-hardware-plugin repository, e.g. a fork (empty: VERL_HARDWARE_PLUGIN_REPO in tests/special_tpu/gke/tpu-ci.env)"
+        required: false
+        default: ""
+        type: string
+      plugin_commit:
+        description: "verl-hardware-plugin full commit id, branch or tag (empty: VERL_HARDWARE_PLUGIN_COMMIT in tests/special_tpu/gke/tpu-ci.env)"
+        required: false
+        default: ""
+        type: string
+
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/main-ci' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
+env:
+  # The self-hosted runners run as root.
+  PIP_ROOT_USER_ACTION: ignore
+  # Give up after waiting this long in the Kueue queue for TPU quota.
+  QUEUE_TIMEOUT_MINS: "90"
+  # Give up if the admitted RayCluster's pods are not all running after this long (TPU node scale-up, or
+  # hosts still held by an earlier CI job).
+  POD_READY_TIMEOUT_MINS: "60"
+  # Empty unless set by hand; the script then uses the plugin repository and commit pinned in tpu-ci.env.
+  VERL_HARDWARE_PLUGIN_REPO: ${{ github.event.inputs.plugin_repo }}
+  VERL_HARDWARE_PLUGIN_COMMIT: ${{ github.event.inputs.plugin_commit }}
+
+jobs:
+  e2e_sft_llm_tpu:
+    if: vars.TPU_CI_RUNNER != ''
+    name: GSM8K SFT Qwen3-0.6B on 1 x TPU v6e-4 (TorchTitan, torchrun + Ray)
+    runs-on: ${{ vars.TPU_CI_RUNNER }}
+    timeout-minutes: 240 # Includes waiting for TPU quota (Kueue) and TPU hosts.
+    steps:
+      - name: Checkout verl
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Install the Ray job CLI
+        run: |
+          python3 -m pip install --quiet "ray[default]==2.56.0"
+      - name: Running GSM8K SFT on 4 TPU v6e chips (examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh)
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh sft
+      - name: Clean up the RayCluster
+        if: always()
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh teardown sft
