@@ -416,8 +416,10 @@ test_rl_grpo() {
     # Disable Qwen3 <think>: with thinking on, 512-token smoke rollouts are all clipped before
     # "#### <answer>" and the reward is ~0. 8 prompts x 4 samples per step keeps the
     # training-reward check stable.
+    # VERIFY_PARITY=all: Raiden weight sync is checked bit for bit at step 0 and by per-tensor norms at every later
+    # step; a mismatch raises RaidenParityError and fails the job (see RaidenParityCheck).
     submit_and_verify_ray_job grpo 40 \
-        '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4"}' \
+        '{"NNODES_TRAINER": "1", "N_CHIPS_TRAINER": "4", "NNODES_ROLLOUT": "1", "N_CHIPS_ROLLOUT": "4", "VERIFY_PARITY": "all"}' \
         bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
         +data.apply_chat_template_kwargs.enable_thinking=False \
         trainer.val_before_train=True \
