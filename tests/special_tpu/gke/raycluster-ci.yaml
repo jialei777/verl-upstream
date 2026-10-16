@@ -1,17 +1,17 @@
 # Per-test RayCluster template of the verl TPU CI.
 #
 # Rendered by tests/special_tpu/run_tpu_e2e_ci.sh (Python string.Template, dollar-brace placeholders)
-# for one test, then deleted when the test ends. Same pods as examples/tpu/grpo/ray-tpu-v6e4-2slice.yaml,
+# for one test, then deleted when the test ends. Same pods as examples/tpu/grpo/ray-tpu-v6e-2slice.yaml,
 # plus what CI needs on the shared CI cluster:
 #
 # - Kueue (`kueue.x-k8s.io/queue-name`): the RayCluster stays suspended until its queue
-#   (`verl-tpu-ci-{1chip,4chip,8chip}`, tests/special_tpu/gke/kueue-tpu-ci.yaml) has free TPU quota,
+#   (`verl-tpu-ci-{1chip,2chip,4chip,8chip}`, tests/special_tpu/gke/kueue-tpu-ci.yaml) has free TPU quota,
 #   then all pods are created at once.
 # - Worker shape:
 #   * v6e-4: the `cloud.google.com/gke-tpu-slice-topology: 2x2` annotation makes the KubeRay TPU
 #     webhook treat every replica as its own single-host 2x2 slice (v6e-4) of a 2x4 (v6e-8) node pool,
 #     so each replica is one Ray TPU slice (`tpu-group-0`, `tpu-group-1`, ...).
-#   * v6e-1: a whole 1x1 node (ct6e-standard-1t, 1 chip).
+#   * v6e-1: a whole 1x1 node (ct6e-standard-1t, 1 chip); 2 replicas are 2 nodes, one Ray TPU slice each.
 #   A single host is the smallest multi-chip unit: GKE only admits whole-host TPU requests on 2x4
 #   nodes, and libtpu cannot open an ICI session on 2 chips of a host.
 # - Labels `verl-ci/*` let the script tear down the clusters of a run and reap leaked ones.

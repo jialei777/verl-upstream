@@ -10,12 +10,16 @@
 # starved by later small ones):
 #
 #   LocalQueue          ClusterQueue            TPU quota (flavor)                     Cohort
-#   verl-tpu-ci-1chip   verl-tpu-ci-1chip-cq    1 chip  (verl-tpu-ci-v6e-1t, 1x1 pool)  -
+#   verl-tpu-ci-1chip   verl-tpu-ci-1chip-cq    1 chip  (verl-tpu-ci-v6e-1t, 1x1 pool)  verl-tpu-ci-v6e-1t
+#   verl-tpu-ci-2chip   verl-tpu-ci-2chip-cq    2 chips (verl-tpu-ci-v6e-1t, 1x1 pool)  verl-tpu-ci-v6e-1t
 #   verl-tpu-ci-4chip   verl-tpu-ci-4chip-cq    8 chips (verl-tpu-ci-v6e, 2x4 pools)    verl-tpu-ci-v6e
 #   verl-tpu-ci-8chip   verl-tpu-ci-8chip-cq    8 chips (verl-tpu-ci-v6e, 2x4 pools)    verl-tpu-ci-v6e
 #
-# - The 1-chip tier has its own ct6e-standard-1t (1x1) node pool (max 1 node), so it never
-#   competes with the 4/8-chip tiers.
+# - The 1-chip tier (unit tests, 1 x v6e-1) and the 2-chip tier (Qwen3-0.6B GRPO, 2 x v6e-1: one
+#   trainer chip and one rollout chip) share the ct6e-standard-1t (1x1) node pool, which
+#   autoscales from 0 to 3 nodes (one chip each): 1 + 2 chips, so one test of each tier runs at a
+#   time and they can borrow each other's idle quota through the cohort. Neither competes with the
+#   4/8-chip tiers.
 # - The 4-chip and 8-chip tiers share the 16 chips of the 2x4 node pools (2 x v6e-8 slices = 4
 #   hosts x 4 chips). Each is guaranteed 8 chips (two trainer jobs / one RL job) and can borrow
 #   the other's unused quota through the cohort, so an idle tier never strands capacity. There
@@ -59,6 +63,7 @@ metadata:
   name: verl-tpu-ci-1chip-cq
 spec:
   namespaceSelector: {}
+  cohort: verl-tpu-ci-v6e-1t
   queueingStrategy: StrictFIFO
   resourceGroups:
     - coveredResources: ["google.com/tpu"]
@@ -75,6 +80,30 @@ spec:
               nominalQuota: 100
             - name: memory
               nominalQuota: 400Gi
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: verl-tpu-ci-2chip-cq
+spec:
+  namespaceSelector: {}
+  cohort: verl-tpu-ci-v6e-1t
+  queueingStrategy: StrictFIFO
+  resourceGroups:
+    - coveredResources: ["google.com/tpu"]
+      flavors:
+        - name: verl-tpu-ci-v6e-1t
+          resources:
+            - name: google.com/tpu
+              nominalQuota: 2
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: verl-tpu-ci-default
+          resources:
+            - name: cpu
+              nominalQuota: 200
+            - name: memory
+              nominalQuota: 800Gi
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue
@@ -131,6 +160,14 @@ metadata:
   namespace: default
 spec:
   clusterQueue: verl-tpu-ci-1chip-cq
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: verl-tpu-ci-2chip
+  namespace: default
+spec:
+  clusterQueue: verl-tpu-ci-2chip-cq
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: LocalQueue
