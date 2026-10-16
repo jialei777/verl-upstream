@@ -17,8 +17,8 @@
 #
 # Every invocation runs one CI test and owns the full lifecycle of its own RayCluster:
 #   1. provision - render tests/special_tpu/gke/raycluster-ci.yaml into a uniquely named, Kueue-queued
-#                  RayCluster: single-host v6e-4 (2x2) subslices of the v6e-8 (2x4) node pools, or a
-#                  whole 1-chip ct6e-standard-1t node. Kueue keeps it suspended until the chip-count
+#                  RayCluster: single-host v6e-4 (2x2) subslices of the v6e-8 (2x4) node pools, or
+#                  whole 1-chip ct6e-standard-1t nodes. Kueue keeps it suspended until the chip-count
 #                  queue has TPU quota, so concurrent CI runs queue (FIFO) instead of fighting for hosts.
 #   2. run       - submit the test as Ray job(s) the way examples/tpu/grpo/README.md does (this checkout
 #                  as the working dir, verl-hardware-plugin as a py_module) and verify the job log with
@@ -29,7 +29,7 @@
 # Tests (one per workflow, see tests/special_tpu/README.md):
 #   tpu_platform  1 x v6e-1  queue 1chip  tpu_unit_tests.yml             tests/special_tpu/tpu_smoke_test.py
 #   sft           1 x v6e-4  queue 4chip  e2e_sft_llm_tpu.yml            examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
-#   grpo          2 x v6e-4  queue 8chip  e2e_v1_separate_async_tpu.yml  examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
+#   grpo          2 x v6e-1  queue 2chip  e2e_v1_separate_async_tpu.yml  examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
 #   grpo_4b       2 x v6e-4  queue 8chip  nightly_tpu.yml                examples/tpu/grpo/run_qwen3_4b_torchtitan.sh
 #
 # Usage:
@@ -51,7 +51,7 @@ export CLUSTER_NAME="${CLUSTER_NAME:-jialeic-ci-v6e8-2s-spot}"
 export REGION="${REGION:-us-central2}"
 export PROJECT="${PROJECT:-tpu-pytorch}"
 export RAY_NAMESPACE="${RAY_NAMESPACE:-default}"
-# One Kueue LocalQueue per chip count: ${KUEUE_QUEUE_PREFIX}-{1chip,4chip,8chip}.
+# One Kueue LocalQueue per chip count: ${KUEUE_QUEUE_PREFIX}-{1chip,2chip,4chip,8chip}.
 export KUEUE_QUEUE_PREFIX="${KUEUE_QUEUE_PREFIX:-verl-tpu-ci}"
 export PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-$((28000 + RANDOM % 1000))}"
 # Maximum time to wait in the Kueue queue before giving up.
@@ -223,7 +223,8 @@ print(json.dumps({
 
 provision_ray_cluster() {
     # shape: "v6e-4" = 2x2 single-host subslice of a 2x4 node pool (4 chips per worker);
-    #        "v6e-1" = whole 1x1 node from the ct6e-standard-1t pool (1 chip per worker).
+    #        "v6e-1" = whole 1x1 node from the ct6e-standard-1t pool (1 chip per worker; the pool's node
+    #                  count caps the concurrent 1-chip and 2-chip tests).
     local test_name="$1" shape="$2" replicas="$3" head_cpu="$4" head_mem="$5" worker_cpu="$6" worker_mem="$7"
     local node_topology torch_topology annotation_key annotation_value slicebuilder
     WORKER_REPLICAS="${replicas}"
@@ -583,8 +584,9 @@ test_sft() {
 }
 
 test_grpo() {
-    # The 5-step Qwen3-0.6B GRPO smoke test of examples/tpu/grpo as is: TorchTitan trainer on tpu-group-0,
-    # vLLM rollout on tpu-group-1, tpu-sync weight sync, V1 separate-async trainer.
+    # The 5-step Qwen3-0.6B GRPO smoke test of examples/tpu/grpo as is (2 x v6e-1, the script's default
+    # N_CHIPS_TRAINER=1 N_CHIPS_ROLLOUT=1): TorchTitan trainer on tpu-group-0, vLLM rollout on tpu-group-1,
+    # tpu-sync weight sync, V1 separate-async trainer.
     submit_and_verify_ray_job grpo 45 "--steps 5" -- \
         env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
 }
@@ -604,7 +606,7 @@ provision_test_cluster() {
     case "${test_name}" in
         tpu_platform) provision_ray_cluster "${test_name}" v6e-1 1 2 8Gi 32 128Gi ;;
         sft) provision_ray_cluster "${test_name}" v6e-4 1 4 16Gi 96 400Gi ;;
-        grpo) provision_ray_cluster "${test_name}" v6e-4 2 4 16Gi 96 400Gi ;;
+        grpo) provision_ray_cluster "${test_name}" v6e-1 2 4 16Gi 32 128Gi ;;
         grpo_4b) provision_ray_cluster "${test_name}" v6e-4 2 8 32Gi 96 400Gi ;;
         *)
             echo "${USAGE}" >&2
