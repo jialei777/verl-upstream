@@ -15,6 +15,7 @@
 import datetime
 import inspect
 import logging
+import time
 from contextlib import contextmanager
 from typing import Any, Optional
 
@@ -22,6 +23,7 @@ import torch
 import torch.distributed as dist
 from codetiming import Timer
 
+from verl.utils import timeline
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.logger import DecoratorLoggerBase
 
@@ -192,7 +194,9 @@ def marked_timer(
     Yields:
         None: This is a context manager that yields control back to the code block.
     """
+    start = time.time()
     yield from _timer(name, timing_raw)
+    timeline.emit(name, start, time.time() - start)
 
 
 def reduce_timing(
