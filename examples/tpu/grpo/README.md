@@ -8,6 +8,9 @@ By default, this guide walks through the minimal **2-chip setup** (2 TPU `v6e-1`
 |---|---|
 | [`run_qwen3_0_6b_torchtitan.sh`](run_qwen3_0_6b_torchtitan.sh) | 5-step smoke test (Qwen3-0.6B, 2 `v6e-1` slices / 2 chips by default) |
 | [`run_qwen3_4b_torchtitan.sh`](run_qwen3_4b_torchtitan.sh) | 100-step GRPO run (Qwen3-4B, 2 `v6e-4` slices / 8 chips) |
+| [`run_qwen3_5_torchtitan.sh`](run_qwen3_5_torchtitan.sh) | Qwen3.5 GRPO on TPU v7x (default `Qwen3.5-35B-A3B` MoE; also `Qwen3.5-0.8B`) |
+| [`convert_qwen3_5_text_only.py`](convert_qwen3_5_text_only.py) | Convert a multimodal Qwen3.5 HF checkpoint to a text-only causal-LM checkpoint |
+| [`render_ray_tpu7x_jobset.py`](render_ray_tpu7x_jobset.py) | Render a Ray-on-JobSet manifest for GKE TPU v7x (without KubeRay) |
 | [`ray-tpu-v6e-2slice.yaml`](ray-tpu-v6e-2slice.yaml) | KubeRay `RayCluster`: 1 CPU head pod and 2 TPU `v6e-1` slices (configurable for `v6e-4` / `v6e-8`) |
 | [`Dockerfile`](Dockerfile) | Image of the Ray pods |
 
@@ -147,3 +150,34 @@ The scripts take their settings from environment variables, e.g. `-- RAY_DATA_HO
    The 4B run takes about 10 minutes to start, then about 18-27 s per step (~22 s average over 100 steps).
 
 To scale further to **2 `v6e-8` slices (16 chips)**, create two multi-host node pools with `--machine-type ct6e-standard-4t --num-nodes 2 --tpu-topology 2x4`, set `numOfHosts: 2` and `cloud.google.com/gke-tpu-topology: 2x4` (with `memory: 400Gi`, `cpu: "48"`, `google.com/tpu: "4"`) in [`ray-tpu-v6e-2slice.yaml`](ray-tpu-v6e-2slice.yaml), and run with `NNODES_TRAINER=2 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=2 N_CHIPS_ROLLOUT=4`.
+
+## 7. Qwen3.5 (Hybrid GatedDeltaNet + MoE / Dense) on TPU v7x
+
+[`run_qwen3_5_torchtitan.sh`](run_qwen3_5_torchtitan.sh) runs GRPO on GSM8K with Qwen3.5 (default `Qwen3.5-35B-A3B` MoE) on TPU v7x: one trainer slice and one rollout slice; each v7x `2x2x1` host has 4 chips = 8 TensorCores = 768 GiB HBM. A `2x2x1` trainer and a `2x2x1` rollout run the 35B MoE at about 108 s per step (16 prompts x 4 responses, micro-batch 2; GSM8K validation accuracy 0.86 after 10 steps).
+
+Qwen3.5 checkpoints on Hugging Face (`Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.5-0.8B`, etc.) package the language model under `model.language_model.*` alongside a vision encoder. Convert the checkpoint to a text-only causal-LM checkpoint and upload it with the bucket layout of step 3 (GSM8K goes to `gs://<BUCKET>/data/gsm8k` as there):
+
+```bash
+hf download Qwen/Qwen3.5-35B-A3B --local-dir /tmp/Qwen3.5-35B-A3B-raw
+python3 examples/tpu/grpo/convert_qwen3_5_text_only.py /tmp/Qwen3.5-35B-A3B-raw /tmp/Qwen3.5-35B-A3B
+gcloud storage cp -r /tmp/Qwen3.5-35B-A3B gs://<BUCKET>/assets/hf/
+```
+
+On GKE TPU v7x clusters without KubeRay, render and apply a Ray-on-JobSet manifest. Every pod copies the model and GSM8K from the bucket to `/data` (the head pod only the config and tokenizer) before it starts Ray. Add `--namespace`, `--reservation`, `--queue` / `--priority` (Kueue) and `--head-node-selector` / `--head-toleration` as your cluster needs:
+
+```bash
+python3 examples/tpu/grpo/render_ray_tpu7x_jobset.py \
+  --name verl-qwen35 \
+  --image <IMAGE> \
+  --bucket gs://<BUCKET> \
+  --model Qwen3.5-35B-A3B \
+  --trainer 2x2x1:1 \
+  --rollout 2x2x1:1 | kubectl apply -f -
+```
+
+Then forward the head pod's dashboard (`kubectl port-forward pod/<verl-qwen35-head-0-0-...> 23333:8265`) and submit the script as in step 5:
+
+```bash
+ray job submit --working-dir . --runtime-env-json "$RUNTIME_ENV" -- \
+  env MODEL_NAME=Qwen3.5-35B-A3B NNODES_TRAINER=1 bash examples/tpu/grpo/run_qwen3_5_torchtitan.sh
+```
