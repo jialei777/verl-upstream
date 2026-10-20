@@ -1,0 +1,95 @@
+# TPU platform tests on 1 Cloud TPU v6e chip (TPU counterpart of gpu_unit_tests.yml / npu_unit_tests.yml).
+#
+# The TPU workflows (tpu_unit_tests.yml, e2e_sft_llm_tpu.yml, e2e_v1_separate_async_tpu.yml, nightly_tpu.yml)
+# run on self-hosted runners inside a GKE cluster with TPU v6e node pools. Each job provisions its own
+# Kueue-queued RayCluster with tests/special_tpu/run_tpu_e2e_ci.sh, runs one test on it the way
+# examples/tpu/grpo/README.md runs jobs (this checkout + verl-hardware-plugin through the Ray runtime env,
+# image built from examples/tpu/grpo/Dockerfile), and deletes the cluster at the end. See
+# tests/special_tpu/README.md.
+#
+# The jobs only run in repositories that set the variable TPU_CI_RUNNER to the label of their TPU runners.
+
+name: tpu_unit_tests
+
+on:
+  push:
+    branches:
+      - main
+      - main-ci
+      - v0.*
+    paths:
+      - "verl/**/*.py"
+      - "tests/special_tpu/**"
+      # The CI image is built from it
+      - "examples/tpu/grpo/Dockerfile"
+      - "!**/*.md"
+      - ".github/workflows/tpu_unit_tests.yml"
+  pull_request:
+    branches:
+      - main
+      - main-ci
+      - v0.*
+    paths:
+      - "verl/**/*.py"
+      - "tests/special_tpu/**"
+      # The CI image is built from it
+      - "examples/tpu/grpo/Dockerfile"
+      - "!**/*.md"
+      - ".github/workflows/tpu_unit_tests.yml"
+  workflow_dispatch:
+    inputs:
+      plugin_repo:
+        description: "verl-hardware-plugin repository, e.g. a fork (empty: VERL_HARDWARE_PLUGIN_REPO in tests/special_tpu/gke/tpu-ci.env)"
+        required: false
+        default: ""
+        type: string
+      plugin_commit:
+        description: "verl-hardware-plugin full commit id, branch or tag (empty: VERL_HARDWARE_PLUGIN_COMMIT in tests/special_tpu/gke/tpu-ci.env)"
+        required: false
+        default: ""
+        type: string
+
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/main-ci' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
+env:
+  # The self-hosted runners run as root.
+  PIP_ROOT_USER_ACTION: ignore
+  # Give up after waiting this long in the Kueue queue for TPU quota.
+  QUEUE_TIMEOUT_MINS: "90"
+  # Give up if the admitted RayCluster's pods are not all running after this long (TPU node scale-up, or
+  # hosts still held by an earlier CI job).
+  POD_READY_TIMEOUT_MINS: "60"
+  # Empty unless set by hand; the script then uses the plugin repository and commit pinned in tpu-ci.env.
+  VERL_HARDWARE_PLUGIN_REPO: ${{ github.event.inputs.plugin_repo }}
+  VERL_HARDWARE_PLUGIN_COMMIT: ${{ github.event.inputs.plugin_commit }}
+
+jobs:
+  tpu_unit_tests:
+    if: vars.TPU_CI_RUNNER != ''
+    name: TPU platform tests on 1 x TPU v6e-1 (torch_tpu, verl-hardware-plugin)
+    runs-on: ${{ vars.TPU_CI_RUNNER }}
+    timeout-minutes: 180 # Includes waiting for TPU quota (Kueue) and TPU hosts.
+    steps:
+      - name: Checkout verl
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Install the Ray job CLI
+        run: |
+          python3 -m pip install --quiet "ray[default]==2.56.0"
+      - name: Run TPU platform tests on 1 TPU chip (tests/special_tpu/tpu_smoke_test.py)
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh tpu_platform
+      - name: Clean up the RayCluster
+        if: always()
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh teardown tpu_platform
