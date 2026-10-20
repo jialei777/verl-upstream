@@ -1,8 +1,8 @@
-# GRPO on 2 Cloud TPU v6e-4 slices (TPU counterpart of e2e_v1_separate_async.yml /
+# GRPO on 2 Cloud TPU v6e-1 slices (TPU counterpart of e2e_v1_separate_async.yml /
 # e2e_v1_separate_async_ascend.yml and e2e_ppo_trainer_torchtitan_vllm.yml).
 #
-# Runs the 5-step Qwen3-0.6B GSM8K GRPO smoke test of examples/tpu/grpo as documented in its README: V1
-# separate-async trainer, TorchTitan trainer on one v6e-4 slice, vLLM rollout on the other, tpu-sync weight
+# Runs the 5-step Qwen3-0.6B GSM8K GRPO smoke test of examples/tpu/grpo as documented in its README (2 chips):
+# V1 separate-async trainer, TorchTitan trainer on one v6e-1 slice, vLLM rollout on the other, tpu-sync weight
 # sync. See tpu_unit_tests.yml and tests/special_tpu/README.md for how the TPU jobs work. The jobs only run
 # in repositories that set the variable TPU_CI_RUNNER.
 
@@ -88,7 +88,7 @@ env:
 jobs:
   e2e_v1_separate_async_tpu:
     if: vars.TPU_CI_RUNNER != ''
-    name: GSM8K GRPO Qwen3-0.6B on 2 x TPU v6e-4 (TorchTitan + vLLM, tpu-sync, V1 separate async)
+    name: GSM8K GRPO Qwen3-0.6B on 2 x TPU v6e-1 (TorchTitan + vLLM, tpu-sync, V1 separate async)
     runs-on: ${{ vars.TPU_CI_RUNNER }}
     timeout-minutes: 240 # Includes waiting for TPU quota (Kueue) and TPU hosts.
     steps:
@@ -101,7 +101,7 @@ jobs:
       - name: Install the Ray job CLI
         run: |
           python3 -m pip install --quiet "ray[default]==2.56.0"
-      - name: Running the GSM8K GRPO smoke test on 8 TPU v6e chips (examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh)
+      - name: Running the GSM8K GRPO smoke test on 2 TPU v6e chips (examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh)
         run: |
           bash tests/special_tpu/run_tpu_e2e_ci.sh grpo
       - name: Clean up the RayCluster
