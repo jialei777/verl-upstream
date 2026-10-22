@@ -15,13 +15,32 @@
 
 import logging
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from types import MethodType
 from typing import Any
 
 import torch
 import torch.distributed
+import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
+from torch.distributed import _functional_collectives as funcol
+from torch.distributed.tensor import DTensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+try:
+    from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
+    from torchtitan.experiments.tpu.spmd_utils import apply_spmd_safe
+    from torchtitan.models.common.attention import segment_ids_from_positions
+except ImportError:
+    splash_sdpa = None
+    apply_spmd_safe = None
+    segment_ids_from_positions = None
+
+try:
+    import torchtitan.distributed.context_parallel as torchtitan_cp
+except ImportError:
+    torchtitan_cp = None
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -39,6 +58,152 @@ def unwrap_metadata(val):
         elif val.numel() > 1:
             return val.flatten()[0].item()
     return val
+
+
+class _TPURMSNormAffine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, normalized: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(normalized, weight)
+        return normalized * weight.float()
+
+    @staticmethod
+    def backward(ctx, gradient: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized, weight = ctx.saved_tensors
+        gradient = gradient.float()
+        grad_normalized = gradient * weight.float()
+        product = gradient * normalized
+        dimensions = tuple(range(product.ndim - weight.ndim))
+        grad_weight = product.sum(dim=dimensions, dtype=torch.float32) if dimensions else product
+        # Let autograd cast at the parameter edge. An explicit BF16 return cast
+        # permits XLA to push that rounding inside the reduction, even with
+        # bfloat16-propagation disabled by the trainer compiler context.
+        return grad_normalized, grad_weight
+
+
+def _tpu_fp32_rms_norm(self: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    # Match CUDA autocast before Q/K RoPE and the final LM head. Casting an
+    # already-rounded BF16 norm output to FP32 cannot recover the lost precision.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight
+        if weight is not None and weight.dtype == torch.bfloat16:
+            normalized = F.rms_norm(x.float(), self.normalized_shape, None, self.eps)
+            return _TPURMSNormAffine.apply(normalized, weight)
+        weight = weight.float() if weight is not None else None
+        return F.rms_norm(x.float(), self.normalized_shape, weight, self.eps)
+
+
+def _patch_rms_norm(module: nn.Module) -> None:
+    # The traversal includes Q/K norms, both block norms, and the final decoder norm.
+    if isinstance(module, nn.RMSNorm) and getattr(module.forward, "__func__", None) is not _tpu_fp32_rms_norm:
+        module.forward = MethodType(_tpu_fp32_rms_norm, module)
+
+
+def _tpu_fp32_feed_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    # CUDA's BF16 SiLU uses FP32 arithmetic before rounding the activation.
+    # Explicitly retain that arithmetic on TPU, including its backward path.
+    gate = self.w1(x)
+    activated = F.silu(gate.float()).to(gate.dtype)
+    return self.w2(activated * self.w3(x))
+
+
+def _patch_feed_forward(module: nn.Module) -> None:
+    module_type = type(module)
+    if (
+        module_type.__name__ == "SimpleFSDPFeedForward"
+        and hasattr(module, "_simple_fsdp_parametrization_list")
+        and len(module_type.__bases__) == 1
+    ):
+        module_type = module_type.__bases__[0]
+    if module_type.__module__ != "torchtitan.models.common.feed_forward":
+        return
+    from torchtitan.models.common.feed_forward import FeedForward
+
+    if module_type is FeedForward and getattr(module.forward, "__func__", None) is not _tpu_fp32_feed_forward:
+        module.forward = MethodType(_tpu_fp32_feed_forward, module)
+
+
+def apply_tpu_precision_patches(model_parts: list[torch.nn.Module]) -> None:
+    """Apply the TPU FP32 RMSNorm and SiLU corrections before the first forward."""
+    # torch_tpu defaults FP32 dots to reduced precision; match the CUDA golden run.
+    torch.set_float32_matmul_precision("highest")
+    for model in model_parts:
+        for module in model.modules():
+            _patch_rms_norm(module)
+            _patch_feed_forward(module)
+
+
+class _TPUFp32LogitsLinear(torch.autograd.Function):
+    """Preserve FP32 projection accumulators with BF16 operands and backward matmuls."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        x_b = x.to(torch.bfloat16)
+        w_b = weight.to(torch.bfloat16)
+        ctx.save_for_backward(x_b, w_b)
+        ctx.x_dtype, ctx.w_dtype = x.dtype, weight.dtype
+        previous = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("medium")
+        try:
+            return torch.matmul(x_b.float(), w_b.float().t())
+        finally:
+            torch.set_float32_matmul_precision(previous)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_b, w_b = ctx.saved_tensors
+        g = grad.to(torch.bfloat16)
+        grad_x = torch.matmul(g, w_b).to(ctx.x_dtype)
+        grad_w = torch.matmul(g.reshape(-1, g.shape[-1]).t(), x_b.reshape(-1, x_b.shape[-1])).to(ctx.w_dtype)
+        return grad_x, grad_w
+
+
+def _tpu_fp32_logits_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if getattr(self, "bias", None) is not None:
+        raise ValueError("fp32_logits supports a bias-free LM head only")
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+        return _TPUFp32LogitsLinear.apply(x, weight)
+
+
+def apply_fp32_logits_tpu(modules: Any) -> int:
+    """Patch each LM head before its first forward; leave its parameter storage unchanged."""
+    if modules is None:
+        return 0
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    patched = 0
+    for model in model_list:
+        head = getattr(model, "lm_head", None)
+        if not isinstance(head, torch.nn.Module):
+            continue
+        if getattr(head.forward, "__func__", None) is _tpu_fp32_logits_forward:
+            continue
+        head.forward = MethodType(_tpu_fp32_logits_forward, head)
+        patched += 1
+    if patched:
+        logger.warning("fp32 logits enabled on TPU: patched %d lm_head module(s)", patched)
+    return patched
+
+
+_attention_dtype_fallback_logged = False
+
+
+def attention_compute_dtype(x: torch.Tensor) -> torch.dtype | None:
+    """Use the autocast dtype at the attention kernel boundary, preserving FP32 otherwise."""
+    global _attention_dtype_fallback_logged
+    device_type = x.device.type
+    try:
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
+        return None
+    except (RuntimeError, TypeError, ValueError) as e:
+        if not _attention_dtype_fallback_logged:
+            _attention_dtype_fallback_logged = True
+            logger.warning(
+                "Could not query autocast state for device %r (%s); TPU attention will run in bfloat16.",
+                device_type,
+                e,
+            )
+        return torch.bfloat16
 
 
 def monkey_patch_varlen_attention_tpu():
@@ -95,6 +260,11 @@ def monkey_patch_varlen_attention_tpu():
             k = xk.transpose(1, 2)
             v = xv.transpose(1, 2)
 
+            # Match CUDA's attention boundary after FP32 Q/K norm and RoPE.
+            compute_dtype = attention_compute_dtype(xq)
+            if compute_dtype is not None:
+                q, k, v = q.to(compute_dtype), k.to(compute_dtype), v.to(compute_dtype)
+
             if q.shape[1] != k.shape[1]:
                 num_repeat = q.shape[1] // k.shape[1]
                 k = k.repeat_interleave(num_repeat, dim=1)
@@ -103,8 +273,12 @@ def monkey_patch_varlen_attention_tpu():
             # Eager only: TorchTitanEngine rejects use_torch_compile without use_splash_attention on TPU,
             # because F.scaled_dot_product_attention traced by torch.compile(backend="tpu") yields NaN q/k/v
             # gradients. With splash attention enabled this module is replaced by TPUSplashAttention.
-            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-            return attn_out.transpose(1, 2)
+            if q.dtype == torch.float32:
+                with sdpa_kernel([SDPBackend.MATH]):
+                    attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            else:
+                attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            return attn_out.transpose(1, 2).to(q_BLNH.dtype)
 
         VarlenAttention.forward = tpu_varlen_forward
         logger.info("Successfully patched VarlenAttention.forward for TPU execution.")
@@ -167,19 +341,109 @@ def splash_block_size_for(seq_len: int, max_block_size: int = 512, min_block_siz
     return 0
 
 
+def _all_to_all_seq_to_head_bnlh(
+    x: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    cp_size: int,
+) -> torch.Tensor:
+    """Redistribute ``(B, S_local, H, D)`` -> ``(B, H // cp_size, S_local * cp_size, D)`` via Ulysses all-to-all."""
+    bsz, seq_local, num_heads, head_dim = x.shape
+    if num_heads % cp_size != 0:
+        raise ValueError(
+            f"Ulysses CP requires attention heads ({num_heads}) to be divisible by context_parallel_size ({cp_size})."
+        )
+    heads_local = num_heads // cp_size
+    x_staged = x.view(bsz, seq_local, cp_size, heads_local, head_dim).permute(2, 0, 1, 3, 4).contiguous()
+    y = funcol.all_to_all_single(x_staged, None, None, cp_group)
+    if isinstance(y, funcol.AsyncCollectiveTensor):
+        y = y.wait()
+    return y.permute(1, 3, 0, 2, 4).contiguous().view(bsz, heads_local, cp_size * seq_local, head_dim)
+
+
+def _all_to_all_head_to_seq_blnh(
+    x: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    cp_size: int,
+) -> torch.Tensor:
+    """Redistribute ``(B, H_local, S_full, D)`` -> ``(B, S_full // cp_size, H_local * cp_size, D)`` via all-to-all."""
+    bsz, heads_local, seq_full, head_dim = x.shape
+    seq_local = seq_full // cp_size
+    x_staged = x.view(bsz, heads_local, cp_size, seq_local, head_dim).permute(2, 0, 3, 1, 4).contiguous()
+    y = funcol.all_to_all_single(x_staged, None, None, cp_group)
+    if isinstance(y, funcol.AsyncCollectiveTensor):
+        y = y.wait()
+    return y.permute(1, 2, 0, 3, 4).contiguous().view(bsz, seq_local, cp_size * heads_local, head_dim)
+
+
+class _CPGather1D(torch.autograd.Function):
+    """All-gather a 1D sequence-sharded tensor across ``cp_group`` in forward; slice local chunk in backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, cp_group: torch.distributed.ProcessGroup) -> torch.Tensor:
+        ctx.cp_size = torch.distributed.get_world_size(cp_group)
+        ctx.cp_rank = torch.distributed.get_rank(cp_group)
+        x_contig = x.contiguous()
+        out = torch.empty((ctx.cp_size * x_contig.numel(),), dtype=x_contig.dtype, device=x_contig.device)
+        torch.distributed.all_gather_into_tensor(out, x_contig, group=cp_group)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output.chunk(ctx.cp_size, dim=0)[ctx.cp_rank].contiguous(), None
+
+
+def gather_cp_1d(x: torch.Tensor, cp_group: torch.distributed.ProcessGroup | None) -> torch.Tensor:
+    """All-gather a 1D sequence-sharded tensor across ``cp_group``."""
+    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
+        return x
+    return _CPGather1D.apply(x, cp_group)
+
+
+def _resolve_splash_segment_ids(
+    segment_ids: torch.Tensor | None,
+    attention_masks: Any,
+    positions: torch.Tensor | None,
+    seq_len_full: int,
+    cp_group: torch.distributed.ProcessGroup | None,
+) -> torch.Tensor | None:
+    """Resolve full-sequence ``segment_ids`` for ``TPUSplashAttention``."""
+    if (
+        isinstance(attention_masks, torch.Tensor)
+        and attention_masks.dtype == torch.int32
+        and int(attention_masks.shape[-1]) == seq_len_full
+    ):
+        return attention_masks
+    if segment_ids is not None and int(segment_ids.shape[-1]) == seq_len_full:
+        return segment_ids
+    if positions is None or segment_ids_from_positions is None:
+        return segment_ids
+    if cp_group is not None:
+        positions = funcol.all_gather_tensor(positions.contiguous(), gather_dim=1, group=cp_group)
+        if isinstance(positions, funcol.AsyncCollectiveTensor):
+            positions = positions.wait()
+    return segment_ids_from_positions(positions)
+
+
 class TPUSplashAttention(torch.nn.Module):
     """TorchTitan inner attention backed by the TPU splash attention Pallas kernel.
 
     Same contract as ``torchtitan.experiments.tpu.kernels.splash_attention.SplashAttention``
     ((B, S, H, D) in and out, causal + packed-document masking from ``segment_ids``), but the
     block sizes are chosen per call from the (static, bucketed) sequence length instead of
-    being fixed at 512. Falls back to the original module if no block size fits.
+    being fixed at 512. Supports Ulysses Context Parallelism via ``all_to_all_single`` when
+    ``cp_mesh`` is active (``cp_size > 1``). Falls back to the original module if no block size fits.
     """
 
-    def __init__(self, original_module: torch.nn.Module, local_window_size: int | None = None):
+    def __init__(
+        self,
+        original_module: torch.nn.Module,
+        local_window_size: int | None = None,
+        cp_mesh: Any = None,
+    ):
         super().__init__()
         self.original_module = original_module
         self.local_window_size = local_window_size
+        self.cp_mesh = cp_mesh
 
     def forward(
         self,
@@ -194,12 +458,13 @@ class TPUSplashAttention(torch.nn.Module):
         segment_ids: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        from torch.distributed.tensor import DTensor
-        from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
-        from torchtitan.models.common.attention import segment_ids_from_positions
+        has_cp = self.cp_mesh is not None and self.cp_mesh.size() > 1
+        cp_group = self.cp_mesh.get_group() if has_cp else None
+        cp_size = int(self.cp_mesh.size()) if has_cp else 1
+        seq_len_full = int(q.shape[1]) * cp_size
 
-        block = splash_block_size_for(int(q.shape[1]))
-        if block == 0 or q.device.type == "cpu":
+        block = splash_block_size_for(seq_len_full)
+        if block == 0 or q.device.type == "cpu" or splash_sdpa is None:
             return self.original_module(
                 q,
                 k,
@@ -220,13 +485,29 @@ class TPUSplashAttention(torch.nn.Module):
         v = v.to_local() if isinstance(v, DTensor) else v
         positions = positions.to_local() if isinstance(positions, DTensor) else positions
         segment_ids = segment_ids.to_local() if isinstance(segment_ids, DTensor) else segment_ids
-        if segment_ids is None and positions is not None:
-            segment_ids = segment_ids_from_positions(positions)
 
-        out = splash_sdpa(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
+        segment_ids = _resolve_splash_segment_ids(
+            segment_ids=segment_ids,
+            attention_masks=attention_masks,
+            positions=positions,
+            seq_len_full=seq_len_full,
+            cp_group=cp_group,
+        )
+        if has_cp:
+            q_bnlh = _all_to_all_seq_to_head_bnlh(q, cp_group, cp_size)
+            k_bnlh = _all_to_all_seq_to_head_bnlh(k, cp_group, cp_size)
+            v_bnlh = _all_to_all_seq_to_head_bnlh(v, cp_group, cp_size)
+        else:
+            q_bnlh = q.transpose(1, 2).contiguous()
+            k_bnlh = k.transpose(1, 2).contiguous()
+            v_bnlh = v.transpose(1, 2).contiguous()
+
+        # Splash requires BF16 inputs after FP32 Q/K norm and RoPE.
+        input_dtype = q.dtype
+        out_bnlh = splash_sdpa(
+            q_bnlh.to(torch.bfloat16).contiguous(),
+            k_bnlh.to(torch.bfloat16).contiguous(),
+            v_bnlh.to(torch.bfloat16).contiguous(),
             segment_ids=segment_ids,
             scale=scale,
             is_causal=True,
@@ -239,13 +520,30 @@ class TPUSplashAttention(torch.nn.Module):
             block_q_dkv=block,
             block_kv_dkv=block,
             block_kv_dkv_compute=block,
-        ).transpose(1, 2)
+        )
+        out = _all_to_all_head_to_seq_blnh(out_bnlh, cp_group, cp_size) if has_cp else out_bnlh.transpose(1, 2)
+        out = out.to(input_dtype)
         if q_mesh is not None:
             out = DTensor.from_local(out, q_mesh, q_placements)
         return out
 
 
-def apply_splash_attention_tpu(model_parts: list[torch.nn.Module]) -> int:
+def make_spmd_safe_parallelize_fn(parallelize_fn):
+    """Wrap a torchtitan ``parallelize_fn`` so each TransformerBlock is marked ``spmd_safe`` before compile."""
+
+    def _parallelize(model: torch.nn.Module, *, compile_config, **kwargs) -> torch.nn.Module:
+        if torchtitan_cp is not None and hasattr(torchtitan_cp, "apply_cp_to_forward"):
+            # TPUSplashAttention handles Ulysses CP directly inside its forward pass.
+            torchtitan_cp.apply_cp_to_forward = lambda attention_modules, cp_mesh: None
+        if apply_spmd_safe is not None and compile_config.enable and hasattr(model, "layers"):
+            for block in model.layers.values():
+                apply_spmd_safe(block)
+        return parallelize_fn(model, compile_config=compile_config, **kwargs)
+
+    return _parallelize
+
+
+def apply_splash_attention_tpu(model_parts: list[torch.nn.Module], cp_mesh: Any = None) -> int:
     """Swaps every attention module's ``inner_attention`` for ``TPUSplashAttention``.
 
     The splash kernel takes the per-token ``segment_ids`` that ``Decoder.forward`` derives
@@ -272,7 +570,7 @@ def apply_splash_attention_tpu(model_parts: list[torch.nn.Module]) -> int:
             local_window_size = None
             if isinstance(window, tuple) and len(window) == 2 and window[0] >= 0:
                 local_window_size = int(window[0])
-            module.inner_attention = TPUSplashAttention(inner, local_window_size=local_window_size)
+            module.inner_attention = TPUSplashAttention(inner, local_window_size=local_window_size, cp_mesh=cp_mesh)
             replaced += 1
     if replaced == 0:
         raise ValueError("use_splash_attention=True but no module with an `inner_attention` was found")
@@ -280,7 +578,7 @@ def apply_splash_attention_tpu(model_parts: list[torch.nn.Module]) -> int:
     return replaced
 
 
-def compute_global_batch_num_tokens(data: TensorDict, dp_group, tp_size: int) -> Any:
+def compute_global_batch_num_tokens(data: TensorDict, dp_group, tp_size: int, cp_size: int = 1) -> Any:
     """Computes global batch token count for loss normalization on TPU.
 
     On TPU, performing CPU-side all-reduce for loss normalization avoids graph desynchronization
@@ -289,11 +587,11 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group, tp_size: int) ->
     batch_num_tokens = data["loss_mask"].sum().cpu()
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(batch_num_tokens, op=torch.distributed.ReduceOp.SUM)
-        batch_num_tokens = batch_num_tokens / tp_size
+        batch_num_tokens = batch_num_tokens / (tp_size * max(1, cp_size))
     return batch_num_tokens.item()
 
 
-def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict]) -> None:
+def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], cp_size: int = 1) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
     Each rank buckets its own packed token count, so ranks normally run differently shaped programs for the
@@ -310,13 +608,15 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict]) -> No
     if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
         return
     bucket_size = get_tpu_seq_bucket_size()
+    seq_bucket_size = bucket_length(bucket_size, 256 * max(1, cp_size))
+    resp_bucket_size = min(bucket_size, 4096)
     lens = []
     for mb in micro_batches:
         ids = mb["input_ids"]
         n_tokens = ids.values().numel() if getattr(ids, "is_nested", False) else ids.numel()
         resp = mb["responses"] if "responses" in mb.keys() else None
         max_resp = int(resp.offsets().diff().max().item()) if getattr(resp, "is_nested", False) else 0
-        lens += [bucket_length(n_tokens, bucket_size), bucket_length(max_resp, bucket_size) if max_resp else 0]
+        lens += [bucket_length(n_tokens, seq_bucket_size), bucket_length(max_resp, resp_bucket_size) if max_resp else 0]
     lens = torch.tensor(lens, dtype=torch.int64)
     torch.distributed.all_reduce(lens, op=torch.distributed.ReduceOp.MAX)
     lens = lens.tolist()
@@ -335,8 +635,9 @@ def synchronize_tpu_loss(loss: torch.Tensor):
         pass
 
 
+@contextmanager
 def tpu_eager_mode_context(mode: str | None):
-    """Context manager running the enclosed ops under the torch_tpu eager ``mode`` (no-op for None).
+    """Run trainer operations with the requested eager mode and FP32 reduction precision.
 
     Mirrors torchtitan's ``tpu_config.eager_mode`` (``torchtitan/experiments/tpu/gmain.py``), which the
     afmv7 / qwen3 TPU recipes set to ``DEFER_AND_FUSE``: ops outside the compiled blocks are deferred
@@ -344,11 +645,24 @@ def tpu_eager_mode_context(mode: str | None):
     one XLA program per op (the torch_tpu default, ``DEFER_NEVER``). A context manager rather than a
     global setting so it applies to whichever Ray actor thread runs the RPC.
     """
-    if mode is None:
-        return nullcontext()
-    from torch_tpu._internal import execution_mode
+    try:
+        from torch_tpu._internal import execution_mode
+    except ImportError:
+        yield
+        return
 
-    return execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode))
+    try:
+        from torch_tpu._internal.compiler_options import custom_compiler_options
+    except ImportError as error:
+        raise RuntimeError("TPU trainer precision requires TorchTPU's custom_compiler_options API") from error
+
+    eager_context = (
+        execution_mode.set_eager_mode(getattr(execution_mode.EagerMode, mode)) if mode is not None else nullcontext()
+    )
+    # Keep XLA from rounding RMSNorm weight-gradient products before their FP32 reduction.
+    # This trainer-local override leaves the separate JAX/vLLM generator unchanged.
+    with eager_context, custom_compiler_options({"xla_disable_hlo_passes": "bfloat16-propagation"}):
+        yield
 
 
 def get_tpu_seq_bucket_size() -> int:
@@ -371,6 +685,8 @@ def pad_packed_inputs_for_tpu(
     micro_batch: TensorDict,
     device: Any,
     build_attention_mask: bool = True,
+    cp_size: int = 1,
+    cp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
     """Pads 1D packed sequence inputs on CPU to a fixed bucket multiple and transfers to TPU.
 
@@ -381,11 +697,14 @@ def pad_packed_inputs_for_tpu(
     the TPU only ever sees static bucket shapes across the entire training run.
 
     With ``build_attention_mask=False`` (splash attention, which derives document boundaries
-    from ``positions``) the dense mask is skipped and ``None`` is returned in its place.
+    from ``positions``) the dense mask is skipped and ``None`` is returned in its place (or
+    full-sequence ``segment_ids`` of dtype ``int32`` when ``cp_size > 1``).
     """
     from verl.utils import tensordict_utils as tu
 
     bucket_size = get_tpu_seq_bucket_size()
+    seq_bucket_size = bucket_length(bucket_size, 256 * max(1, cp_size))
+    resp_bucket_size = min(bucket_size, 4096)
     input_ids_cpu = input_ids.values().detach().cpu().unsqueeze(0)
     if position_ids.dim() == 3:
         position_ids_cpu = position_ids.values().detach().cpu().unsqueeze(1)
@@ -397,7 +716,7 @@ def pad_packed_inputs_for_tpu(
     orig_seq_len = int(input_ids_cpu.shape[1])
     # tpu_padded_seq_len: common length across ranks from align_micro_batch_shapes_across_ranks (SimpleFSDP).
     padded_seq_len = max(
-        bucket_length(orig_seq_len, bucket_size),
+        bucket_length(orig_seq_len, seq_bucket_size),
         int(tu.get_non_tensor_data(data=micro_batch, key="tpu_padded_seq_len", default=0) or 0),
     )
     pad_len = padded_seq_len - orig_seq_len
@@ -429,13 +748,21 @@ def pad_packed_inputs_for_tpu(
         same_seq_mask = seq_ids.unsqueeze(2) == seq_ids.unsqueeze(1)
         causal_mask = idx.unsqueeze(2) >= idx.unsqueeze(1)
         attention_mask_cpu = (same_seq_mask & causal_mask).unsqueeze(1)
+    elif cp_size > 1:
+        # Precompute full-sequence SplashAttention segment_ids [1, padded_seq_len] before CP slicing.
+        attention_mask_cpu = (torch.cumsum((pos_2d_cpu == 0).to(torch.int32), dim=1) - 1).to(torch.int32)
+
+    if cp_size > 1:
+        input_ids_cpu = input_ids_cpu.chunk(cp_size, dim=1)[cp_rank]
+        labels_cpu = labels_cpu.chunk(cp_size, dim=1)[cp_rank]
+        position_ids_cpu = position_ids_cpu.chunk(cp_size, dim=-1)[cp_rank]
 
     # Bucket max_response_len on micro_batch so ppo_loss operates on static bucketed shapes.
     if "responses" in micro_batch.keys() and getattr(micro_batch["responses"], "is_nested", False):
         resp_lens = micro_batch["responses"].offsets().diff().cpu()
         raw_max_resp = int(resp_lens.max().item())
         max_resp = max(
-            bucket_length(raw_max_resp, bucket_size),
+            bucket_length(raw_max_resp, resp_bucket_size),
             int(tu.get_non_tensor_data(data=micro_batch, key="tpu_max_response_len", default=0) or 0),
         )
         tu.assign_non_tensor_data(micro_batch, "max_response_len", max_resp)
