@@ -122,6 +122,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.torchtitan.use_splash_attention=True \
     +actor_rollout_ref.actor.torchtitan.tpu_eager_mode=DEFER_AND_FUSE \
     +actor_rollout_ref.actor.torchtitan.use_simple_fsdp=True \
+    +actor_rollout_ref.actor.torchtitan.fuse_qkv=False \
     actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
     actor_rollout_ref.actor.optim.lr_warmup_steps="${LR_WARMUP_STEPS}" \
     actor_rollout_ref.actor.optim.decay_type=cosine \
