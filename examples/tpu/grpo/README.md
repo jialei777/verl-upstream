@@ -92,6 +92,14 @@ The 5-step smoke test takes about 5-6 minutes to start up and log the first step
 
 The scripts take their settings from environment variables, e.g. `-- RAY_DATA_HOME=/data/<DIR> TOTAL_TRAINING_STEPS=10 bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh`, and pass extra arguments to `verl.trainer.main_ppo` as Hydra overrides.
 
+To enable Context Parallelism (CP) across trainer chips, set `CONTEXT_PARALLEL_SIZE` (e.g. `2` or `4`; `DATA_PARALLEL_SHARD_SIZE` defaults to `TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE / CONTEXT_PARALLEL_SIZE`) and optionally `CONTEXT_PARALLEL_STRATEGY` (`all_gather`, the default, for load-balanced KV all-gather CP with Splash Attention, or `ulysses` for DeepSpeed-Ulysses all-to-all CP). CP needs at least 2 trainer chips, e.g. on the 2 `v6e-4` slices of Section 6:
+
+```bash
+ray job submit --working-dir . --runtime-env-json "$RUNTIME_ENV" -- \
+  env N_CHIPS_TRAINER=4 N_CHIPS_ROLLOUT=4 CONTEXT_PARALLEL_SIZE=2 \
+  bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
+```
+
 ## 6. Run Qwen3-4B on 2 `v6e-4` slices (8 chips)
 
 `run_qwen3_4b_torchtitan.sh` runs a 100-step GRPO job on 2 `v6e-4` slices (4 trainer chips + 4 rollout chips).
