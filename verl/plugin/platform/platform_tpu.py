@@ -27,6 +27,7 @@ import torch
 
 from .platform_cuda import PlatformCUDA
 from .platform_manager import PlatformRegistry, get_platform
+from .platform_tpu_slices import plan_resource_pool_placement, slice_chips_for
 from .platform_tpu_workarounds import convert_tensors_to_scalars, patch_ray_worker
 
 logger = logging.getLogger(__file__)
@@ -64,6 +65,28 @@ TPU_TOPOLOGY_MAP = {
     1: "1,1,1",
 }
 
+# TPU v5p 3D mesh topology mappings (X, Y, Z) by pod type or total chips (1 logical device per chip in Megacore mode).
+# Each host is 2x2x1 (4 chips = 8 TensorCores); multi-host slices stack along Z then X/Y (2x2x2 = 8 chips,
+# 2x2x4 = 16 chips, 2x4x4 = 32 chips, 4x4x4 = 64 chips, 4x4x8 = 128 chips, 4x8x8 = 256 chips).
+TPU_V5P_TOPOLOGY_MAP = {
+    "v5p-512": "4,8,8",
+    "v5p-256": "4,4,8",
+    "v5p-128": "4,4,4",
+    "v5p-64": "2,4,4",
+    "v5p-32": "2,2,4",
+    "v5p-16": "2,2,2",
+    "v5p-8": "2,2,1",
+    256: "4,8,8",
+    128: "4,4,8",
+    64: "4,4,4",
+    32: "2,4,4",
+    16: "2,2,4",
+    8: "2,2,2",
+    4: "2,2,1",
+    2: "1,2,1",
+    1: "1,1,1",
+}
+
 # TPU 7x (Ironwood) 4D mesh topology mappings (X, Y, Z, CoresPerChip=2), keyed by device count.
 # A host has 4 chips (2x2x1) and 8 devices; the multi-host entries follow the GKE slice shapes
 # (2x2x2 = 2 hosts, 2x2x4 = 4, 2x4x4 = 8, 4x4x4 = 16).
@@ -80,9 +103,13 @@ TPU_V7X_TOPOLOGY_MAP = {
 
 
 def get_tpu_topology_map() -> dict:
-    """Returns the topology map for the configured TPU generation (4D for TPU 7x, 3D otherwise)."""
+    """Returns the topology map for the configured TPU generation (4D for TPU 7x, 3D for v5p/v6e)."""
     tpu_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v6e").lower()
-    return TPU_V7X_TOPOLOGY_MAP if any(k in tpu_type for k in ("tpu7x", "v7x")) else TPU_TOPOLOGY_MAP
+    if any(k in tpu_type for k in ("tpu7x", "v7x")):
+        return TPU_V7X_TOPOLOGY_MAP
+    if "v5p" in tpu_type:
+        return TPU_V5P_TOPOLOGY_MAP
+    return TPU_TOPOLOGY_MAP
 
 
 def get_tpu_chip_hbm_bytes() -> int:
@@ -344,23 +371,49 @@ class PlatformTPU(PlatformCUDA):
         local_world_size: int,
         name_prefix: str,
         pgs: list,
+        accelerator_type: Optional[str] = None,
     ) -> dict[str, str]:
-        """Generates TPU-specific distributed environment variables for PJRT mesh initialization."""
-        node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in ray.nodes() if node.get("Alive", False)}
+        """Generates TPU-specific distributed environment variables for PJRT mesh initialization.
+        ``accelerator_type`` is the slice resource of the worker group's resource pool (``tpu-group-<k>``);
+        it tells a group that uses only part of a slice apart from one spanning the whole slice.
+        """
+        alive_nodes = [node for node in ray.nodes() if node.get("Alive", False)]
+        node_ip_map = {node["NodeID"]: node["NodeManagerAddress"] for node in alive_nodes}
         bundle_ips = []
         local_ip = ray.util.get_node_ip_address()
         clean_prefix = name_prefix.lower().split("_")[0] if name_prefix else ""
         matching_pgs = []
 
-        # 1. Primary filter: Select placement group containing current worker's node IP
+        # 0. Single-slice pool: if every placement group of this pool is on the same TPU slice (Ray node label
+        # ray.io/tpu-slice-name), they all form one PJRT mesh, so keep all of them. This method runs in the driver
+        # (TaskRunner), so `local_ip` is the driver's node, not the worker's. When the driver shares a host with a
+        # multi-host pool, filter 1 alone keeps only that host's placement group and every worker gets one host's
+        # TPU_PROCESS_ADDRESSES (libtpu: "Expected 16 worker addresses, got 8").
+        node_slice_map = {
+            node["NodeID"]: node.get("Labels", {}).get("ray.io/tpu-slice-name", "") for node in alive_nodes
+        }
+        pg_slices = set()
         for p in pgs:
             specs = ray._private.state.state.placement_group_table(p.id)
             if specs.get("state") != "CREATED":
                 continue
-            bundles_map = specs.get("bundles_to_node_id", {})
-            pg_ips = [node_ip_map[node_id] for b_idx, node_id in sorted(bundles_map.items()) if node_id in node_ip_map]
-            if local_ip in pg_ips:
-                matching_pgs.append(p)
+            bundle_nodes = specs.get("bundles_to_node_id", {}).values()
+            pg_slices.update(node_slice_map.get(node_id, "") for node_id in bundle_nodes)
+        if len(pg_slices) == 1 and "" not in pg_slices:
+            matching_pgs = list(pgs)
+
+        # 1. Primary filter: Select placement group containing current worker's node IP
+        if not matching_pgs:
+            for p in pgs:
+                specs = ray._private.state.state.placement_group_table(p.id)
+                if specs.get("state") != "CREATED":
+                    continue
+                bundles_map = specs.get("bundles_to_node_id", {})
+                pg_ips = [
+                    node_ip_map[node_id] for b_idx, node_id in sorted(bundles_map.items()) if node_id in node_ip_map
+                ]
+                if local_ip in pg_ips:
+                    matching_pgs.append(p)
 
         # 2. Secondary fallback: Filter by clean_prefix if placement group names are explicitly set
         if not matching_pgs and clean_prefix:
@@ -369,7 +422,11 @@ class PlatformTPU(PlatformCUDA):
                 if clean_prefix in p_name:
                     matching_pgs.append(p)
 
-        target_pgs = matching_pgs if matching_pgs else pgs
+        matching_bundles = sum(
+            len(ray._private.state.state.placement_group_table(p.id).get("bundles_to_node_id", {}))
+            for p in matching_pgs
+        )
+        target_pgs = matching_pgs if (matching_pgs and matching_bundles == world_size) else pgs
 
         for pg in target_pgs:
             specs = ray._private.state.state.placement_group_table(pg.id)
@@ -399,12 +456,18 @@ class PlatformTPU(PlatformCUDA):
             "TPU_VISIBLE_DEVICES": str(local_rank),
         }
 
-        # Apply TPU topology and host bounds based on TPU pod type or world size
+        # Apply TPU topology and host bounds based on TPU pod type or world size. The pod-type label describes
+        # the whole slice; a worker group that uses only part of it (e.g. one TP=4 replica per host of a 2-host
+        # v6e-8 slice) must take the shape of its own world size instead.
         tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
         topo_map = get_tpu_topology_map()
-        topo = topo_map.get(tpu_type) or topo_map.get(world_size)
+        slice_chips = slice_chips_for(accelerator_type)
+        if slice_chips is not None and world_size != slice_chips:
+            topo = topo_map.get(world_size) or topo_map.get(tpu_type)
+        else:
+            topo = topo_map.get(tpu_type) or topo_map.get(world_size)
         if topo is None:
             # Falling back to the single-device topology makes a multi-host trainer fail in ways that do not
             # point here (the mesh forms, then collectives stall or halt), so say what happened.
@@ -439,32 +502,32 @@ class PlatformTPU(PlatformCUDA):
             if world_size > 1:
                 env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
 
+        env_vars["LIBTPU_INIT_ARGS"] = _ensure_slicebuilder_insecure_grpc(os.environ.get("LIBTPU_INIT_ARGS", ""))
+
         return env_vars
 
     def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
-        """Dynamically assign a TPU slice/group or node affinity to a resource pool on multi-slice clusters."""
+        """Assign a TPU slice (``tpu-group-<k>`` or ``node:<ip>``) to a resource pool on multi-slice clusters."""
         if accelerator_type is not None:
             return accelerator_type
+        return self.plan_resource_pool_placement(name_prefix)[0]
 
-        is_rollout_pool = any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"])
+    def plan_resource_pool_placement(
+        self, name_prefix: str, process_on_nodes: Optional[list[int]] = None
+    ) -> tuple[Optional[str], Optional[list[str]]]:
+        """Slice resource and per-placement-group host pins for a resource pool.
 
+        Trainer pools get the trainer slice; ``rollout_pool_<idx>`` pools get the slice and the hosts
+        of rollout replica ``idx`` from the slice plan (see ``platform_tpu_slices``), so that several
+        replicas on one multi-host slice occupy distinct hosts instead of racing for the same one.
+        """
         try:
-            if ray.is_initialized():
-                tpu_nodes = [n for n in ray.nodes() if n.get("Alive") and "TPU" in n.get("Resources", {})]
-                tpu_slices = sorted(
-                    {res for n in tpu_nodes for res in n.get("Resources", {}) if res.startswith("tpu-group-")}
-                )
-                if not tpu_slices:
-                    # Single-host slices (numOfHosts=1) omit tpu-group-* resources; pin by node:<ip> instead.
-                    tpu_slices = sorted(
-                        f"node:{n['NodeManagerAddress']}" for n in tpu_nodes if n.get("NodeManagerAddress")
-                    )
-                if tpu_slices:
-                    return tpu_slices[1] if (len(tpu_slices) >= 2 and is_rollout_pool) else tpu_slices[0]
-        except Exception:
-            pass
-
-        return accelerator_type
+            return plan_resource_pool_placement(name_prefix, process_on_nodes)
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(f"TPU slice assignment failed for {name_prefix}: {e}")
+            return None, None
 
     def configure_placement_group_bundle(
         self, bundle: dict, use_gpu: bool, device_name: str, name_prefix: str, accelerator_type: Optional[str] = None
@@ -475,6 +538,24 @@ class PlatformTPU(PlatformCUDA):
             bundle[device_name] = 1
         if accelerator_type is not None:
             bundle[accelerator_type] = 1e-4
+
+    def pin_placement_group_scheme(self, pg_scheme: list[list[dict]], hosts: Optional[list[str]]) -> None:
+        """Pin each placement group of ``pg_scheme`` to the host planned for it.
+
+        Rollout bundles reserve no ``TPU`` (vLLM allocates the chips itself), so without a per-host
+        constraint Ray may pack two replicas of one slice onto the same host. ``node:<ip>`` is the
+        resource Ray advertises on exactly that node.
+        """
+        if not hosts:
+            return
+        if len(hosts) != len(pg_scheme):
+            logger.warning(
+                f"TPU host pins {hosts} do not match the {len(pg_scheme)} placement group(s); leaving them unpinned"
+            )
+            return
+        for bundles, ip in zip(pg_scheme, hosts, strict=True):
+            for bundle in bundles:
+                bundle[f"node:{ip}"] = 1e-4
 
     def get_worker_env_vars(
         self,
@@ -502,6 +583,7 @@ class PlatformTPU(PlatformCUDA):
             local_world_size=local_world_size,
             name_prefix=name_prefix,
             pgs=pgs,
+            accelerator_type=getattr(resource_pool, "accelerator_type", None),
         )
         env_vars.update(tpu_env)
         return env_vars
@@ -520,17 +602,44 @@ class PlatformTPU(PlatformCUDA):
         have to be named to survive. The caller appends VERL_TPU_EXTRA_<VAR> and
         falls back to the value forwarded off the worker.
         """
-        return {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+        env_vars = {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+        env_vars["LIBTPU_INIT_ARGS"] = _ensure_slicebuilder_insecure_grpc(env_vars.get("LIBTPU_INIT_ARGS", ""))
+        return env_vars
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
         """Return Ray initialization arguments with runtime_env configured for GKE TPU workers."""
         env_vars = {
             "VERL_PLATFORM": "tpu",
             "TPU_ACCELERATOR_TYPE": os.environ.get("TPU_ACCELERATOR_TYPE", "v6e"),
+            "LIBTPU_INIT_ARGS": _ensure_slicebuilder_insecure_grpc(os.environ.get("LIBTPU_INIT_ARGS", "")),
         }
+        for key in (
+            "WANDB_API_KEY",
+            "WANDB_BASE_URL",
+            "WANDB_ENTITY",
+            "WANDB_PROJECT",
+            "WANDB_MODE",
+            "VERL_FILE_LOGGER_ROOT",
+            "VERL_FILE_LOGGER_PATH",
+            "TENSORBOARD_DIR",
+            "VERL_TPU_VLLM_ATTN_FP32_STATS",
+            "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER",
+        ):
+            if os.environ.get(key):
+                env_vars[key] = os.environ[key]
         return {
             "runtime_env": {
                 "worker_process_setup_hook": patch_ray_worker,
                 "env_vars": env_vars,
             }
         }
+
+
+def _ensure_slicebuilder_insecure_grpc(raw_args: str) -> str:
+    """Ensure LIBTPU_INIT_ARGS enables insecure SliceBuilder gRPC to avoid GKE ALTS handshake hangs."""
+    tokens = raw_args.split()
+    if not any(t.startswith("--slicebuilder_use_insecure_grpc") for t in tokens):
+        tokens.append("--slicebuilder_use_insecure_grpc=true")
+    if not any(t.startswith("--undefok=") and "slicebuilder_use_insecure_grpc" in t for t in tokens):
+        tokens.append("--undefok=slicebuilder_use_insecure_grpc")
+    return " ".join(tokens)

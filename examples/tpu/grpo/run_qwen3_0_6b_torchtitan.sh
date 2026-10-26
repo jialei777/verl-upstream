@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU 7x (2x2x1 Single-Host) & TPU v6e
+# GRPO | Qwen3-0.6B | GSM8K | TorchTitan Training & vLLM Rollout | TPU v5p, TPU v6e & TPU 7x
 # V1 PPOTrainer (Separate Async Overlap)
 #
 # By default this runs a realistic 100-step GRPO job whose reward curve actually
@@ -31,8 +31,8 @@ set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
-# TPU generation: defaults to v6e (3D topology map). On TPU 7x, pass TPU_ACCELERATOR_TYPE=tpu7x
-# (e.g. via --runtime-env-json) to select the 4D topology map; it aborts libtpu on v6e.
+# TPU generation: defaults to v6e (2D/3D topology map). Pass TPU_ACCELERATOR_TYPE=v5p on TPU v5p
+# (3D torus topology map) or TPU_ACCELERATOR_TYPE=tpu7x on TPU 7x (4D topology map).
 export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=1
@@ -87,11 +87,33 @@ TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k/test.parquet}"
 export NNODES_TRAINER="${NNODES_TRAINER:-2}"      # physical VM hosts for the training slice
 export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"    # TPU chips per training host
 
-export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"      # physical VM hosts for the rollout slice
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-2}"      # physical VM hosts for the rollout slice(s)
 export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"    # TPU chips per rollout host
 
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
+
+# Rollout parallelism. By default one vLLM replica spans every rollout chip. Several replicas (data parallelism
+# across replicas) can be asked for in two equivalent ways; a replica always occupies whole hosts of one slice:
+#   * ROLLOUT_TP=<chips per replica> with ROLLOUT_DP=<replicas>: NNODES_ROLLOUT x N_CHIPS_ROLLOUT must equal
+#     ROLLOUT_DP x ROLLOUT_TP, e.g. NNODES_ROLLOUT=2 N_CHIPS_ROLLOUT=4 ROLLOUT_TP=4 ROLLOUT_DP=2 -> one TP=4
+#     replica per host of the rollout v6e-8 slice. ROLLOUT_DP=1 (default) keeps verl's own
+#     TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP replica count.
+#   * ROLLOUT_SLICES=<slice indices or names, comma separated> with ROLLOUT_TP: the sampler runs on exactly those
+#     slices (e.g. ROLLOUT_SLICES=1,2 -> tpu-group-1 and tpu-group-2), NNODES_ROLLOUT / N_CHIPS_ROLLOUT are derived
+#     from them and the replica count is chips / ROLLOUT_TP. TRAINER_SLICES picks the trainer slice (default: the
+#     first slice not used by the rollout).
+ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
+ROLLOUT_DP="${ROLLOUT_DP:-1}"
+ROLLOUT_SLICES="${ROLLOUT_SLICES:-}"
+TRAINER_SLICES="${TRAINER_SLICES:-}"
+TPU_SLICE_ARGS=()
+if [[ -n "${ROLLOUT_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("actor_rollout_ref.rollout.tpu_slices=[${ROLLOUT_SLICES}]")
+fi
+if [[ -n "${TRAINER_SLICES}" ]]; then
+    TPU_SLICE_ARGS+=("+trainer.tpu_slices=[${TRAINER_SLICES}]")
+fi
 
 # Sequence budget. max_model_len must cover prompt + response, otherwise vLLM
 # silently truncates the generation and the reward is always zero.
@@ -170,7 +192,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
-    actor_rollout_ref.rollout.tensor_model_parallel_size="${TOTAL_ROLLOUT_CHIPS}" \
+    actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    actor_rollout_ref.rollout.data_parallel_size="${ROLLOUT_DP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -202,4 +225,4 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.nnodes="${NNODES_ROLLOUT}" \
     actor_rollout_ref.rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" \
     +rollout.nnodes="${NNODES_ROLLOUT}" \
-    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" "$@"
+    +rollout.n_gpus_per_node="${N_CHIPS_ROLLOUT}" ${TPU_SLICE_ARGS[@]+"${TPU_SLICE_ARGS[@]}"} "$@"

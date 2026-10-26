@@ -104,10 +104,25 @@ def run_ppo(config, task_runner_class) -> None:
             DEFAULT_TASK_RUNNER_CPUS,
         )
 
+        # Forward platform env_vars (e.g., WANDB_*, VERL_FILE_LOGGER_ROOT) to TaskRunner, and pin it to the Ray head
+        # node only when the head node advertises enough CPUs (>= DEFAULT_TASK_RUNNER_CPUS). On GKE KubeRay clusters
+        # with a lightweight CPU head pod (e.g., 4 CPUs), leaving resources=None schedules TaskRunner on a TPU worker
+        # pod instead of deadlocking on {'node:__internal_head__': 1e-4, 'CPU': 10}.
+        runner_env_vars = (
+            get_platform().get_ray_init_kwargs().get("runtime_env", {}).get("env_vars", {"VERL_PLATFORM": "tpu"})
+        )
+        head_has_enough_cpus = any(
+            node.get("Alive", False)
+            and "node:__internal_head__" in node.get("Resources", {})
+            and node.get("Resources", {}).get("CPU", 0) >= DEFAULT_TASK_RUNNER_CPUS
+            for node in ray.nodes()
+        )
+        runner_resources = {"node:__internal_head__": 1e-4} if head_has_enough_cpus else None
         runner = task_runner_class.options(
             num_cpus=DEFAULT_TASK_RUNNER_CPUS,
             max_concurrency=DEFAULT_TASK_RUNNER_CONCURRENCY,
-            runtime_env={"env_vars": {"VERL_PLATFORM": "tpu"}},
+            resources=runner_resources,
+            runtime_env={"env_vars": runner_env_vars},
         ).remote()
     else:
         runner = task_runner_class.remote()
@@ -115,6 +130,10 @@ def run_ppo(config, task_runner_class) -> None:
     try:
         ray.get(runner.run.remote(config))
     finally:
+        import sys
+
+        sys.stdout.flush()
+        sys.stderr.flush()
         timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
         if timeline_json_file:
             ray.timeline(filename=timeline_json_file)
@@ -154,6 +173,9 @@ class TaskRunnerV1:
 
     def run(self, config: DictConfig):
         """Run the PPO training process."""
+        import sys
+        import time
+
         configure_verl_logging()
 
         import transfer_queue as tq
@@ -183,6 +205,12 @@ class TaskRunnerV1:
                     tracking.finish(exit_code=0 if succeeded else 1)
             finally:
                 tq.close()
+                # When TaskRunnerV1 runs on a remote worker node (e.g., when ray-head has --num-cpus=0),
+                # flush stdout/stderr and allow Ray's log_monitor (1s poll interval) to ship the final
+                # step/validation metric lines to the driver before ray.shutdown() disconnects.
+                sys.stdout.flush()
+                sys.stderr.flush()
+                time.sleep(2.5)
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)

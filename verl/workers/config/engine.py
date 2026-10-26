@@ -493,6 +493,9 @@ class TorchtitanEngineConfig(EngineConfig):
         forward_prefetch (bool): Whether to prefetch parameters for next forward pass, default False
         use_orig_params (bool): Whether to use original parameters when initialize FSDP, default False
         mixed_precision (bool): Mixed precision configuration for FSDP, default False
+        mixed_precision_param (Optional[str]): Override TorchTitan's mixed precision parameter dtype;
+            None preserves TorchTitan's default.
+        fp32_logits (bool): TPU only. Retain FP32 LM-head accumulators with BF16 operands and backward.
         offload_policy (bool): Whether to offload policy model parameters, default False
         data_parallel_size (int): Data parallel group size, default 1
         data_parallel_replicate_size (int): Data parallel replicate size, default 1
@@ -542,6 +545,8 @@ class TorchtitanEngineConfig(EngineConfig):
     forward_prefetch: bool = False
     use_orig_params: bool = False
     mixed_precision: bool = False
+    mixed_precision_param: Optional[Literal["bfloat16", "float32"]] = None
+    fp32_logits: bool = False
     offload_policy: bool = False
     use_torch_compile: bool = True
     entropy_from_logits_with_chunking: bool = False
@@ -568,17 +573,16 @@ class TorchtitanEngineConfig(EngineConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        assert self.mixed_precision_param in [None, "bfloat16", "float32"], (
+            f"mixed_precision_param {self.mixed_precision_param} not supported"
+        )
         assert self.tpu_eager_mode in [None, "DEFER_AND_FUSE", "DEFER_NEVER"], (
             f"tpu_eager_mode {self.tpu_eager_mode} not supported"
         )
         if self.use_simple_fsdp:
-            assert (
-                self.tensor_parallel_size
-                == self.pipeline_parallel_size
-                == self.context_parallel_size
-                == self.expert_parallel_size
-                == 1
-            ), "use_simple_fsdp supports pure FSDP/HSDP only (tensor/pipeline/context/expert parallel size 1)"
+            assert self.tensor_parallel_size == self.pipeline_parallel_size == self.expert_parallel_size == 1, (
+                "use_simple_fsdp supports FSDP/HSDP (+ optional CP) only (tensor/pipeline/expert parallel size 1)"
+            )
         assert self.attn_type in ["flex", "flex_flash", "varlen"], (
             f"attn_type {self.attn_type} not supported (sdpa is not a valid language-model backend)"
         )

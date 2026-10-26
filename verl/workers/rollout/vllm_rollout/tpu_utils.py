@@ -74,6 +74,57 @@ def _resolve_tpu_topology_bounds(
     return topology, host_bounds, chips_per_host_bounds, chips_per_host
 
 
+# Hosts (node IPs) planned for this rollout replica by the trainer, and their chip count. Set on the
+# server actor (launch_tpu_vllm_servers) from RayResourcePool.tpu_hosts and inherited by the engine
+# process, where the Ray executor allocates the TPU workers.
+VERL_TPU_ROLLOUT_HOSTS_ENV = "VERL_TPU_ROLLOUT_HOSTS"
+VERL_TPU_CHIPS_PER_HOST_ENV = "VERL_TPU_CHIPS_PER_HOST"
+
+
+def _create_pinned_tpu_placement_group(parallel_config, ray_address=None):
+    """Create vLLM's placement group on the hosts planned for this replica, or return None.
+
+    vLLM otherwise creates a PACK placement group of ``world_size`` ``{"TPU": 1}`` bundles that Ray places
+    on any hosts with free chips. With several replicas, or a multi-host replica next to other slices, that
+    can land a replica's workers on hosts of another slice (no ICI between slices) or on the host another
+    replica's server was pinned to. One ``{"TPU": 1, "node:<ip>": 1e-4}`` bundle per chip of each planned
+    host keeps the workers on exactly those hosts. Falls back to vLLM's default on any problem.
+    """
+    hosts_env = os.environ.get(VERL_TPU_ROLLOUT_HOSTS_ENV, "")
+    hosts = [h.strip() for h in hosts_env.split(",") if h.strip()]
+    if not hosts:
+        return None
+    try:
+        world_size = int(parallel_config.world_size)
+        chips_per_host = int(os.environ.get(VERL_TPU_CHIPS_PER_HOST_ENV) or world_size // len(hosts))
+        if chips_per_host * len(hosts) != world_size:
+            logging.getLogger(__name__).warning(
+                f"[TPU placement] {len(hosts)} planned host(s) x {chips_per_host} chips != vLLM world size "
+                f"{world_size}; letting vLLM place its workers."
+            )
+            return None
+        if not ray.is_initialized():
+            try:
+                ray.init(address=ray_address, runtime_env=getattr(parallel_config, "ray_runtime_env", None))
+            except Exception:
+                ray.init(address="auto")
+        bundles = [{"TPU": 1, f"node:{ip}": 1e-4} for ip in hosts for _ in range(chips_per_host)]
+        pg = ray.util.placement_group(
+            bundles, strategy="PACK", name=f"verl_tpu_rollout_{os.getpid()}_{int(time.time() * 1000)}"
+        )
+        ray.get(pg.ready(), timeout=1800)
+        logging.getLogger(__name__).info(
+            f"[TPU placement] vLLM workers pinned to hosts {hosts} ({chips_per_host} chips each)"
+        )
+        print(f"[TPU placement] vLLM workers pinned to hosts {hosts} ({chips_per_host} chips each)", flush=True)
+        return pg
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"[TPU placement] could not pin vLLM workers to {hosts}: {e}; letting vLLM place its workers."
+        )
+        return None
+
+
 # -------------------------------------------
 
 try:
@@ -201,6 +252,67 @@ def patch_multiprocessing_for_tpu() -> None:
     multiprocessing.process.BaseProcess._tpu_patched = True
 
 
+# Folded MoE expert stacks sent by raiden_checkpoint_engine.export_local_shards (expert_stack_wire):
+# "<prefix>.experts.gate_proj.weight" / ".up_proj.weight" [E * I, H] and ".down_proj.weight" [E * H, I].
+_RAIDEN_EXPERT_SUFFIXES = (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+
+
+def _raiden_resolve_name(name: str, table) -> Optional[str]:
+    """``name`` as a key of ``table`` (state_dict or named_modules dict), tolerating a missing / extra ``model.``."""
+    for key in (name, name[6:] if name.startswith("model.") else None, f"model.{name}"):
+        if key is not None and key in table:
+            return key
+    return None
+
+
+def _raiden_expert_stack_prefix(name: str) -> Optional[str]:
+    """``model.layers.N.mlp.experts`` if ``name`` is a folded expert stack, else None."""
+    for suffix in _RAIDEN_EXPERT_SUFFIXES:
+        if name.endswith(".experts" + suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def _raiden_routed_experts(module_dict: dict, prefix: str):
+    """``(name, module)`` of the vLLM module holding MoE block ``prefix``'s fused ``w13_weight`` / ``w2_weight``.
+
+    vLLM >= 0.2x wraps them as ``<prefix>.routed_experts`` (MoERunner -> RoutedExperts); older FusedMoE held them
+    directly on ``<prefix>``.
+    """
+    for cand in (f"{prefix}.routed_experts", prefix):
+        key = _raiden_resolve_name(cand, module_dict)
+        if key is not None and hasattr(module_dict[key], "w13_weight") and hasattr(module_dict[key], "w2_weight"):
+            return key, module_dict[key]
+    return None, None
+
+
+def _raiden_fused_expert_weights(
+    gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, half: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build vLLM-TPU's fused expert weights from per-expert HF blocks.
+
+    ``gate`` / ``up``: ``[E_local, I, H]``, ``down``: ``[E_local, H, I]`` (HF ``[out, in]`` per expert). vllm_torchtpu
+    (VllmUnquantizedFusedMoEMethod.process_weights_after_loading) stores ``w13 = [gate^T | 0 | up^T | 0]``
+    ``[E_local, H, 2 * half]`` with each half zero padded to ``half`` columns, and ``w2 = [down^T ; 0]``
+    ``[E_local, half, H]``.
+    """
+    inter = int(gate.shape[1])
+    pad = int(half) - inter
+    if pad < 0:
+        raise RuntimeError(f"Raiden MoE: received intermediate size {inter} exceeds vLLM's fused half {half}")
+    gate_t = gate.transpose(1, 2).contiguous()
+    up_t = up.transpose(1, 2).contiguous()
+    down_t = down.transpose(1, 2).contiguous()
+    if pad:
+        zeros = gate_t.new_zeros((*gate_t.shape[:-1], pad))
+        w13 = torch.cat([gate_t, zeros, up_t, zeros], dim=-1)
+        w2 = torch.cat([down_t, down_t.new_zeros((down_t.shape[0], pad, down_t.shape[2]))], dim=1)
+    else:
+        w13 = torch.cat([gate_t, up_t], dim=-1)
+        w2 = down_t
+    return w13.contiguous(), w2.contiguous()
+
+
 class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
     """vLLM Worker Extension for Google Cloud TPU with Raiden P2P weight synchronization.
 
@@ -214,8 +326,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         worker = getattr(self, "worker", self)
         return worker.model_runner.model
 
-    def init_raiden_sync_on_worker(self, parallelism: int = 8) -> bool:
-        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController."""
+    def init_raiden_sync_on_worker(self, parallelism: int = 8, job_name: str = "sampler") -> bool:
+        """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
+
+        ``job_name`` is the Raiden job this replica registers under; the orchestrator gives every rollout replica
+        its own name when there are several, so their ranks ``0..TP-1`` do not collide on the controller.
+        """
         if hasattr(self, "_raiden_ws") and self._raiden_ws is not None:
             return True
 
@@ -232,7 +348,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = 12000 + rank_val
+        # Let the OS pick the control listener port, as the trainer side does. ``rank`` is the rank inside this
+        # replica, so a fixed ``12000 + rank`` collides as soon as two replicas share a host. The port actually
+        # bound is read back from the synchronizer and registered with the controller below.
+        listener_port = 0
 
         # 1. Fetch RaidenController address and un-fused global shapes from TPUWeightRegistry
         from verl.checkpoint_engine.tpu_weight_registry import get_tpu_weight_registry
@@ -278,38 +397,74 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         # every sync. Unfused tensors (o_proj, down_proj, norms, embed_tokens, lm_head) could bind the vLLM
         # parameter buffers directly; fused qkv_proj / gate_up_proj and transposed (_tpu_weight_flipped)
         # weights need tpu_sync to write into a slice or layout of the target tensor.
-        from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling, raiden_is_tile_aligned
-
         ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
+        KV_PROJ_SUFFIXES = (".self_attn.k_proj.weight", ".self_attn.v_proj.weight")
+
+        # GQA with tp_size > num_kv_heads: vLLM replicates each KV head on tp_size // num_kv_heads ranks, so a
+        # dim-0 split over tp would cut heads apart. Register k/v as one slice per KV head and pass this rank's
+        # head via global_shard_indices (ranks sharing a head receive the same slice).
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
+        kv_head_idx = get_tensor_model_parallel_rank() // (tp_size // num_kv_heads) if num_kv_heads < tp_size else None
+
+        # vLLM's own parameters, to spot weights it keeps whole on every rank (e.g. the MoE router mlp.gate, a
+        # ReplicatedLinear) and the fused MoE expert modules (whose EP rank must equal this TP rank).
+        tp_rank = get_tensor_model_parallel_rank()
+        model_sd = vllm_model.state_dict() if hasattr(vllm_model, "state_dict") else vllm_model.model.state_dict()
+        module_dict = dict(vllm_model.named_modules()) if hasattr(vllm_model, "named_modules") else {}
+        self._raiden_moe_layers = {}
 
         staging_tensors = {}
         variable_protos = []
         valid_params = []
-        skip_tiling_plan = []
+        replicas = {}
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
             spec_axes = [""] * len(g_shape)
             local_shape = list(g_shape)
+            tp_axis_size = tp_size  # number of slices along the "tp" mesh axis
+            global_shard_indices = []  # empty = tpu-sync derives this rank's slice from the mesh geometry
+            moe_prefix = _raiden_expert_stack_prefix(name)
+            vllm_key = _raiden_resolve_name(name, model_sd) if moe_prefix is None else None
+            vllm_shape = list(model_sd[vllm_key].shape) if vllm_key is not None else None
 
-            if len(g_shape) == 2:
-                if any(name.endswith(s) for s in ROW_PARALLEL_SUFFIXES):
+            if moe_prefix is not None:
+                # Folded expert stack [E * rows, cols]: under linear expert parallelism over the TP group this
+                # rank owns experts [r * E / tp, (r + 1) * E / tp), a plain dim-0 block of whole experts.
+                self._raiden_register_moe_stack(module_dict, moe_prefix, name, g_shape, tp_size, tp_rank)
+                spec_axes = ["tp", ""]
+                local_shape[0] = g_shape[0] // tp_size
+            elif len(g_shape) == 2:
+                if tp_size > 1 and vllm_shape is not None and vllm_shape in (g_shape, g_shape[::-1]):
+                    # vLLM keeps this weight whole on every rank (e.g. the MoE router): receive it replicated.
+                    pass
+                elif any(name.endswith(s) for s in ROW_PARALLEL_SUFFIXES):
                     # Row parallel: partition input dimension (dim 1) across TP ranks
                     spec_axes = ["", "tp"]
                     local_shape[1] = g_shape[1] // tp_size
+                elif kv_head_idx is not None and name.endswith(KV_PROJ_SUFFIXES):
+                    # GQA with tp_size > num_kv_heads (see above): one slice per KV head; this rank holds head
+                    # kv_head_idx, e.g. Qwen3-32B TP32: k_proj [1024, 5120] -> mesh [8, 1], rank 13 -> slice 3.
+                    spec_axes = ["tp", ""]
+                    tp_axis_size = num_kv_heads
+                    local_shape[0] = g_shape[0] // num_kv_heads
+                    global_shard_indices = [kv_head_idx]
                 elif g_shape[0] % tp_size == 0:
                     # Column parallel or vocab parallel: partition output dimension (dim 0) across TP ranks
                     spec_axes = ["tp", ""]
                     local_shape[0] = g_shape[0] // tp_size
 
-            sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            sharding_mesh = [tp_axis_size if axis == "tp" else 1 for axis in spec_axes]
+            # Number of TP ranks holding this same slice: 1 for a plain split, tp_size // num_kv_heads for GQA k/v,
+            # tp_size for unsharded tensors (norms). The norm parity check divides by it when summing over ranks.
+            replicas[name] = tp_size // int(np.prod(sharding_mesh))
 
             # Allocate local TPU staging buffer with matching layout
             t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device("tpu"))
             staging_tensors[name] = t
             valid_params.append((name, t))
-            # Tile-aligned local shards can skip the CPU (de)tiling pass and DMA straight to HBM.
-            skip_tiling_plan.append(raiden_is_tile_aligned(local_shape))
 
             variable_protos.append(
                 raiden_service_pb2.VariableMetadataProto(
@@ -320,11 +475,13 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                     item_size=t.element_size(),
                     layer_idx=idx,
                     sharding_spec=spec_axes,
+                    global_shard_indices=global_shard_indices,
                 )
             )
 
         self._raiden_staging = staging_tensors
         self._sorted_vllm_params = valid_params
+        self._raiden_replicas = replicas
 
         try:
             from torch_tpu._internal import sync as torch_tpu_sync
@@ -347,14 +504,17 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             bind_ip=bind_ip,
         )
 
-        self._skip_tiling_plan = skip_tiling_plan
-        apply_raiden_skip_tiling(self._raiden_ws, skip_tiling_plan)
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # SOURCE and destination slices together, and delivered to this listener with the transfer. Setting it here
+        # from the local shape alone made the two sides disagree whenever a trainer shard was not 8-row aligned
+        # (e.g. Qwen3's embedding at 32+ FSDP ranks): the sender de-tiled to row-major and h2d() copied those bytes
+        # raw into tiled HBM, permuting the weights while leaving every norm unchanged.
 
         try:
             from tpu_sync.rpc import raiden_controller
 
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],
@@ -376,14 +536,64 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         return True
 
+    def _raiden_register_moe_stack(
+        self, module_dict: dict, prefix: str, name: str, g_shape: list, tp_size: int, tp_rank: int
+    ) -> None:
+        """Check that folded expert stack ``name`` can be received as a dim-0 shard and record its vLLM module.
+
+        Supported: vLLM fused MoE (RoutedExperts) with linear expert parallelism over the whole TP group
+        (``enable_expert_parallel`` with expert_parallel_size == tensor_parallel_size), unquantized, silu-style
+        activation (no swigluoai interleave), no expert bias. Anything else fails closed here, at the first sync.
+        Without EP, each rank holds an intermediate-dim slice of every expert, which a 2-D folded stack cannot
+        express (it needs a 3-D variable split on the intermediate dim).
+        """
+        key, experts = _raiden_routed_experts(module_dict, prefix)
+        if experts is None:
+            raise RuntimeError(f"Raiden Sampler: no vLLM fused-MoE module (w13_weight / w2_weight) for {name}")
+        moe_cfg = getattr(experts, "moe_config", None)
+        num_experts = int(getattr(experts, "global_num_experts", 0) or 0)
+        num_local = int(getattr(experts, "local_num_experts", 0) or 0)
+        use_ep = bool(getattr(experts, "use_ep", False))
+        ep_size = int(getattr(moe_cfg, "ep_size", 0) or 0)
+        ep_rank = int(getattr(moe_cfg, "ep_rank", -1))
+        placement = getattr(experts, "expert_placement_strategy", "linear")
+        if not (
+            use_ep
+            and ep_size == tp_size
+            and ep_rank == tp_rank
+            and placement == "linear"
+            and num_experts > 0
+            and num_experts % tp_size == 0
+            and num_local * tp_size == num_experts
+            and g_shape[0] % num_experts == 0
+        ):
+            raise NotImplementedError(
+                f"Raiden MoE weight sync needs linear expert parallelism over the whole TP group "
+                f"(enable_expert_parallel, expert_parallel_size == tensor_parallel_size == {tp_size}); {key} has "
+                f"use_ep={use_ep}, ep_size={ep_size}, ep_rank={ep_rank} (tp_rank={tp_rank}), placement={placement}, "
+                f"local/global experts={num_local}/{num_experts}, received {name} {g_shape}"
+            )
+        activation = str(getattr(experts, "activation", "")).lower()
+        if "swigluoai" in activation or getattr(moe_cfg, "has_bias", False):
+            raise NotImplementedError(f"Raiden MoE: {key} uses activation={activation} / expert bias, not supported")
+        w13, w2 = experts.w13_weight, experts.w2_weight
+        if w13.ndim != 3 or w2.ndim != 3 or int(w13.shape[0]) != num_local or int(w2.shape[0]) != num_local:
+            raise RuntimeError(f"Raiden MoE: unexpected {key} w13 {tuple(w13.shape)} / w2 {tuple(w2.shape)}")
+        self._raiden_moe_layers[prefix] = key
+
     @torch.no_grad()
-    def install_raiden_weights(self) -> dict[str, float]:
+    def install_raiden_weights(self, exact_parity: bool = False) -> dict:
         """Install received weights from host staging buffer into TPU HBM via zero-copy H2D DMA
         and fuse/transpose them directly into vLLM model parameters.
 
+        Args:
+            exact_parity: Set by RaidenParityCheck on the step-0 sync: compare every received tensor bit for bit
+                with the vLLM parameter it overwrites.
+
         Returns:
             Per-worker timings in seconds: ``total`` (whole install), ``h2d`` (pure ``_raiden_ws.h2d()``)
-            and ``sync`` (final TPU sync barrier). Empty if the synchronizer is not initialized.
+            and ``sync`` (final TPU sync barrier), plus ``exact_parity`` (this rank's
+            ``RaidenParityCheck.exact_result``) when requested. Empty if the synchronizer is not initialized.
         """
         if not hasattr(self, "_raiden_ws") or self._raiden_ws is None:
             logging.getLogger(__name__).warning(
@@ -393,11 +603,6 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
-        # Re-apply the skip_tiling plan right before H2D: the network listener overwrites it with its default.
-        if getattr(self, "_skip_tiling_plan", None):
-            from verl.checkpoint_engine.raiden_checkpoint_engine import apply_raiden_skip_tiling
-
-            apply_raiden_skip_tiling(self._raiden_ws, self._skip_tiling_plan)
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
@@ -446,6 +651,41 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         ]
 
         consumed_staging = set()
+        parity = None
+        if exact_parity:
+            from verl.checkpoint_engine.raiden_checkpoint_engine import RaidenParityCheck
+
+            parity = RaidenParityCheck("exact")
+        # vLLM state_dict keys written by this install; checked against the model's parameters at the end.
+        written_keys = set()
+        rank_id = getattr(self, "rank", 0)
+
+        # 0. Fused MoE experts: unfold this rank's whole-expert blocks into vLLM's w13_weight / w2_weight
+        for prefix, mod_key in (getattr(self, "_raiden_moe_layers", None) or {}).items():
+            experts = module_dict[mod_key]
+            src_keys = [prefix + s for s in _RAIDEN_EXPERT_SUFFIXES]
+            gate, up, down = (self._raiden_staging[k] for k in src_keys)
+            w13, w2 = experts.w13_weight, experts.w2_weight
+            n_local, hidden = int(w13.shape[0]), int(w13.shape[1])
+            inter = int(gate.shape[0]) // n_local
+            new13, new2 = _raiden_fused_expert_weights(
+                gate.view(n_local, inter, hidden),
+                up.view(n_local, inter, hidden),
+                down.view(n_local, hidden, inter),
+                half=int(w13.shape[-1]) // 2,
+            )
+            if new13.shape != w13.shape or new2.shape != w2.shape:
+                raise RuntimeError(
+                    f"Raiden MoE: {mod_key} built w13 {tuple(new13.shape)} / w2 {tuple(new2.shape)} from {prefix}, "
+                    f"vLLM has {tuple(w13.shape)} / {tuple(w2.shape)}"
+                )
+            if parity:
+                parity.check_exact(f"{mod_key}.w13_weight", w13, new13)
+                parity.check_exact(f"{mod_key}.w2_weight", w2, new2)
+            w13.copy_(new13)
+            w2.copy_(new2)
+            written_keys.update((f"{mod_key}.w13_weight", f"{mod_key}.w2_weight"))
+            consumed_staging.update(src_keys)
 
         # 1. Handle fused projections (QKV and Gate-Up)
         for target_suffix, src_suffixes in FUSED_MAP:
@@ -466,10 +706,14 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                             parts = [self._raiden_staging[sk] for sk in layer_src_keys]
                             fused = torch.cat(parts, dim=0)
                             fused_adapted = to_target_layout(fused, target_local, is_flipped)
+                            if parity:
+                                parity.check_exact(resolved_key, target_local, fused_adapted)
                             target_local.copy_(fused_adapted)
+                            written_keys.add(resolved_key)
                             consumed_staging.update(layer_src_keys)
 
         # 2. Handle all remaining non-fused parameters (o_proj, down_proj, layernorms, embeddings)
+        unresolved = []
         for name, src_t in self._raiden_staging.items():
             if name in consumed_staging:
                 continue
@@ -480,7 +724,12 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
                 parent_mod = get_parent_mod(resolved_key)
                 is_flipped = bool(getattr(parent_mod, "_tpu_weight_flipped", False))
                 adapted = to_target_layout(src_t, target_local, is_flipped)
+                if parity:
+                    parity.check_exact(resolved_key, target_local, adapted)
                 target_local.copy_(adapted)
+                written_keys.add(resolved_key)
+            else:
+                unresolved.append(name)
 
         # 3. Handle tied word embeddings. Only when the trainer did not send lm_head itself: for untied
         #    models (e.g. Qwen3-8B / 32B) the received lm_head must not be overwritten by embed_tokens.
@@ -497,6 +746,20 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         elif hasattr(vllm_model, "lm_head") and hasattr(vllm_model, "embed_tokens"):
             if vllm_model.lm_head.weight.data_ptr() != vllm_model.embed_tokens.weight.data_ptr():
                 vllm_model.lm_head.weight.copy_(vllm_model.embed_tokens.weight)
+        if not received_lm_head and hasattr(vllm_model, "lm_head"):
+            written_keys.add(resolve_model_key("lm_head.weight") or "lm_head.weight")
+
+        # 4. Every vLLM parameter must have been written: one the trainer never sent would silently keep its
+        #    initial (HF checkpoint) value for the whole run while the trainer's copy moves on.
+        missing = [n for n, _ in vllm_model.named_parameters() if n not in written_keys]
+        if missing:
+            msg = (
+                f"Raiden Sampler Rank {rank_id}: {len(missing)} of the vLLM model's parameters received no weights "
+                f"and keep their initial values: {missing[:8]}"
+            )
+            if os.environ.get("VERL_RAIDEN_ALLOW_MISSING", "0") != "1":
+                raise RuntimeError(msg + " (set VERL_RAIDEN_ALLOW_MISSING=1 to only warn)")
+            logging.getLogger(__name__).warning(msg)
 
         t_sync_start = time.perf_counter()
         try:
@@ -518,7 +781,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
             f"(H2D={t_h2d:.4f}s, TPUSyncBarrier={t_sync:.4f}s)"
         )
         # Returned through collective_rpc so the orchestrator can log them as step metrics.
-        return {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        result = {"total": t_total, "h2d": t_h2d, "sync": t_sync}
+        if parity:
+            result["exact_parity"] = parity.exact_result(getattr(self, "rank", 0), unresolved)
+        return result
 
     def get_model_weights_stats(self, include_shards: bool = False) -> dict:
         """Computes deterministic parameter count, L1 norm, and L2 norm across all model parameters.
@@ -540,6 +806,10 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
 
         res = compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = rank_val
+        replicas = getattr(self, "_raiden_replicas", {})
+        for name, stats in res["per_tensor"].items():
+            if name in replicas:
+                stats["replicas"] = replicas[name]
 
         return res
 
@@ -907,6 +1177,9 @@ def patch_vllm_for_tpu() -> None:
                     value = existing
             elif key == "LIBTPU_INIT_ARGS":
                 value = value.replace("--deepsea_chip_config_name=megachip_tccontrol", "")
+                if "--slicebuilder_use_insecure_grpc" not in value:
+                    insecure_flag = "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                    value = f"{value} {insecure_flag}".strip()
             original_driver_environ_setitem(self, key, value)
 
         os.environ.__class__.__setitem__ = patched_driver_environ_setitem
@@ -928,6 +1201,12 @@ def patch_vllm_for_tpu() -> None:
 
             def patched_initialize_ray_cluster(parallel_config, *args, **kwargs):
                 if parallel_config.placement_group is None:
+                    pinned_pg = _create_pinned_tpu_placement_group(
+                        parallel_config, ray_address=kwargs.get("ray_address") or (args[0] if args else None)
+                    )
+                    if pinned_pg is not None:
+                        parallel_config.placement_group = pinned_pg
+                if parallel_config.placement_group is None:
                     curr_pg = ray.util.get_current_placement_group()
                     if curr_pg is None:
                         pg_name = os.environ.get("VERL_ROLLOUT_PG_NAME")
@@ -939,6 +1218,9 @@ def patch_vllm_for_tpu() -> None:
                         if curr_pg is None:
                             try:
                                 pgs = ray.util.placement_group_table()
+                                replica_rank = os.environ.get("VERL_REPLICA_RANK")
+                                replica_prefix = f"rollout_pool_{replica_rank}" if replica_rank is not None else None
+                                fallback_pg = None
                                 for pg_id, pg_info in pgs.items():
                                     state = (
                                         pg_info.get("state")
@@ -962,10 +1244,15 @@ def patch_vllm_for_tpu() -> None:
                                             if candidate_pg is not None:
                                                 num_bundles = len(getattr(candidate_pg, "bundle_specs", []))
                                                 if num_bundles >= parallel_config.world_size:
-                                                    curr_pg = candidate_pg
-                                                    break
+                                                    if replica_prefix and replica_prefix in str(name):
+                                                        curr_pg = candidate_pg
+                                                        break
+                                                    if fallback_pg is None:
+                                                        fallback_pg = candidate_pg
                                         except Exception:
                                             pass
+                                if curr_pg is None:
+                                    curr_pg = fallback_pg
                             except Exception:
                                 pass
                     parallel_config.placement_group = curr_pg
@@ -1063,6 +1350,16 @@ def patch_vllm_for_tpu() -> None:
 
         def patched_init_worker(self, *args, **kwargs):
             patch_vllm_for_tpu()
+            from verl.utils.vllm.tpu_vllm_patch import (
+                patch_tpu_attention_fp32_stats,
+                patch_tpu_rms_norm,
+                patch_tpu_silu_and_mul,
+            )
+
+            # Worker environment variables arrive after the wrapper is constructed.
+            patch_tpu_attention_fp32_stats()
+            patch_tpu_silu_and_mul()
+            patch_tpu_rms_norm()
             if "vllm.utils.import_utils" not in sys.modules:
                 sys.modules["vllm.utils.import_utils"] = types.ModuleType("import_utils")
             sys.modules["vllm.utils.import_utils"].init_cached_hf_modules = lambda: None
@@ -1276,6 +1573,9 @@ def patch_vllm_for_tpu() -> None:
                 for name in env_vars_to_copy_list:
                     if name in os.environ:
                         args[name] = os.environ[name]
+                for name in ("VERL_TPU_VLLM_ATTN_FP32_STATS", "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"):
+                    if name in os.environ:
+                        args[name] = os.environ[name]
                 logger.debug(f"RayDistributedExecutor | Worker {i} environment variables before patch: {args}")
 
             self._env_vars_for_all_workers = all_args_to_update_environment_variables
@@ -1303,6 +1603,11 @@ def patch_vllm_for_tpu() -> None:
                     args["TORCH_TPU_TOPOLOGY"] = topology
                     args["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = sb_addresses_str
                     args["TPU_PROCESS_ADDRESSES"] = sb_addresses_str
+                    libtpu_args = args.get("LIBTPU_INIT_ARGS", os.environ.get("LIBTPU_INIT_ARGS", ""))
+                    if "--slicebuilder_use_insecure_grpc" not in libtpu_args:
+                        insecure_flag = "--slicebuilder_use_insecure_grpc=true --undefok=slicebuilder_use_insecure_grpc"
+                        libtpu_args = f"{libtpu_args} {insecure_flag}".strip()
+                    args["LIBTPU_INIT_ARGS"] = libtpu_args
                     if total_chips > 4 or num_nodes > 1:
                         args["TPU_MULTIHOST_BACKEND"] = "ray"
 
@@ -1528,6 +1833,8 @@ async def get_tpu_server_launch_config(workers):
                         # crash (b/501165531). See apply_tpu_vllm_patches().
                         "VLLM_DISABLE_COMPILE_CACHE",
                         "VERL_PLATFORM",
+                        "VERL_TPU_VLLM_ATTN_FP32_STATS",
+                        "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER",
                         "XLA_FLAGS",
                     )
                 }
@@ -1734,13 +2041,11 @@ async def launch_tpu_vllm_servers(replica) -> None:
     if replica.config.data_parallel_size > 1:
         raise NotImplementedError(
             "actor_rollout_ref.rollout.data_parallel_size="
-            f"{replica.config.data_parallel_size} is not supported on TPU. The TPU "
-            "distributed runtime requires each compiled program to span the whole "
-            "TPU mesh, but a single DP group only spans "
-            f"tensor_model_parallel_size={replica.config.tensor_model_parallel_size} "
-            "chips. Set actor_rollout_ref.rollout.data_parallel_size=1 instead: verl "
-            "then creates one rollout replica per tensor_model_parallel_size chips, "
-            "which is equivalent to engine-internal data parallelism."
+            f"{replica.config.data_parallel_size} inside a single TPU replica is not supported. The TPU "
+            "distributed runtime requires each compiled program to span the whole TPU mesh, but a single DP "
+            f"group only spans tensor_model_parallel_size={replica.config.tensor_model_parallel_size} chips. "
+            "LLMServerManager turns data_parallel_size into that many TPU replicas; create replicas through it "
+            "or pass data_parallel_size=1 per replica."
         )
 
     await report_stale_tpu_engines(replica.workers)
@@ -1763,6 +2068,26 @@ async def launch_tpu_vllm_servers(replica) -> None:
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
+    for name in ("VERL_TPU_VLLM_ATTN_FP32_STATS", "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"):
+        if name in os.environ:
+            env_vars[name] = os.environ[name]
+    resource_pool = getattr(replica, "resource_pool", None)
+    if resource_pool is not None and getattr(resource_pool, "pgs", None):
+        try:
+            pg_info = ray._private.state.state.placement_group_table(resource_pool.pgs[0].id)
+            if pg_info and pg_info.get("name"):
+                env_vars["VERL_ROLLOUT_PG_NAME"] = str(pg_info["name"])
+        except Exception:
+            pass
+    planned_hosts = getattr(resource_pool, "tpu_hosts", None)
+    if planned_hosts:
+        # The engine's Ray executor pins its TPU workers to these hosts (see _create_pinned_tpu_placement_group).
+        env_vars[VERL_TPU_ROLLOUT_HOSTS_ENV] = ",".join(planned_hosts)
+        env_vars[VERL_TPU_CHIPS_PER_HOST_ENV] = str(replica.gpus_per_replica_node)
+        _tpu_preflight_log(
+            f"replica {replica.replica_rank}: slice {resource_pool.accelerator_type}, hosts {planned_hosts}",
+            tag="TPU placement",
+        )
 
     flags_to_copy = set()
     for flag_var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
@@ -1776,6 +2101,12 @@ async def launch_tpu_vllm_servers(replica) -> None:
         if resolved:
             env_vars[flag_var] = resolved
             flags_to_copy.add(flag_var)
+
+    # Raiden switches read inside the vLLM workers (VERL_RAIDEN_ALLOW_MISSING in install_raiden_weights): vLLM's
+    # Ray workers do not inherit the job env.
+    for raiden_var in (k for k in os.environ if k.startswith("VERL_RAIDEN_")):
+        env_vars[raiden_var] = os.environ[raiden_var]
+        flags_to_copy.add(raiden_var)
 
     if flags_to_copy:
         copy_var = "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"
