@@ -312,3 +312,20 @@ def test_cancelled_request_releases_barrier_and_aborts_in_engine():
         assert server._admitting == 0
 
     asyncio.run(main())
+
+
+def test_abort_reports_timing_and_forwards_reset_prefix_cache():
+    async def main():
+        server = _make_server()
+        kwargs_seen = []
+
+        async def pause_generation(**kwargs):
+            kwargs_seen.append(kwargs)
+
+        server.engine.pause_generation = pause_generation
+        result = await server.abort_all_requests(reset_prefix_cache=False)
+
+        assert kwargs_seen == [{"wait_for_inflight_requests": False, "clear_cache": False}]
+        assert result["barrier_s"] >= 0 and result["pause_s"] >= 0
+
+    asyncio.run(main())
