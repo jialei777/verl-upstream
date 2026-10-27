@@ -88,7 +88,11 @@ ENABLE_THINKING="${ENABLE_THINKING:-False}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
+# Known issue: with Qwen3.5 (GatedDeltaNet) on vllm-torchtpu (per-layer KV caches, see above), rollouts get corrupted
+# when vLLM decodes more than ~128 sequences at once. Responses pick up tokens from other requests, and the
+# trainer / rollout log-prob gap (actor/rollout_corr/log_ppl_diff) jumps from ~1e-3 to 0.02-1.1. Up to 128 is
+# clean; further requests just queue. Keep this at 128 or below until the vllm-torchtpu bug is fixed.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
 
 # Rollout & training overlap settings
