@@ -13,7 +13,8 @@ export VERL_USE_EXTERNAL_MODULES=verl_hardware_plugin
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
+# PROMOTE_F32 promotes sigmoid/SiLU/GELU to f32 (instead of bf16) on TPU 7x, for RL stability; a no-op on v6e.
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
 
 project_name="${PROJECT_NAME:-verl_tpu_grpo}"
 exp_name="${EXPERIMENT_NAME:-qwen3_0.6b_fast_smoke_test}"
