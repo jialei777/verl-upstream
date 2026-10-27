@@ -1284,18 +1284,21 @@ class vLLMHttpServer:
                 if output is STREAM_FINISHED:
                     continue
                 final_res = output
-        except BaseException as e:
+        except (asyncio.CancelledError, Exception) as e:
             # Client disconnected or the request failed mid-flight: drop it from the engine like
-            # AsyncLLM.generate() does, so no orphaned request is left in the scheduler.
+            # AsyncLLM.generate() does, so no orphaned request is left in the scheduler. The collector
+            # holds vLLM's internal request id, which may differ from the caller's request_id.
             if queue is not None and not isinstance(e, EngineDeadError):
                 try:
-                    await self.engine.abort(request_id)
+                    await self.engine.abort(queue.request_id, internal=True)
                 except Exception:
                     logger.debug("failed to abort request %s after %s", request_id, type(e).__name__, exc_info=True)
             raise
         finally:
             if not admitted:
                 self._admitting -= 1
+            if queue is not None:
+                queue.close()
         return final_res
 
     async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:

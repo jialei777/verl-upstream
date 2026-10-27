@@ -56,6 +56,7 @@ class _FakeEngine:
         self.reset_prefix_calls = 0
         self.outputs = []
         self.sampling_params = []
+        self.closed = 0
 
     async def add_request(self, request_id, prompt, params, lora_request=None, priority=0, data_parallel_rank=None):
         """Like AsyncLLM.add_request(): returns a collector that yields ``outputs``, the last one finished."""
@@ -64,12 +65,17 @@ class _FakeEngine:
         for i, output in enumerate(pending):
             output.finished = i == len(pending) - 1
 
+        engine = self
+
         class _Collector:
             def get_nowait(self_inner):
                 return pending.pop(0) if pending else None
 
             async def get(self_inner):
                 return pending.pop(0)
+
+            def close(self_inner):
+                engine.closed += 1
 
         return _Collector()
 
@@ -366,6 +372,7 @@ def test_default_request_hooks_leave_generate_output_unchanged(monkeypatch):
         assert server.engine.sampling_params[0].logprob_token_ids is None
         assert output.token_ids == [5, 9] and output.stop_reason == "completed"
         assert output.extra_fields == {"global_steps": 7, "num_cached_tokens": 0}
+        assert server.engine.closed == 1
         assert server._admitting == 0
 
     asyncio.run(main())
@@ -383,13 +390,19 @@ class _QueuedEngine(_FakeEngine):
         super().__init__()
         self.queues: dict[str, asyncio.Queue] = {}
         self.aborted: list[str] = []
+        self.engine_aborts: list[tuple[str, bool]] = []
 
     async def add_request(self, request_id, prompt, params, **kwargs):
         q = asyncio.Queue()
         self.queues[request_id] = q
         self.output_processor.request_states[request_id] = object()
 
+        engine = self
+        internal_id = f"{request_id}-internal"  # vLLM's internal request id, which differs from the caller's
+
         class _Collector:
+            request_id = internal_id
+
             def get_nowait(self_inner):
                 try:
                     return q.get_nowait()
@@ -398,6 +411,9 @@ class _QueuedEngine(_FakeEngine):
 
             async def get(self_inner):
                 return await q.get()
+
+            def close(self_inner):
+                engine.closed += 1
 
         return _Collector()
 
@@ -409,8 +425,8 @@ class _QueuedEngine(_FakeEngine):
             q.put_nowait(SimpleNamespace(finished=True, outputs=[]))
         self.output_processor.request_states.clear()
 
-    async def abort(self, request_id):
-        self.aborted.append(request_id)
+    async def abort(self, request_id, internal=False):
+        self.engine_aborts.append((request_id, internal))
 
 
 def _make_queued_server():
@@ -451,6 +467,8 @@ def test_abort_is_not_blocked_by_requests_waiting_for_their_first_token():
         results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
         assert all(r.finished and r.outputs == [] for r in results), "aborted requests return empty"
         assert sorted(server.engine.aborted) == sorted(f"r{i}" for i in range(8))
+        # Requests that finish normally close their collectors and are not aborted again.
+        assert server.engine.closed == 8 and server.engine.engine_aborts == []
         assert server._admitting == 0
 
     asyncio.run(main())
@@ -518,7 +536,9 @@ def test_cancelled_request_releases_barrier_and_aborts_in_engine():
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        assert server.engine.aborted == ["r1"], "cancellation must drop the request from the engine"
+        # Aborted by vLLM's internal id, as AsyncLLM.generate() does, and the collector is closed.
+        assert server.engine.engine_aborts == [("r1-internal", True)], "cancellation must drop the request"
+        assert server.engine.closed == 1
         assert server._admitting == 0
 
     asyncio.run(main())
