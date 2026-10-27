@@ -48,7 +48,10 @@ MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
 # data.apply_chat_template_kwargs. Off by default: with thinking on, 26-44% of responses hit MAX_RESPONSE_LEN=1024
 # before writing the "#### <answer>" line that the strict GSM8K reward needs, so they score 0.
 ENABLE_THINKING="${ENABLE_THINKING:-False}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
+# vLLM sequences decoded concurrently on the rollout replica. Each step sends 32 prompts x 8 = 256 requests; at 32
+# most of them queue and the rollout (~1.2k tok/s on v5p 2x2x4) bounds the step. 128 roughly doubles rollout
+# throughput (~2.4k tok/s) at a lower per-sequence decode rate.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-3}"
 # Weight sync backend: raiden (P2P, as in the 4B/8B recipes) or tpu (gather to rank 0 + Ray object store).
 CHECKPOINT_BACKEND="${CHECKPOINT_BACKEND:-raiden}"

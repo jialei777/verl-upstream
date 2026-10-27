@@ -984,18 +984,59 @@ def _sampler_job_name(replica_idx: int, num_replicas: int) -> str:
     return "sampler" if num_replicas == 1 else f"sampler{replica_idx}"
 
 
+def _keep_prefix_cache_on_sync(manager) -> bool:
+    """Whether ``engine_kwargs.raiden.keep_prefix_cache_on_sync`` asks to keep the rollout prefix cache.
+
+    By default a weight sync clears every replica's prefix cache, so no request reuses KV computed with the old
+    weights. Keeping it lets requests resumed after the sync (partial rollout) and new requests that share a
+    prompt prefix skip that part of the prefill, at the cost of attending to KV from the previous weights.
+    """
+    engine_kwargs = getattr(getattr(manager, "config", None), "engine_kwargs", None) or {}
+    return bool((engine_kwargs.get("raiden") or {}).get("keep_prefix_cache_on_sync", False))
+
+
+async def _abort_replicas_for_sync(manager, global_steps: Optional[int]) -> tuple[float, dict]:
+    """Abort in-flight and queued rollout requests before the samplers take part in a sync; returns (s, stats).
+
+    Aborted requests are retried by the client with their partial output as the new prompt (partial rollout),
+    so nothing is waited for: running and queued requests are both cut immediately. Skipped for the initial
+    sync (``global_steps`` 0/None), when no generation is running yet.
+    """
+    t_start = time.perf_counter()
+    stats: dict = {}
+    if global_steps and global_steps > 0:
+        keep_cache = _keep_prefix_cache_on_sync(manager)
+        # Call the replicas directly rather than CheckpointEngineManager.abort_replicas(): Raiden drives vLLM
+        # replicas, whose abort_all_requests() takes reset_prefix_cache and returns the per-server results.
+        kwargs = {"reset_prefix_cache": False} if keep_cache else {}
+        try:
+            results = await asyncio.gather(*[r.abort_all_requests(**kwargs) for r in manager.replicas])
+        except Exception as e:
+            logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
+            results = None
+        # vLLM replicas return {"aborted_count", "server_results": [{..., "barrier_s", "pause_s"}]} per replica.
+        server_results = [
+            r
+            for replica_result in results or []
+            if isinstance(replica_result, dict)
+            for r in replica_result.get("server_results") or [replica_result]
+            if isinstance(r, dict) and "barrier_s" in r
+        ]
+        if server_results:
+            stats = {
+                "aborted": sum(r.get("aborted_count", 0) for r in server_results),
+                "barrier_s": round(max(r["barrier_s"] for r in server_results), 4),
+                "pause_s": round(max(r["pause_s"] for r in server_results), 4),
+                "keep_prefix_cache": keep_cache,
+            }
+    return time.perf_counter() - t_start, stats
+
+
 async def update_raiden_weights(
     manager,
     global_steps: Optional[int] = None,
 ) -> dict:
     """Orchestrator coordination for Raiden TPU P2P weight synchronization via central RaidenController."""
-    t_abort_start = time.perf_counter()
-    if global_steps and global_steps > 0:
-        try:
-            await manager.abort_replicas()
-        except Exception as e:
-            logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
-    t_abort = time.perf_counter() - t_abort_start
     parity = RaidenParityCheck.from_config(manager.config.engine_kwargs)
 
     t_total_start = time.perf_counter()
@@ -1005,10 +1046,14 @@ async def update_raiden_weights(
 
     # Blocks untill all Trainer ranks complete their send_weights, but do so asynchronously
     # in a background thread so we don't freeze the orchestrator's event loop.
+    # The trainer side only reads the trainer's own HBM, so the rollout replicas keep generating meanwhile and
+    # are paused only afterwards, right before the samplers take part in the transfer.
     actor_refs = manager.actor_wg.update_weights(global_steps=global_steps, mode="raiden")
     if actor_refs is not None:
         await asyncio.to_thread(ray.get, actor_refs)
     t_init_trainer = time.perf_counter() - t_init_trainer_start
+
+    t_abort, abort_stats = await _abort_replicas_for_sync(manager, global_steps)
 
     parallelism = 8
     if hasattr(manager, "config") and hasattr(manager.config, "engine_kwargs"):
@@ -1141,8 +1186,8 @@ async def update_raiden_weights(
 
     logger.info(
         f"[RAIDEN TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
-        f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s\n"
         f"  * Trainer Raiden Init    : {t_init_trainer:.4f}s\n"
+        f"  * Sampler Quiesce/Pause  : {t_abort:.4f}s ({abort_stats})\n"
         f"  * Sampler Raiden Init    : {t_init_sampler:.4f}s\n"
         f"  * Raiden Barrier Check   : {t_barrier:.4f}s\n"
         f"  * RaidenController P2P   : {t_transfer:.4f}s\n"
@@ -1155,7 +1200,8 @@ async def update_raiden_weights(
 
     # Surface the phase timers as step metrics. The trainer stashes this dict in _pending_sync_metrics and
     # merges it into the same step's metrics, so they are logged next to timing_s/update_weights by every
-    # configured backend (console / tensorboard / wandb). timing_s/update_weights ~= quiesce + total_sync.
+    # configured backend (console / tensorboard / wandb). timing_s/update_weights ~= total_sync (the quiesce
+    # now runs inside it, after the trainer init).
     metrics = {
         "timing_s/tpu-sync/quiesce": t_abort,
         "timing_s/tpu-sync/trainer_init": t_init_trainer,

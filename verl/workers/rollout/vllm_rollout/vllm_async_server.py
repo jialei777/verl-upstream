@@ -967,6 +967,7 @@ class vLLMHttpServer:
             dict[str, Any]: Dictionary containing:
                 - aborted_count: Number of requests aborted
                 - request_ids: List of aborted request IDs
+                - barrier_s / pause_s: Time spent in the submission-gate barrier and in pause_generation
         """
         # Only node rank 0 owns AsyncLLM/self.engine. The remaining actors in a
         # multi-node replica run vLLM's headless entry point, so there is no
@@ -981,7 +982,8 @@ class vLLMHttpServer:
             self._submission_paused = True
             self._rejecting = reject_request
             self._resume_event.clear()
-            deadline = time.monotonic() + _GATE_BARRIER_TIMEOUT_S
+            t_start = time.monotonic()
+            deadline = t_start + _GATE_BARRIER_TIMEOUT_S
             while self._admitting > 0:
                 if time.monotonic() > deadline:
                     logger.warning(
@@ -990,6 +992,7 @@ class vLLMHttpServer:
                     )
                     break
                 await asyncio.sleep(0.01)
+            t_barrier = time.monotonic() - t_start
 
             # Snapshot request IDs before pausing for reporting
             request_ids = list(self.engine.output_processor.request_states.keys())
@@ -1008,9 +1011,18 @@ class vLLMHttpServer:
                 wait_for_inflight_requests=False,
                 clear_cache=reset_prefix_cache,
             )
+            t_pause = time.monotonic() - t_start - t_barrier
 
-            logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
-            return {"aborted_count": len(request_ids), "request_ids": request_ids}
+            logger.info(
+                f"Aborted {len(request_ids)} requests in {t_barrier + t_pause:.3f}s (gate barrier {t_barrier:.3f}s, "
+                f"pause {t_pause:.3f}s, reset_prefix_cache={reset_prefix_cache}): {request_ids}"
+            )
+            return {
+                "aborted_count": len(request_ids),
+                "request_ids": request_ids,
+                "barrier_s": t_barrier,
+                "pause_s": t_pause,
+            }
 
         except Exception:
             # Weight updates must not proceed unless every in-flight request was
@@ -1503,18 +1515,23 @@ class vLLMReplica(RolloutReplica):
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
-    async def abort_all_requests(self, reject_request: bool = False) -> dict[str, Any]:
+    async def abort_all_requests(self, reject_request: bool = False, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.
 
         Args:
             reject_request: Fail requests arriving behind the closed gate instead of
                 parking them. See vLLMHttpServer.abort_all_requests().
+            reset_prefix_cache: Clear the prefix cache along with the pause. See
+                vLLMHttpServer.abort_all_requests().
 
         Returns:
             dict[str, Any]: Combined abort results from all servers.
         """
         results = await asyncio.gather(
-            *[server.abort_all_requests.remote(reject_request=reject_request) for server in self.servers]
+            *[
+                server.abort_all_requests.remote(reject_request=reject_request, reset_prefix_cache=reset_prefix_cache)
+                for server in self.servers
+            ]
         )
 
         total_aborted = sum(r.get("aborted_count", 0) for r in results)
