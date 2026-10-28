@@ -21,11 +21,11 @@ export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VERL_TPU_TIMELINE="${VERL_TPU_TIMELINE:-1}"
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
-# vllm-torchtpu's unified (attention-shaped) KV pool for GatedDeltaNet models fails to size Qwen3.5-35B-A3B's
-# full-attention pages ("pool page mismatch") at TP=8; use the per-layer KV caches (prefix caching is off).
-# vllm-torchtpu reads it from the environment of its engine workers: it goes to every Ray worker through
+# vllm-torchtpu's unified block pool aligns Qwen3.5's hybrid GatedDeltaNet + full-attention KV pages
+# (via update_block_size_for_backend after load_model in verl-hardware-plugin) and avoids the non-unified
+# compact-slot rollout corruption seen above ~128 concurrent sequences. It goes to every Ray worker through
 # ray_kwargs.ray_init.runtime_env.env_vars (see the overrides below).
-TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-0}"
+TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
 # PROMOTE_F32: TPU 7x otherwise evaluates bf16 sigmoid/SiLU/GELU chains natively in bf16 (v6e promotes them
 # to f32), which inflates the trainer / rollout logits mismatch. Internal XLA flag, pinned with the image's libtpu;
 # the same as the Qwen3 recipes (verl-project/verl#8301).
@@ -88,11 +88,7 @@ ENABLE_THINKING="${ENABLE_THINKING:-False}"
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))}"
-# Known issue: with Qwen3.5 (GatedDeltaNet) on vllm-torchtpu (per-layer KV caches, see above), rollouts get corrupted
-# when vLLM decodes more than ~128 sequences at once. Responses pick up tokens from other requests, and the
-# trainer / rollout log-prob gap (actor/rollout_corr/log_ppl_diff) jumps from ~1e-3 to 0.02-1.1. Up to 128 is
-# clean; further requests just queue. Keep this at 128 or below until the vllm-torchtpu bug is fixed.
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
 
 # Rollout & training overlap settings
