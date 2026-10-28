@@ -83,7 +83,6 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
 VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-128}"
 TEST_FREQ="${TEST_FREQ:-10}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
-ENABLE_THINKING="${ENABLE_THINKING:-False}"
 
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
@@ -126,7 +125,7 @@ python3 -m verl.trainer.main_ppo \
     +data.pad_mode=no_padding \
     data.dataloader_num_workers=0 \
     data.seed="${SEED}" \
-    +data.apply_chat_template_kwargs.enable_thinking="${ENABLE_THINKING}" \
+    +data.apply_chat_template_kwargs.enable_thinking=True \
     actor_rollout_ref.actor.strategy=torchtitan \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
