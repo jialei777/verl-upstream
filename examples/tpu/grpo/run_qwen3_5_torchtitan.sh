@@ -44,8 +44,8 @@ TEST_FILE="${TEST_FILE:-${RAY_DATA_HOME}/data/gsm8k/test.parquet}"
 LOG_ROOT="${LOG_ROOT:-/tmp/verl_dump/${exp_name}}"
 
 # TPU topology. N_CHIPS_* counts torch_tpu processes per host: 8 on v7x (4 chips x 2 TensorCores).
-# Default: a 2x2x2 trainer slice (2 hosts, 16 TensorCores) and a 2x2x1 rollout slice (1 host, 8 TensorCores).
-export NNODES_TRAINER="${NNODES_TRAINER:-2}"
+# Default: a 2x2x1 trainer slice (1 host, 8 TensorCores) and a 2x2x1 rollout slice (1 host, 8 TensorCores).
+export NNODES_TRAINER="${NNODES_TRAINER:-1}"
 export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-8}"
 export NNODES_ROLLOUT="${NNODES_ROLLOUT:-1}"
 export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-8}"
@@ -67,25 +67,26 @@ ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-${TOTAL_ROLLOUT_CH
 FUSE_QKV="${FUSE_QKV:-True}"
 
 # Training & validation settings
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
-PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 # Sequences per micro-batch, packed into one row (use_remove_padding=True): torchtitan's TPU GatedDeltaNet
-# restarts its causal conv1d and recurrent state at every sequence start (from the position ids). 4 runs out of
-# HBM on an 8-TensorCore trainer next to the 35B-A3B actor, Adam and reference states.
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
+# restarts its causal conv1d and recurrent state at every sequence start (from the position ids). With
+# 2560-token thinking sequences (512 prompt + 2048 response), 1 fits within HBM on an 8-TensorCore trainer
+# next to the 35B-A3B actor, Adam and reference states.
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 OPTIM_IMPL="${OPTIM_IMPL:-foreach}"
-ROLLOUT_N="${ROLLOUT_N:-8}"
+ROLLOUT_N="${ROLLOUT_N:-4}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-5}"
-TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-20}"
+TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-100}"
 
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-64}"
 VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-128}"
-TEST_FREQ="${TEST_FREQ:-10}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
+TEST_FREQ="${TEST_FREQ:-20}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-512}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-1024}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-2048}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
@@ -118,8 +119,8 @@ python3 -m verl.trainer.main_ppo \
     data.val_max_samples="${VAL_MAX_SAMPLES}" \
     data.max_prompt_length="${MAX_PROMPT_LEN}" \
     data.max_response_length="${MAX_RESPONSE_LEN}" \
-    +data.max_length=4096 \
-    +data.max_token_len_per_gpu=4096 \
+    +data.max_length=8192 \
+    +data.max_token_len_per_gpu=8192 \
     data.filter_overlong_prompts=True \
     data.truncation=error \
     +data.pad_mode=no_padding \
@@ -142,7 +143,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.decay_type=cosine \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.actor.data_loader_seed="${SEED}" \
     actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode \
     '+actor_rollout_ref.actor.policy_loss.rollout_correction=${algorithm.rollout_correction}' \
@@ -170,7 +171,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.pad_to_length=True \
     actor_rollout_ref.actor.torchtitan.pad_to_length_bucket="${PAD_TO_LENGTH_BUCKET}" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${MICRO_BATCH_SIZE}" \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.ref.torchtitan.seed="${SEED}" \
     actor_rollout_ref.ref.torchtitan.use_torch_compile=True \
     actor_rollout_ref.ref.torchtitan.max_seq_len="${MAX_MODEL_LEN}" \
@@ -192,7 +193,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.no_enable_prefix_caching=True \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.prompt_length="${MAX_PROMPT_LEN}" \
