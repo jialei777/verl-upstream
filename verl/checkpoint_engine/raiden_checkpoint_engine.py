@@ -325,6 +325,10 @@ def merge_rank_stats(rank_stats: dict) -> dict:
     }
 
 
+class RaidenParityError(RuntimeError):
+    """Raised when an enabled Raiden parity check finds wrong weights or cannot collect what it needs to verify."""
+
+
 class RaidenParityCheck:
     """Raiden weight-sync verification, selected by ``engine_kwargs.raiden.verify_parity``.
 
@@ -340,6 +344,10 @@ class RaidenParityCheck:
       changing sharding or upgrading tpu-sync / torch-tpu. Cost: ~0.4 s once per rank (Qwen3-32B, TP32).
 
     ``"all"`` enables both; ``False`` / ``"off"`` (default) neither.
+
+    An enabled check raises ``RaidenParityError`` when it finds a mismatch, and also when it cannot collect the stats
+    or results it needs (so a broken verification path never passes silently). The orchestrator runs the checks
+    before resuming generation, so a failing sync stops the run instead of serving wrong weights.
     """
 
     MODES = ("off", "norm", "exact", "all")
@@ -388,7 +396,11 @@ class RaidenParityCheck:
     @classmethod
     def report_exact(cls, global_steps: Optional[int], install_results: list) -> bool:
         """Log one summary of the per-rank ``exact_result`` dicts that every sampler worker returns under
-        ``install_raiden_weights(...)["exact_parity"]``."""
+        ``install_raiden_weights(...)["exact_parity"]``.
+
+        Returns True when every received tensor matches bit for bit. Raises ``RaidenParityError`` on any mismatched
+        or unresolved tensor, or when no sampler returned a result.
+        """
         results = [
             w["exact_parity"]
             for res in install_results
@@ -397,8 +409,7 @@ class RaidenParityCheck:
         ]
         step = global_steps or 0
         if not results:
-            logger.warning(f"[RAIDEN PARITY EXACT | Step {step}] no sampler returned a result")
-            return False
+            raise RaidenParityError(f"[RAIDEN PARITY EXACT | Step {step}] no sampler returned a result")
         results.sort(key=lambda r: r["rank"])
         num_mismatched = sum(r["num_mismatched"] for r in results)
         num_unresolved = sum(len(r["unresolved"]) for r in results)
@@ -413,8 +424,7 @@ class RaidenParityCheck:
         details = [f"  * rank {r['rank']}: {line}" for r in results for line in r["mismatched"]]
         details += [f"  * rank {r['rank']}: unresolved {r['unresolved'][:5]}" for r in results if r["unresolved"]]
         detail_text = "\n".join(details[: cls.MAX_DETAIL_LINES])
-        logger.error(f"{summary}\n{detail_text}")
-        return False
+        raise RaidenParityError(f"{summary}\n{detail_text}")
 
     # ---- exact check: sampler worker side ----
 
@@ -458,56 +468,60 @@ class RaidenParityCheck:
           - Ranks 1..N-1 accumulate only sharded tensors.
         The orchestrator can then perform verification in O(ranks) pure scalar arithmetic
         rather than O(tensors * ranks) loop aggregation.
+
+        Raises ``RaidenParityError`` on a norm mismatch, or when the trainer or any sampler replica did not provide
+        stats for this step.
         """
         step_key = global_steps if global_steps is not None else 0
         if step_key <= 0:
             return
 
-        try:
-            registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
-            num_trainer_ranks = manager.actor_wg.world_size
-            trainer_entry = None
-            for _ in range(25):
-                entry = await registry.get_stats.remote(step_key)
-                # Sharded export: every trainer rank posts partial stats, usable once all have arrived.
-                if entry is not None and ("ranks" not in entry or len(entry["ranks"]) >= num_trainer_ranks):
-                    trainer_entry = entry
-                    break
-                await asyncio.sleep(0.5)
+        registry = ray.get_actor("TPUWeightRegistry", namespace="verl")
+        num_trainer_ranks = manager.actor_wg.world_size
+        trainer_entry = None
+        for _ in range(25):
+            entry = await registry.get_stats.remote(step_key)
+            # Sharded export: every trainer rank posts partial stats, usable once all have arrived.
+            if entry is not None and ("ranks" not in entry or len(entry["ranks"]) >= num_trainer_ranks):
+                trainer_entry = entry
+                break
+            await asyncio.sleep(0.5)
+        if not trainer_entry:
+            raise RaidenParityError(f"[RAIDEN PARITY | Step {step_key}] no complete trainer stats in TPUWeightRegistry")
 
-            sampler_futures = [
-                replica.server_handle.collective_rpc.remote(
-                    method="get_model_weights_stats", kwargs={"include_shards": False}
+        sampler_futures = [
+            replica.server_handle.collective_rpc.remote(
+                method="get_model_weights_stats", kwargs={"include_shards": False}
+            )
+            for replica in manager.replicas
+        ]
+        sampler_entries = await asyncio.gather(*sampler_futures)
+        if not sampler_entries:
+            raise RaidenParityError(f"[RAIDEN PARITY | Step {step_key}] no sampler replica returned stats")
+
+        if "ranks" in trainer_entry:
+            trainer_master = merge_rank_stats(trainer_entry["ranks"])
+        else:
+            trainer_master = trainer_entry.get("master", trainer_entry)
+
+        # Every rollout replica holds a complete copy of the weights, so compare the trainer with each
+        # replica on its own: summing the workers of all replicas would count every tensor once per replica.
+        num_replicas = len(sampler_entries)
+        for replica_idx, res in enumerate(sampler_entries):
+            sampler_workers = [w for w in (res if isinstance(res, list | tuple) else [res]) if isinstance(w, dict)]
+            if not sampler_workers:
+                raise RaidenParityError(
+                    f"[RAIDEN PARITY | Step {step_key}] no sampler stats from replica {replica_idx}"
                 )
-                for replica in manager.replicas
-            ]
-            sampler_entries = await asyncio.gather(*sampler_futures)
-
-            if not trainer_entry or not sampler_entries:
-                logger.warning(f"[RAIDEN PARITY] Incomplete stats data for step {step_key}")
-                return
-
-            if "ranks" in trainer_entry:
-                trainer_master = merge_rank_stats(trainer_entry["ranks"])
-            else:
-                trainer_master = trainer_entry.get("master", trainer_entry)
-
-            # Every rollout replica holds a complete copy of the weights, so compare the trainer with each
-            # replica on its own: summing the workers of all replicas would count every tensor once per replica.
-            num_replicas = len(sampler_entries)
-            for replica_idx, res in enumerate(sampler_entries):
-                sampler_workers = [w for w in (res if isinstance(res, list | tuple) else [res]) if isinstance(w, dict)]
-                if not sampler_workers:
-                    logger.warning(f"[RAIDEN PARITY] No sampler stats from replica {replica_idx} for step {step_key}")
-                    continue
-                tag = f"Step {step_key}" + (f" | Replica {replica_idx}" if num_replicas > 1 else "")
-                self._compare_replica_norms(tag, trainer_master, sampler_workers)
-        except Exception as e:
-            logger.warning(f"Error during parity verification for step {step_key}: {e}")
+            tag = f"Step {step_key}" + (f" | Replica {replica_idx}" if num_replicas > 1 else "")
+            self._compare_replica_norms(tag, trainer_master, sampler_workers)
 
     @staticmethod
     def _compare_replica_norms(tag: str, trainer_master: dict, sampler_workers: list[dict]) -> bool:
-        """Compare the trainer's per-tensor norms with those of one replica's TP workers; log the verdict."""
+        """Compare the trainer's per-tensor norms with those of one replica's TP workers.
+
+        Logs and returns True on parity; raises ``RaidenParityError`` on any mismatch.
+        """
         trainer_per_tensor = trainer_master.get("per_tensor", {})
         # Gets master list of all model tensor names (e.g., "model.layers.0.self_attn.qkv_proj.weight").
         all_param_names = list(sampler_workers[0].get("per_tensor", {}).keys())
@@ -582,14 +596,13 @@ class RaidenParityCheck:
             )
             return True
         mismatches_summary = "\n".join(mismatches[:10])
-        logger.error(
+        raise RaidenParityError(
             f"[RAIDEN PARITY MISMATCH | {tag}] Norms do NOT match!\n"
             f"  * Trainer: numel={total_trainer_numel}, L1={total_trainer_l1:.6f}, L2={global_trainer_l2:.6f}\n"
             f"  * Sampler: numel={total_sampler_numel}, L1={total_sampler_l1:.6f}, L2={global_sampler_l2:.6f}\n"
             f"  * Mismatched Tensors ({len(mismatches)} / {len(all_param_names)}):\n"
             f"{mismatches_summary}"
         )
-        return False
 
 
 def setup_raiden_controller() -> tuple[Any, Any, str]:
@@ -607,6 +620,12 @@ def setup_raiden_controller() -> tuple[Any, Any, str]:
 
     try:
         registry = get_tpu_weight_registry()
+        # TPUWeightRegistry is a detached actor: it survives the job that created it and lives as long as the Ray
+        # cluster. Without this clear(), parity stats from an earlier job on the same cluster are still there:
+        # e.g. job A (8 trainer ranks) leaves stats[1]["ranks"] = {0..7}; job B (4 ranks) then overwrites only
+        # ranks 0..3 at its step 1, verify_norms sums all 8 entries and raises a false RaidenParityError (or reads
+        # job A's entry before job B's fire-and-forget posts arrive). Start every job from an empty registry.
+        ray.get(registry.clear.remote())
         ray.get(registry.set_controller_address.remote(address))
         logger.info(f"Successfully stored RaidenController address ({address}) in TPUWeightRegistry")
     except Exception as reg_err:
@@ -970,14 +989,22 @@ async def update_raiden_weights(
     global_steps: Optional[int] = None,
 ) -> dict:
     """Orchestrator coordination for Raiden TPU P2P weight synchronization via central RaidenController."""
-    t_abort_start = time.perf_counter()
-    if global_steps and global_steps > 0:
-        try:
-            await manager.abort_replicas()
-        except Exception as e:
-            logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
-    t_abort = time.perf_counter() - t_abort_start
     parity = RaidenParityCheck.from_config(manager.config.engine_kwargs)
+
+    # 0. Quiesce the samplers *concurrently* with the trainer-side export below. The trainer's
+    #    update_weights(mode="raiden") only exports local shards, binds/creates its WeightSynchronizer and
+    #    registers with the RaidenController; nothing reads or writes sampler memory until step 2
+    #    (sampler init) at the earliest, so the pause does not need to be serialized in front of it.
+    async def _quiesce_samplers() -> float:
+        t0 = time.perf_counter()
+        if global_steps and global_steps > 0:
+            try:
+                await manager.abort_replicas()
+            except Exception as e:
+                logger.warning(f"Failed to abort replicas at step {global_steps}: {e}")
+        return time.perf_counter() - t0
+
+    quiesce_task = asyncio.create_task(_quiesce_samplers())
 
     t_total_start = time.perf_counter()
 
@@ -990,6 +1017,9 @@ async def update_raiden_weights(
     if actor_refs is not None:
         await asyncio.to_thread(ray.get, actor_refs)
     t_init_trainer = time.perf_counter() - t_init_trainer_start
+
+    # The samplers must be quiesced before anything below touches them.
+    t_abort = await quiesce_task
 
     parallelism = 8
     if hasattr(manager, "config") and hasattr(manager.config, "engine_kwargs"):
@@ -1107,19 +1137,31 @@ async def update_raiden_weights(
         await asyncio.gather(
             *[replica.server_handle.set_global_steps.remote(global_steps) for replica in manager.replicas]
         )
-    if release_refs is not None:
-        await asyncio.to_thread(ray.get, release_refs)
 
-    t_total = time.perf_counter() - t_total_start
-
-    # 5. Parity Verification (Optional, default=off; see RaidenParityCheck)
+    # 6. Parity Verification (Optional, default=off; see RaidenParityCheck). Raises RaidenParityError on a
+    #    mismatch or on missing results; it runs before resume_generation_replicas so that a failing sync never
+    #    resumes generation on wrong weights. Off by default, so it adds nothing to the resume path.
+    t_parity_start = time.perf_counter()
     if install_kwargs:
         parity.report_exact(global_steps, install_results)
     if parity.norm:
-        try:
-            await parity.verify_norms(manager, global_steps)
-        except Exception as e:
-            logger.warning(f"Failed to execute parity verification: {e}")
+        await parity.verify_norms(manager, global_steps)
+    t_parity = time.perf_counter() - t_parity_start
+
+    # 7. Resume generation as soon as the samplers hold the new (verified) weights and carry the new
+    #    global_steps tag. Do not wait for the trainer-side buffer release below: it only frees trainer HBM
+    #    (gc + TPU sync, ~2s at 8B) and would otherwise keep the samplers idle for that long on every sync.
+    t_resume_start = time.perf_counter()
+    await manager.resume_generation_replicas()
+    t_resume = time.perf_counter() - t_resume_start
+
+    # 8. Wait for the trainer to hand its staging HBM back before the next training step starts.
+    t_release_start = time.perf_counter()
+    if release_refs is not None:
+        await asyncio.to_thread(ray.get, release_refs)
+    t_release = time.perf_counter() - t_release_start
+
+    t_total = time.perf_counter() - t_total_start
 
     logger.info(
         f"[RAIDEN TELEMETRY | Orchestrator] Step {global_steps} Completed in {t_total:.4f}s:\n"
@@ -1129,11 +1171,11 @@ async def update_raiden_weights(
         f"  * Raiden Barrier Check   : {t_barrier:.4f}s\n"
         f"  * RaidenController P2P   : {t_transfer:.4f}s\n"
         f"  * Sampler H2D DMA        : {t_install:.4f}s\n"
+        f"  * Parity Check           : {t_parity:.4f}s\n"
+        f"  * Sampler Resume         : {t_resume:.4f}s\n"
+        f"  * Trainer Buffer Release : {t_release:.4f}s (samplers already generating)\n"
         f"  * Total End-to-End Sync  : {t_total:.4f}s"
     )
-
-    # 6. Resume generation immediately
-    await manager.resume_generation_replicas()
 
     # Surface the phase timers as step metrics. The trainer stashes this dict in _pending_sync_metrics and
     # merges it into the same step's metrics, so they are logged next to timing_s/update_weights by every
@@ -1145,6 +1187,8 @@ async def update_raiden_weights(
         "timing_s/tpu-sync/barrier": t_barrier,
         "timing_s/tpu-sync/p2p_transfer": t_transfer,
         "timing_s/tpu-sync/sampler_h2d": t_install,
+        "timing_s/tpu-sync/sampler_resume": t_resume,
+        "timing_s/tpu-sync/trainer_release": t_release,
         "timing_s/tpu-sync/total_sync": t_total,
     }
     if t_h2d_pure is not None:
