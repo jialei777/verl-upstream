@@ -658,6 +658,8 @@ submit_and_verify_ray_job() {
     fi
 
     if [[ "${final_status}" != "SUCCEEDED" ]]; then
+        log "Python tracebacks in ${log_file} (debug):"
+        grep -n -A80 'Traceback (most recent call last)' "${log_file}" | head -n 1500 || true
         log "ERROR: Job ${sub_id} ended with status ${final_status}" >&2
         diagnose_cluster
         exit 1
