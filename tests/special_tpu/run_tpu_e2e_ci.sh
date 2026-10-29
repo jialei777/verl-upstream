@@ -653,6 +653,8 @@ submit_and_verify_ray_job() {
     wait "${LOG_FOLLOW_PID}" 2>/dev/null || true
     LOG_FOLLOW_PID=""
     tail -n 150 "${log_file}"
+    log "Per-rank validation metrics that differ (debug):"
+    grep -a "DEBUG val metrics" "${log_file}" | cut -c1-1500 | head -n 40 || true
     if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
         echo "log_file=${log_file}" >> "${GITHUB_OUTPUT}"
     fi
