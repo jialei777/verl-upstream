@@ -362,6 +362,12 @@ class SFTTrainer:
                         output = self.training_client.infer_batch(val_data)
                         output = output.get()
                         metrics = tu.get(output, "metrics")
+                        if isinstance(metrics, list):  # DEBUG: which per-rank metrics differ
+                            distinct = [m for i, m in enumerate(metrics) if m not in metrics[:i]]
+                            keys = sorted({k for m in distinct for k in m if any(d.get(k) != m.get(k) for d in distinct)})
+                            print(f"[DEBUG val metrics] {len(distinct)} distinct per-rank dicts; differing keys: "
+                                  f"{ {k: [d.get(k) for d in distinct] for k in keys} }", flush=True)
+                            metrics = metrics[0]
                         val_losses.append(metrics["loss"])
 
                     val_loss = torch.mean(torch.tensor(val_losses))
