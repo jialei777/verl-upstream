@@ -11,11 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify the Ray job log of a TPU CI test (smoke: TPU platform / sft: trainer / grpo: RL, including the Raiden
-weight-sync parity checks / raiden_sync: tests/special_tpu/raiden_sync_test.py).
+"""Verify the Ray job log of a TPU CI test.
+
+Tests: smoke (TPU platform), raiden_raw (tpu-sync raw transfer, tests/special_tpu/raiden_raw_transfer_test.py),
+sft (trainer), grpo (RL, including the Raiden weight-sync parity checks), raiden_sync
+(tests/special_tpu/raiden_sync_test.py).
 
 Usage:
-    python3 tests/special_tpu/verify_tpu_e2e_log.py <smoke|sft|grpo|raiden_sync> <log_file> <smoke_test: 0|1>
+    python3 tests/special_tpu/verify_tpu_e2e_log.py <test> <log_file> <smoke_test: 0|1>
+    (<test>: smoke | raiden_raw | sft | grpo | raiden_sync)
 """
 
 import math
@@ -126,13 +130,27 @@ def verify_raiden_sync(text: str, smoke_test: bool) -> None:
     print(f"[TPU CI] Raiden sync test verified: {exact_syncs} bit-exact syncs.")
 
 
-VERIFIERS = {"smoke": verify_smoke, "sft": verify_sft, "grpo": verify_grpo, "raiden_sync": verify_raiden_sync}
+def verify_raiden_raw(text: str, smoke_test: bool) -> None:
+    """tests/special_tpu/raiden_raw_transfer_test.py: tpu-sync accepts the folded MoE expert stacks."""
+    if "[raiden raw-transfer] PASSED" not in text:
+        sys.exit("[TPU CI] ERROR: Raiden raw-transfer test did not report PASSED.")
+    print("[TPU CI] Raiden raw-transfer test verified.")
+
+
+VERIFIERS = {
+    "smoke": verify_smoke,
+    "raiden_raw": verify_raiden_raw,
+    "sft": verify_sft,
+    "grpo": verify_grpo,
+    "raiden_sync": verify_raiden_sync,
+}
+NO_TRAINING_STEPS = ("smoke", "raiden_raw")
 
 
 def main() -> None:
     test_name, log_path, smoke_test = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
     text = open(log_path, encoding="utf-8", errors="replace").read()
-    if test_name != "smoke" and not re.findall(r"step[:\s]+([1-9][0-9]*)", text, flags=re.IGNORECASE):
+    if test_name not in NO_TRAINING_STEPS and not re.findall(r"step[:\s]+([1-9][0-9]*)", text, flags=re.IGNORECASE):
         sys.exit(f"[TPU CI] ERROR: No training steps logged in {test_name} output.")
     VERIFIERS[test_name](text, smoke_test)
 

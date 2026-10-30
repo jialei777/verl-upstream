@@ -490,6 +490,24 @@ class vLLMRaidenWorkerExtension(_BaseWorkerExtension):
         except Exception as e:
             logging.getLogger(__name__).warning(f"Could not synchronize via torch_tpu: {e}")
 
+        # Rebind the staging tensors tpu-sync's raw transfer rejects (see adapt_for_raw_transfer);
+        # install_raiden_weights keeps reading a logical-shape view of the bound buffer.
+        from verl.checkpoint_engine.raiden_checkpoint_engine import adapt_for_raw_transfer
+
+        valid_params, rebind_methods, raw_report = adapt_for_raw_transfer(
+            valid_params, bind_ip, f"Sampler Rank {rank_val}"
+        )
+        for name, t in valid_params:
+            if name in rebind_methods:
+                staging_tensors[name] = t.view(staging_tensors[name].shape)
+        self._raiden_staging = staging_tensors
+        self._sorted_vllm_params = valid_params
+        if raw_report and rank_val == 0:
+            logging.getLogger(__name__).warning(
+                f"[RAIDEN] raw-transfer probe (sampler rank 0): rebound {len(rebind_methods)} staging tensors "
+                f"({sorted(set(rebind_methods.values()))}); {'; '.join(raw_report)}"
+            )
+
         logging.getLogger(__name__).info(
             f"Raiden Sampler Rank {rank_val}: binding {len(valid_params)} staging tensors to WeightSynchronizer "
             f"(sample: name={valid_params[0][0]}, shape={valid_params[0][1].shape}, "
@@ -2068,9 +2086,10 @@ async def launch_tpu_vllm_servers(replica) -> None:
     }
     if "VERL_PLATFORM" in os.environ:
         env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
-    for name in ("VERL_TPU_VLLM_ATTN_FP32_STATS", "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"):
-        if name in os.environ:
-            env_vars[name] = os.environ[name]
+    # Not `name`: that is the server actor's name, used below (shadowing it gave every replica the same name).
+    for var in ("VERL_TPU_VLLM_ATTN_FP32_STATS", "VERL_TPU_VLLM_RMSNORM_CUDA_ORDER"):
+        if var in os.environ:
+            env_vars[var] = os.environ[var]
     resource_pool = getattr(replica, "resource_pool", None)
     if resource_pool is not None and getattr(resource_pool, "pgs", None):
         try:

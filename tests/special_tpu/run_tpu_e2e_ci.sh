@@ -27,7 +27,8 @@
 #
 # Tiers (add new tests to the matching tier in run_tier):
 #   v6e-1chip - 1 x v6e-1 (whole ct6e-standard-1t node). TPU platform tests:
-#               test_tpu_platform (torch_tpu import / to(device) / matmul / autograd / TPU-vs-CPU).
+#               test_tpu_platform (torch_tpu import / to(device) / matmul / autograd / TPU-vs-CPU),
+#               test_raiden_raw_transfer (tpu-sync raw transfer accepts the folded MoE expert stacks).
 #   v6e-4chip - 1 x v6e-4 subslice. Trainer tests:
 #               test_trainer_sft (Qwen3-0.6B GSM8K SFT, TorchTitan FSDP2).
 #   v6e-8chip - 2 x v6e-4 subslices. RL tests:
@@ -403,6 +404,12 @@ test_tpu_platform() {
     submit_and_verify_ray_job smoke 15 '{}' python3 tests/special_tpu/tpu_smoke_test.py
 }
 
+test_raiden_raw_transfer() {
+    # Raiden binds MoE expert stacks folded to 2-D; tpu-sync must accept them for raw transfer (after
+    # adapt_for_raw_transfer). The dense RL test never builds such a tensor, so check it here on 1 chip.
+    submit_and_verify_ray_job raiden_raw 15 '{}' python3 tests/special_tpu/raiden_raw_transfer_test.py
+}
+
 test_trainer_sft() {
     # Qwen3-0.6B GSM8K SFT, TorchTitan FSDP2 on one v6e-4 subslice.
     submit_and_verify_ray_job sft 30 \
@@ -449,6 +456,7 @@ run_tier() {
             wait_for_ray_cluster
             connect_ray_dashboard
             test_tpu_platform
+            test_raiden_raw_transfer
             ;;
         v6e-4chip)
             # Trainer tests: one v6e-4 (2x2) subslice.

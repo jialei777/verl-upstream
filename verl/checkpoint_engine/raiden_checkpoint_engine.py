@@ -147,6 +147,7 @@ def validate_and_sanitize_tensors(
         device = torch.device("tpu")
 
     sanitized = []
+    rebased = []
     for item in named_tensors:
         name, p = item[0], item[1]
         if p is None:
@@ -173,15 +174,106 @@ def validate_and_sanitize_tensors(
 
         # tpu-sync raw transfer binds the tensor's whole device storage, so a view onto part of a larger
         # buffer (non-zero offset or a smaller extent) is rejected; give such tensors their own buffer.
+        # [tpu-sync raw-transfer] Newer tpu-sync also requires the base buffer's leading dim to equal the tensor's (or a
+        # rank-1 base under a rank-2 view).
         try:
+            base = getattr(t, "_base", None)
+            base_major_differs = (
+                base is not None
+                and base.dim() > 0
+                and int(base.shape[0]) != int(t.shape[0])
+                and not (base.dim() == 1 and t.dim() == 2)
+            )
             if t.storage_offset() != 0 or t.untyped_storage().nbytes() != t.numel() * t.element_size():
+                t = t.clone()
+            elif base_major_differs:
+                rebased.append(f"{name}{tuple(t.shape)}<-{tuple(base.shape)}")
                 t = t.clone()
         except Exception:
             pass
 
         sanitized.append((name, t))
 
+    if rebased:
+        logger.warning(
+            f"[RAIDEN] {len(rebased)} tensors were views whose leading dim differs from their base allocation; "
+            f"bound fresh buffers instead (first 6: {rebased[:6]})"
+        )
     return sanitized
+
+
+# Raw-transfer probe. tpu-sync's raw transfer requires a tensor's leading dim to equal its base storage buffer's
+# (tpu_sync/frameworks/torch/torch_tpu_utils.cc, UnpackTorchTensor). Since torch_tpu 449c975e1 (2026-09-24; in
+# torch-tpu 0.1.2.dev20261006 / the verl-tpu:v20261006-tsync1006 image) a full-buffer TPU->TPU copy (clone, copy_)
+# shares the source's base buffer instead of allocating one with the destination's shape, so the folded MoE expert
+# stacks ([E_local * F, D] views of an [E_local, F, D] base) are rejected even after a clone; only a host round trip
+# allocates a buffer with the folded shape. Probe once per tensor class and rebind what tpu-sync rejects.
+_TENSOR_CLASS_RE = re.compile(r"\.\d+\.")
+
+
+def _raw_transfer_error(t: torch.Tensor, bind_ip: str) -> Optional[str]:
+    """None if tpu-sync accepts ``t`` for raw transfer, else its error (probed with a throwaway synchronizer)."""
+    try:
+        ws = create_torch_weight_synchronizer([[t]], local_port=0, parallelism=1, listener_port=0, bind_ip=bind_ip)
+    except ValueError as e:
+        return str(e)
+    del ws
+    return None
+
+
+def _rank1_backed(t: torch.Tensor) -> torch.Tensor:
+    """Copy of ``t`` in a fresh rank-1 buffer, viewed as rank 2 ``[t.shape[0], -1]``."""
+    flat = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
+    flat.copy_(t.reshape(-1))
+    return flat.view(t.shape[0], -1)
+
+
+def _host_roundtrip(t: torch.Tensor) -> torch.Tensor:
+    """``t`` re-uploaded from host memory: a device buffer allocated with exactly ``t``'s logical shape."""
+    return t.detach().to("cpu").to(t.device)
+
+
+_REBIND_METHODS = {"clone": lambda t: t.clone(), "rank1_view": _rank1_backed, "host_roundtrip": _host_roundtrip}
+
+
+def rebind_for_raw_transfer(t: torch.Tensor, method: str) -> torch.Tensor:
+    return _REBIND_METHODS[method](t)
+
+
+def adapt_for_raw_transfer(
+    named: list[tuple[str, torch.Tensor]], bind_ip: str, who: str
+) -> tuple[list[tuple[str, torch.Tensor]], dict, list[str]]:
+    """Rebind the tensors tpu-sync's raw transfer rejects; returns (new list, {name: method}, report)."""
+    first = {}
+    for n, t in named:
+        first.setdefault((_TENSOR_CLASS_RE.sub(".N.", n), tuple(t.shape), t.dtype), t)
+    chosen, report = {}, []
+    for key, t in first.items():
+        err = _raw_transfer_error(t, bind_ip)
+        if err is None:
+            continue
+        tried = []
+        chosen[key] = None
+        for method in _REBIND_METHODS:
+            err2 = _raw_transfer_error(rebind_for_raw_transfer(t, method), bind_ip)
+            tried.append(f"{method} {'accepted' if err2 is None else 'rejected'}")
+            if err2 is None:
+                chosen[key] = method
+                break
+        report.append(
+            f"{key[0]}{list(key[1])}/{str(key[2]).replace('torch.', '')}: rejected ({err[:40]}...); {', '.join(tried)}"
+        )
+    out, methods = [], {}
+    for n, t in named:
+        key = (_TENSOR_CLASS_RE.sub(".N.", n), tuple(t.shape), t.dtype)
+        if key not in chosen:
+            out.append((n, t))
+        elif chosen[key] is not None:
+            out.append((n, rebind_for_raw_transfer(t, chosen[key])))
+            methods[n] = chosen[key]
+        else:
+            raise ValueError(f"[RAIDEN] {who}: tpu-sync rejects {n} {tuple(t.shape)} in every layout tried: {report}")
+    return out, methods, report
 
 
 def _dim0_shard_info(spec) -> Optional[tuple[tuple, int, int]]:
@@ -275,8 +367,10 @@ def export_local_shards(
             if wire_shape != full_shape:
                 # whole experts folded into rows: still a contiguous dim-0 block of the 2-D wire tensor.
                 # tpu-sync binds each tensor's device storage as-is and rejects a view whose leading (block)
-                # dim differs from its storage's, so the folded stack gets its own 2-D buffer (one extra copy
-                # of this rank's expert shards, freed with the synchronizer after the sync).
+                # dim differs from its storage's. Before torch_tpu 449c975e1 (2026-09-24) this clone gave the
+                # folded stack its own 2-D buffer; since then a full-buffer TPU->TPU copy shares the source's
+                # [E_local, F, D] base buffer, so tpu-sync still rejects it and adapt_for_raw_transfer (called
+                # in send_weights) rebinds it.
                 local_shape = (int(local_shape[0]) * full_shape[1], full_shape[2])
                 named.append((wire_name, local.reshape(local_shape).clone()))
             else:
@@ -742,7 +836,8 @@ class RaidenCheckpointEngine(CheckpointEngine):
         )
 
         def _full_shape(name: str, p: torch.Tensor) -> list[int]:
-            shape = list(p.shape)
+            # [tpu-sync raw-transfer] tensors rebound by adapt_for_raw_transfer keep their logical shape.
+            shape = list(getattr(self, "_logical_shapes", {}).get(name, p.shape))
             if name in self._shard_info:
                 shape[0] *= self._shard_info[name][0]
             return shape
@@ -884,6 +979,25 @@ class RaidenCheckpointEngine(CheckpointEngine):
 
         sorted_weights = sorted(unfused_weights.items(), key=lambda x: x[0])
         valid_weights = validate_and_sanitize_tensors(sorted_weights, device=torch.device("tpu"))
+
+        # [tpu-sync raw-transfer] probe once which tensor classes tpu-sync accepts for raw transfer and rebind the rest.
+        if not getattr(self, "_raw_probe_done", False):
+            self._raw_probe_done = True
+            logical = {n: tuple(t.shape) for n, t in valid_weights}
+            valid_weights, self._rebind_methods, report = adapt_for_raw_transfer(
+                valid_weights, ray.util.get_node_ip_address().strip("[]"), f"Trainer Rank {self.rank}"
+            )
+            self._logical_shapes = {n: logical[n] for n in self._rebind_methods}
+            if report and self.rank == 0:
+                logger.warning(
+                    f"[RAIDEN] raw-transfer probe (trainer rank 0): rebound {len(self._rebind_methods)} tensors "
+                    f"({sorted(set(self._rebind_methods.values()))}); {'; '.join(report)}"
+                )
+        elif getattr(self, "_rebind_methods", None):
+            valid_weights = [
+                (n, rebind_for_raw_transfer(t, self._rebind_methods[n]) if n in self._rebind_methods else t)
+                for n, t in valid_weights
+            ]
 
         torch_tpu_sync.synchronize(wait=True)
 
