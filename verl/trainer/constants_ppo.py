@@ -142,6 +142,7 @@ def get_ppo_ray_runtime_env(config=None):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
     # Forward only when set: empty string breaks vLLM ParallelConfig int parsing.
     # VERL_TPU_SEQ_BUCKET_SIZE is read by the TorchTitan TPU engine on the trainer workers (packed-length bucket).
+    # LIBTPU_INIT_ARGS: libtpu reads it when each TPU worker process loads it, so a recipe `export` must reach them.
     for key in (
         "PYTHONHASHSEED",
         "CUBLAS_WORKSPACE_CONFIG",
@@ -149,8 +150,14 @@ def get_ppo_ray_runtime_env(config=None):
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
         "VERL_TPU_SEQ_BUCKET_SIZE",
+        "LIBTPU_INIT_ARGS",
     ):
         val = os.environ.get(key)
         if val is not None:
             runtime_env["env_vars"][key] = val
+    # TorchTitan TPU engine switches (VERL_TPU_*: Splash tiles, MoE kernel variants, static micro-batch length, ...):
+    # a recipe `export` only reaches the driver, so forward the ones that are set.
+    for key, val in os.environ.items():
+        if key.startswith("VERL_TPU_") and val != "":
+            runtime_env["env_vars"].setdefault(key, val)
     return runtime_env

@@ -13,6 +13,7 @@
 # limitations under the License.
 import importlib
 import logging
+import os
 import re
 from collections import defaultdict
 from collections.abc import Generator, Iterator
@@ -237,15 +238,28 @@ def configure_qwen3_moe_for_rl(
     n_tpu_dispatchers = len(list(model_config.traverse(TpuAllToAllTokenDispatcher.Config)))
     logger.warning("MoE: TPU token dispatcher on %d layers", n_tpu_dispatchers)
     model_config = TpuGroupedExpertsConverter.Config().build().convert(model_config)
+    # Opt-in perf variants from torchtitan's Qwen3-30B-A3B TPU recipe (performance A/B; defaults unchanged):
+    #   VERL_TPU_MOE_PAIRED_GMM=1     paired W1/W3 Pallas kernel (same parameters and checkpoint keys).
+    #   VERL_TPU_MOE_NATIVE_LAYOUT=1  kernel-native (E, K, N) expert weights; torchtitan's state-dict hooks convert
+    #                                 to/from the canonical layout on state_dict()/load_state_dict(), which the HF
+    #                                 load and the weight-sync export go through (an extra transpose per sync).
+    paired = os.getenv("VERL_TPU_MOE_PAIRED_GMM", "0").strip().lower() in ("1", "true", "yes", "on")
+    native = os.getenv("VERL_TPU_MOE_NATIVE_LAYOUT", "0").strip().lower() in ("1", "true", "yes", "on")
     n_experts = 0
     for _, experts, _, _ in model_config.traverse(TpuGroupedExperts.Config):
         experts.use_pallas_grouped_mm = True
-        experts.use_pallas_paired_grouped_mm = False  # paired W1/W3 is a later perf variant
-        experts.use_kernel_native_weight_layout = False  # keep canonical param names and layout
+        experts.use_pallas_paired_grouped_mm = paired
+        experts.use_kernel_native_weight_layout = native
         experts.pallas_grouped_mm_tile_m = tile_m
         experts.pallas_grouped_mm_tgmm_tiling = (tile_m, 0, 0)  # full K/N dWeight tiles
         n_experts += 1
-    logger.warning("MoE: routed experts on %d layers use the Pallas grouped matmul (tile_m=%d)", n_experts, tile_m)
+    logger.warning(
+        "MoE: routed experts on %d layers use the Pallas grouped matmul (tile_m=%d, paired=%s, native_layout=%s)",
+        n_experts,
+        tile_m,
+        paired,
+        native,
+    )
     return model_config
 
 

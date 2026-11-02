@@ -435,6 +435,11 @@ def plan_resource_pool_placement(
 def tpu_replica_rollout_config(rollout_config):
     """Rollout config of one TPU replica: ``data_parallel_size`` folded into the replica count.
 
+    Expert parallelism, if enabled, is likewise scoped to the replica: the config-level
+    ``expert_parallel_size`` (which must equal ``tensor_model_parallel_size * data_parallel_size``) becomes the
+    replica's ``tensor_model_parallel_size``, i.e. vLLM's ``enable_expert_parallel`` over the replica's TP group,
+    which is also what the Raiden MoE weight sync expects.
+
     Works on the OmegaConf config the trainer holds and on an already converted ``RolloutConfig``.
     """
     import copy
@@ -442,15 +447,22 @@ def tpu_replica_rollout_config(rollout_config):
 
     from omegaconf import DictConfig, open_dict
 
+    updates = {"data_parallel_size": 1}
+    ep = getattr(rollout_config, "expert_parallel_size", None)
+    if ep is not None and ep > 1:
+        updates["expert_parallel_size"] = rollout_config.tensor_model_parallel_size
+
     if isinstance(rollout_config, DictConfig):
         replica_config = copy.deepcopy(rollout_config)
         with open_dict(replica_config):
-            replica_config.data_parallel_size = 1
+            for key, value in updates.items():
+                replica_config[key] = value
         return replica_config
     if dataclasses.is_dataclass(rollout_config):
-        return dataclasses.replace(rollout_config, data_parallel_size=1)
+        return dataclasses.replace(rollout_config, **updates)
     replica_config = copy.deepcopy(rollout_config)
-    replica_config.data_parallel_size = 1
+    for key, value in updates.items():
+        setattr(replica_config, key, value)
     return replica_config
 
 

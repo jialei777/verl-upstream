@@ -184,6 +184,141 @@ def apply_fp32_logits_tpu(modules: Any) -> int:
     return patched
 
 
+def fused_logprob_chunk_size(num_tokens: int, max_chunk: int | None = None, align: int = 256) -> int:
+    """Largest multiple of ``align`` that divides ``num_tokens`` and is <= ``max_chunk``; ``num_tokens`` otherwise.
+
+    ``max_chunk`` defaults to ``VERL_TPU_FUSED_LOGPROB_CHUNK`` (4096). One static chunk shape keeps the chunk
+    loop to a single compiled program per shape.
+    """
+    if max_chunk is None:
+        max_chunk = int(os.getenv("VERL_TPU_FUSED_LOGPROB_CHUNK", "4096"))
+    if num_tokens <= max_chunk:
+        return num_tokens
+    chunk = (max_chunk // align) * align
+    while chunk >= align:
+        if num_tokens % chunk == 0:
+            return chunk
+        chunk -= align
+    return num_tokens
+
+
+def _head_logits(x_b: torch.Tensor, w_b: torch.Tensor, fp32_logits: bool) -> torch.Tensor:
+    """LM-head logits for BF16 operands, matching the unfused head: BF16 output under autocast, or FP32
+    accumulators (``_TPUFp32LogitsLinear``) when ``fp32_logits`` is set."""
+    if not fp32_logits:
+        return torch.matmul(x_b, w_b.t())
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("medium")
+    try:
+        return torch.matmul(x_b.float(), w_b.float().t())
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+@torch.no_grad()
+def _fused_entropy(x: torch.Tensor, weight: torch.Tensor, temperature, chunk: int, fp32_logits: bool) -> torch.Tensor:
+    """Per-token entropy of ``softmax(x @ W.T / temperature)``, chunked; no gradient (old_log_prob metrics only)."""
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        hidden = x.shape[-1]
+        x_b = x.reshape(-1, hidden).to(torch.bfloat16)
+        w_b = weight.to(torch.bfloat16)
+        out = []
+        for start in range(0, x_b.shape[0], chunk):
+            z = (_head_logits(x_b[start : start + chunk], w_b, fp32_logits) / temperature).float()
+            p = torch.softmax(z, dim=-1)
+            out.append(torch.logsumexp(z, dim=-1) - (p * z).sum(-1))
+        return torch.cat(out).reshape(x.shape[:-1])
+
+
+def fused_linear_logprob(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    temperature,
+    *,
+    calculate_entropy: bool = False,
+    fp32_logits: bool = False,
+    chunk: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Log-probs of ``labels`` (and optionally entropy) under ``x @ weight.T / temperature``.
+
+    The log-probs come from Tokamax's fused linear + softmax + cross-entropy Pallas kernel (``tokamax_logprob``):
+    the ``[T, V]`` logits are never written to HBM, in forward or backward. The kernel accumulates the logits in FP32
+    from BF16 operands (the ``fp32_logits=True`` math, used for both settings of ``fp32_logits``). Temperature is
+    applied by scaling ``x`` (``logits / T == (x / T) @ W.T``). Entropy (old_log_prob metrics only) is computed
+    chunked without a gradient: the fused path is only used when no entropy gradient is needed.
+    """
+    from verl.workers.engine.torchtitan.tokamax_logprob import tokamax_linear_logprob
+
+    if isinstance(temperature, torch.Tensor):
+        temperature = float(temperature.item())
+    temperature = float(temperature)
+    hidden = x.shape[-1]
+    x2d = x.reshape(-1, hidden)
+    if temperature != 1.0:
+        x2d = x2d.float() / temperature
+    logp = tokamax_linear_logprob(x2d, labels.reshape(-1), weight).reshape(x.shape[:-1])
+    entropy = None
+    if calculate_entropy:
+        num_tokens = x2d.shape[0]
+        entropy = _fused_entropy(x, weight, temperature, chunk or fused_logprob_chunk_size(num_tokens), fp32_logits)
+    return logp, entropy
+
+
+class FusedLogprobOutput:
+    """What a fused LM head returns instead of logits: per-token log-probs and (optionally) entropy, ``[1, T]``."""
+
+    def __init__(self, log_probs: torch.Tensor, entropy: torch.Tensor | None):
+        self.log_probs = log_probs
+        self.entropy = entropy
+
+
+def _tpu_fused_logprob_head_forward(self: nn.Module, x: torch.Tensor):
+    """LM head that returns a ``FusedLogprobOutput`` while ``self._verl_fused_logprob_args`` is set, else logits."""
+    args = getattr(self, "_verl_fused_logprob_args", None)
+    if args is None:
+        return self._verl_unfused_forward(x)
+    if getattr(self, "bias", None) is not None:
+        raise ValueError("the fused log-prob head supports a bias-free LM head only")
+    weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+    log_probs, entropy = fused_linear_logprob(
+        x,
+        weight,
+        args["labels"],
+        args["temperature"],
+        calculate_entropy=args["calculate_entropy"],
+        fp32_logits=args["fp32_logits"],
+    )
+    return FusedLogprobOutput(log_probs, entropy)
+
+
+def apply_fused_logprob_tpu(modules: Any) -> list[nn.Module]:
+    """Patch each LM head so it can return fused log-probs (see ``_tpu_fused_logprob_head_forward``).
+
+    Apply after ``apply_fp32_logits_tpu``; the previous forward stays available for the unfused fallback.
+    Returns the patched heads. Raises if the Tokamax kernel (tokamax + torch_tpu's Pallas bridge) is unavailable or
+    does not support a patched head's vocabulary size (checked per head, so a model without an LM head is left as is).
+    """
+    if modules is None:
+        return []
+    from verl.workers.engine.torchtitan.tokamax_logprob import require_tokamax
+
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    heads = []
+    for model in model_list:
+        head = getattr(model, "lm_head", None)
+        if not isinstance(head, torch.nn.Module):
+            continue
+        require_tokamax(vocab_size=int(head.weight.shape[0]))
+        if getattr(head.forward, "__func__", None) is not _tpu_fused_logprob_head_forward:
+            head._verl_unfused_forward = head.forward
+            head.forward = MethodType(_tpu_fused_logprob_head_forward, head)
+        heads.append(head)
+    if heads:
+        logger.warning("fused LM-head log-prob enabled on TPU: patched %d lm_head module(s)", len(heads))
+    return heads
+
+
 _attention_dtype_fallback_logged = False
 
 
@@ -325,14 +460,17 @@ def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:
         )
 
 
-def splash_block_size_for(seq_len: int, max_block_size: int = 512, min_block_size: int = 128) -> int:
+def splash_block_size_for(seq_len: int, max_block_size: int | None = None, min_block_size: int = 128) -> int:
     """Largest power-of-two splash block size <= ``max_block_size`` that divides ``seq_len``.
 
     The splash kernel requires every block size to divide the sequence length. verl pads
     packed sequences to a multiple of ``VERL_TPU_SEQ_BUCKET_SIZE`` (256), so a fixed 512
     block (torchtitan's default) fails for e.g. 768 tokens. Returns 0 if no block
-    >= ``min_block_size`` divides ``seq_len``.
+    >= ``min_block_size`` divides ``seq_len``. ``max_block_size`` defaults to
+    ``VERL_TPU_SPLASH_MAX_BLOCK`` (512).
     """
+    if max_block_size is None:
+        max_block_size = int(os.getenv("VERL_TPU_SPLASH_MAX_BLOCK", "512"))
     block = max_block_size
     while block >= min_block_size:
         if seq_len % block == 0:
@@ -620,8 +758,11 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], cp_si
     lens = torch.tensor(lens, dtype=torch.int64)
     torch.distributed.all_reduce(lens, op=torch.distributed.ReduceOp.MAX)
     lens = lens.tolist()
+    # VERL_TPU_STATIC_MICRO_BATCH_LEN=<tokens>: pad every micro-batch to at least this packed length (e.g. the
+    # use_dynamic_bsz token budget), so the trainer compiles one shape instead of one per bucket it meets.
+    static_len = int(os.getenv("VERL_TPU_STATIC_MICRO_BATCH_LEN", "0") or 0)
     for i, mb in enumerate(micro_batches):
-        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", int(lens[2 * i]))
+        tu.assign_non_tensor_data(mb, "tpu_padded_seq_len", max(int(lens[2 * i]), static_len))
         tu.assign_non_tensor_data(mb, "tpu_max_response_len", int(lens[2 * i + 1]))
 
 

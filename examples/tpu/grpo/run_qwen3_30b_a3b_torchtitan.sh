@@ -1,37 +1,41 @@
 #!/usr/bin/env bash
-# GRPO | Qwen3-30B-A3B (MoE) | GSM8K | TorchTitan Training (SimpleFSDP, torch.compile + splash attention, DEFER_AND_FUSE) & vLLM Rollout | TPU 7x 2x2x4 x2 Slices
+# GRPO | Qwen3-30B-A3B (MoE) | GSM8K | TorchTitan Training (SimpleFSDP, torch.compile + splash attention, DEFER_AND_FUSE) & vLLM Rollout | TPU v5p 2x2x4 x2 Slices
 # V1 PPOTrainer (Separate Async Overlap).
-#
-# Scales run_qwen3_8b_torchtitan.sh (2 x v6e-8) to 2 x TPU 7x 2x2x4 slices (examples/tpu/gke/ray-tpu-v7x16-2slice.yaml):
-# slice tpu-group-0 (4 hosts x 8 TensorCore devices) runs the FSDP32 trainer and slice tpu-group-1 runs one TP32 vLLM
-# server. Every TPU 7x chip exposes its 2 TensorCores as 2 devices (96 GiB HBM each), so "chips" below are devices.
 #
 # Qwen3-30B-A3B: 48 layers, hidden 2048, 32 q / 4 KV heads (head_dim 128), 128 experts (8 active per token,
 # moe_intermediate_size 768), vocab 151936; 30.5B parameters in total, 3.3B active per token.
 #
-# Memory budget per trainer device (96 GiB HBM, FSDP over 32 devices): fp32 params + grads + Adam m/v of 30.5B params
-# is 30.5B * 16 B / 32 = ~15.3 GiB. For comparison, torchtitan's FSDP-only TPU 7x recipe for this model
-# (torchtitan/experiments/tpu/recipes/ironwood/qwen3-30b-a3b/tpu7x-4x4x4, 128 devices) peaks at ~65 GiB per device
-# with 2K-token sequences.
+# Memory budget per trainer chip (95 GiB HBM, FSDP over 16 chips): fp32 params + grads + Adam m/v of 30.5B params
+# is 30.5B * 16 B / 16 = ~30.5 GiB.
 #
-# Rollout: on a multi-host slice vLLM's TP size must equal the slice's device count (platform_tpu.get_tpu_env_vars
-# takes the TPU topology from the hosts' pod type), so ROLLOUT_TP=32. With 4 KV heads, TP32 replicates each KV head
-# on 8 ranks. Expert parallelism (ROLLOUT_EP = ROLLOUT_TP = 32, i.e. 4 whole experts per rank) avoids splitting
-# moe_intermediate_size 768 into 24-column TP shards; verl turns it into vLLM's enable_expert_parallel.
+# Rollout: 4 vLLM replicas, one per rollout host (ROLLOUT_TP=4, ROLLOUT_DP=4). With 4 KV heads, TP4 holds one KV head
+# per rank (TP16 would replicate each KV head on 4 ranks). Expert parallelism over each replica's TP group (EP4, i.e.
+# 32 whole experts per rank) avoids splitting moe_intermediate_size 768 into TP shards; verl turns it into vLLM's
+# enable_expert_parallel. On v5p 2x2x4 at 128 prompts x 8 this halved the step time vs one TP16/EP16 replica
+# (~110 s -> ~50 s; rollout wait 66-82 s -> 8-12 s; weight sync 22 s -> 27 s). ROLLOUT_TP=16 ROLLOUT_DP=1 restores
+# the single-replica layout.
+#
+# Submit with USE_MOE_SPARSE_CORE=0 (and VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=USE_MOE_SPARSE_CORE) in the Ray job's
+# runtime env so the vLLM workers on v5p use the TensorCore MoE path.
 
 set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
-# TPU 7x: selects the 4D (X, Y, Z, cores per chip) topology map in platform_tpu.
-export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-tpu7x}"
+# TPU v5p: selects TPU_V5P_TOPOLOGY_MAP in platform_tpu.
+export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v5p}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
-# JAX/XLA Launch Barrier Configuration
-export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_use_enhanced_launch_barrier=false}"
+# libtpu flags (forwarded to the Ray workers by verl/trainer/constants_ppo.py):
+# - enhanced launch barrier off (distributed hangs, b/477673365);
+# - 64 MiB scoped VMEM, as in the v5p runs this recipe was tuned with;
+# - async FSDP all-gather offloaded to the SparseCores: update_actor -2.7% on v5p 2x2x4 (9.35 s -> 9.10 s at
+#   128 prompts x 8, numerics unchanged). Do not add --xla_tpu_enable_async_collective_fusion* /
+#   --xla_tpu_overlap_compute_collective_tc on top: together with these, libtpu fails to initialize.
+export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:---xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_scoped_vmem_limit_kib=65536 --xla_enable_async_all_gather=true --xla_tpu_prefer_async_allgather_to_allreduce=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true}"
 
 # PyTorch Dynamo / Compile Logging and Recompile Limits
 export TORCH_LOGS="${TORCH_LOGS:-recompiles}"
@@ -55,24 +59,34 @@ CHECKPOINT_BACKEND="${CHECKPOINT_BACKEND:-raiden}"
 # Free the bf16 tensors Raiden sends from and the WeightSynchronizer pinning them after each transfer, so they
 # do not stay resident through training until the next sync.
 RELEASE_SYNC_BUFFERS="${RELEASE_SYNC_BUFFERS:-True}"
-# Full AC, as in the 8B/32B recipes and torchtitan's Qwen3-30B-A3B TPU 7x recipe (full_ac).
+# Full AC, as in the 8B/32B recipes and torchtitan's Qwen3-30B-A3B TPU v5p recipe (full_ac).
 ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-full}"
 # SimpleFSDP: FSDP all-gather/reduce-scatter traced into each compiled TransformerBlock. Set False for FSDP2.
 USE_SIMPLE_FSDP="${USE_SIMPLE_FSDP:-True}"
 # torch_tpu eager mode for the ops outside the compiled blocks; see run_qwen3_8b_torchtitan.sh.
 TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_AND_FUSE}"
 # KL-to-reference loss, off by default: the reference model keeps a second fp32 copy of the weights
-# (~3.8 GiB per device at 30B on 32 devices) and doubles the trainer's checkpoint load time.
+# (~7.6 GiB per chip at 30B on 16 chips) and doubles the trainer's checkpoint load time.
 USE_KL_LOSS="${USE_KL_LOSS:-False}"
-# Pack sequences into micro-batches of up to MAX_TOKEN_LEN_PER_GPU tokens (use_dynamic_bsz) for training and log-prob
-# passes. Must stay >= MAX_MODEL_LEN. Each micro-batch has a large fixed cost on TPU (FSDP collectives), so a few
-# packed micro-batches are much faster than one sequence per micro-batch (v5p 2x2x4, 48 layers: update_actor
-# 54 s -> 8 s per step).
+# Token budget per micro-batch (use_dynamic_bsz packs sequences up to it, for training and log-prob passes); must be
+# >= MAX_MODEL_LEN. Every micro-batch costs ~2.6 s on v5p 2x2x4 regardless of size (FSDP Zero-3 gathers all 30.5B
+# params), so size the budget to fit each chip's whole mini-batch share in ONE micro-batch:
+#   - 32 prompts x 8 (~5.4k tokens/chip): 8192 (update_actor 7.0 s -> 4.1 s vs 4096)
+#   - TRAIN_BATCH_SIZE=128 (~21k tokens/chip): 24576 (update_actor 9.3 s, ~11% MFU)
+# Optional: VERL_TPU_STATIC_MICRO_BATCH_LEN=<budget> pads every micro-batch to that length, so only one shape is
+# compiled (avoids ~60 s recompiles when the packed length moves to a new bucket).
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
-MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-4096}"
+MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-8192}"
 # Packed micro-batch lengths are padded to a multiple of this; a coarse bucket keeps the set of compiled shapes small
 # (with 256, almost every step hit a new length and recompiled for ~40 s).
 export VERL_TPU_SEQ_BUCKET_SIZE="${VERL_TPU_SEQ_BUCKET_SIZE:-1024}"
+# Splash attention tile cap: packed micro-batches are long (8-24k tokens) and Splash's grid grows as (len / block)^2;
+# 1024 instead of 512 cut update_actor by 17% at 24k tokens (2048 is the same, 4096 exceeds VMEM on v5p).
+export VERL_TPU_SPLASH_MAX_BLOCK="${VERL_TPU_SPLASH_MAX_BLOCK:-1024}"
+# TorchTitan's paired W1/W3 Pallas expert kernel with the kernel-native expert weight layout (as in its Qwen3-30B-A3B
+# TPU recipe): -1.6% update_actor; checkpoint/HF names unchanged (state-dict hooks), Raiden exact parity verified.
+export VERL_TPU_MOE_PAIRED_GMM="${VERL_TPU_MOE_PAIRED_GMM:-1}"
+export VERL_TPU_MOE_NATIVE_LAYOUT="${VERL_TPU_MOE_NATIVE_LAYOUT:-1}"
 # FSDP2 reshard policy (ignored with USE_SIMPLE_FSDP=True).
 RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-always}"
 TEST_FREQ="${TEST_FREQ:-10}"
@@ -99,24 +113,27 @@ if [[ "${STAGE_MODEL}" == "1" ]]; then
     python3 "$(dirname "${BASH_SOURCE[0]}")/stage_model_local.py" "${MODEL_SRC_PATH}" "${MODEL_PATH}" 8
 fi
 
-# TPU 2-slice TPU 7x 2x2x4 configurations
-export NNODES_TRAINER="${NNODES_TRAINER:-4}"     # 4 physical VM hosts for training slice
-export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-8}"   # 8 TPU devices (4 chips x 2 TensorCores) per training host
+# 2 x TPU v5p 2x2x4 slices
+export NNODES_TRAINER="${NNODES_TRAINER:-4}"     # 4 VM hosts in the training slice
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"   # 4 v5p chips per training host
 
-export NNODES_ROLLOUT="${NNODES_ROLLOUT:-4}"     # 4 physical VM hosts for rollout slice
-export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-8}"   # 8 TPU devices (4 chips x 2 TensorCores) per rollout host
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-4}"     # 4 VM hosts in the rollout slice
+export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"   # 4 v5p chips per rollout host
 
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
-ROLLOUT_TP="${ROLLOUT_TP:-${TOTAL_ROLLOUT_CHIPS}}"
-# Must be 1 (off) or ROLLOUT_TP * rollout data_parallel_size (verl/workers/config/rollout.py).
-ROLLOUT_EP="${ROLLOUT_EP:-${ROLLOUT_TP}}"
+# One TP=ROLLOUT_TP replica per ROLLOUT_TP chips; NNODES_ROLLOUT x N_CHIPS_ROLLOUT must equal ROLLOUT_DP x ROLLOUT_TP.
+ROLLOUT_TP="${ROLLOUT_TP:-${N_CHIPS_ROLLOUT}}"
+ROLLOUT_DP="${ROLLOUT_DP:-$((TOTAL_ROLLOUT_CHIPS / ROLLOUT_TP))}"
+# Must be 1 (off) or ROLLOUT_TP * ROLLOUT_DP (verl/workers/config/rollout.py); each TPU replica then runs expert
+# parallelism over its own TP group (tpu_replica_rollout_config).
+ROLLOUT_EP="${ROLLOUT_EP:-$((ROLLOUT_TP * ROLLOUT_DP))}"
 
 # Sequence budget
 MAX_PROMPT_LEN=512
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))
 
-# Actor parallelism (default: Full FSDP across all 32 trainer devices: tp=1, dp_shard=32, no expert parallelism,
+# Actor parallelism (default: Full FSDP across all 16 trainer chips: tp=1, dp_shard=16, no expert parallelism,
 # like torchtitan's FSDP-only Qwen3-30B-A3B TPU recipe).
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / TENSOR_PARALLEL_SIZE))
@@ -182,6 +199,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.torchtitan.reshard_after_forward="${RESHARD_AFTER_FORWARD}" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    actor_rollout_ref.rollout.data_parallel_size="${ROLLOUT_DP}" \
     actor_rollout_ref.rollout.expert_parallel_size="${ROLLOUT_EP}" \
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
