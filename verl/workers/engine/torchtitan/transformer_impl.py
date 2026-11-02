@@ -57,8 +57,10 @@ from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
 from verl.workers.engine.torchtitan.tpu_utils import (
+    FusedLogprobOutput,
     align_micro_batch_shapes_across_ranks,
     apply_fp32_logits_tpu,
+    apply_fused_logprob_tpu,
     apply_splash_attention_tpu,
     apply_tpu_precision_patches,
     bucket_length,
@@ -121,6 +123,13 @@ if device_name == "tpu":
     monkey_patch_varlen_attention_tpu()
 
 
+def _as_python_float(value) -> float:
+    """A Python float for a scalar that may arrive as a float, a NumPy scalar or a one-element tensor."""
+    if isinstance(value, torch.Tensor):
+        return float(value.item())
+    return float(value)
+
+
 class TorchTitanEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch TorchTitan parallelism.
@@ -154,6 +163,7 @@ class TorchTitanEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
         self.engine_config.check_device_support(device_name)
+        self._fused_logprob_heads: list[torch.nn.Module] = []
 
         # Derive torchtitan model name and flavor from HF config
         torchtitan_name, torchtitan_flavor = derive_torchtitan_name_and_flavor(self.model_config.hf_config)
@@ -265,6 +275,11 @@ class TorchTitanEngine(BaseEngine):
             training_kwargs["steps"] = total_steps
         if self.engine_config.max_seq_len is not None:
             training_kwargs["seq_len"] = self.engine_config.max_seq_len
+        # VERL_TPU_MIXED_PRECISION_REDUCE=bfloat16 (performance A/B): FSDP gradient reduce-scatter in bf16 instead of
+        # TorchTitan's fp32 default; halves the reduce-scatter traffic. #76 keeps fp32 for numerics.
+        reduce_dtype = os.getenv("VERL_TPU_MIXED_PRECISION_REDUCE", "").strip()
+        if device_name == "tpu" and reduce_dtype:
+            training_kwargs["mixed_precision_reduce"] = reduce_dtype
         if (self.engine_config.offload_policy or self.engine_config.forward_only) and device_name != "tpu":
             training = TrainingConfig(enable_cpu_offload=True, **training_kwargs)
         else:
@@ -309,6 +324,13 @@ class TorchTitanEngine(BaseEngine):
             apply_tpu_precision_patches(self.trainer.model_parts)
             if self.engine_config.fp32_logits:
                 apply_fp32_logits_tpu(self.trainer.model_parts)
+            # VERL_TPU_FUSED_LOGPROB=1: the LM head returns per-token log-probs computed in token chunks, so the
+            # [T, vocab] logits (and their log-softmax and gradient) are never materialized.
+            if os.getenv("VERL_TPU_FUSED_LOGPROB", "0").strip().lower() in ("1", "true", "yes", "on"):
+                if self.parallel_dims.tp_enabled or self.parallel_dims.pp_enabled:
+                    logger.warning("VERL_TPU_FUSED_LOGPROB is not supported with TP/PP; using the unfused LM head")
+                else:
+                    self._fused_logprob_heads = apply_fused_logprob_tpu(self.trainer.model_parts)
 
         self._use_splash_attention = device_name == "tpu" and self.engine_config.use_splash_attention
         if self._use_splash_attention:
@@ -1160,6 +1182,26 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
 
         return input_ids, extra_inputs, extra_kwargs, output_args
 
+    def _fused_logprob_args(self, micro_batch: TensorDict, output_args: dict, forward_only: bool) -> dict | None:
+        """Arguments for the fused log-prob LM head, or None to use the unfused head for this micro-batch."""
+        if not self._fused_logprob_heads:
+            return None
+        use_remove_padding = unwrap_metadata(
+            tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+        )
+        calculate_entropy = unwrap_metadata(
+            tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+        )
+        # The fused head computes entropy without a gradient, so an entropy loss falls back to the unfused head.
+        if not use_remove_padding or (calculate_entropy and not forward_only and torch.is_grad_enabled()):
+            return None
+        return {
+            "labels": output_args["labels"],
+            "temperature": _as_python_float(unwrap_metadata(micro_batch["temperature"])),
+            "calculate_entropy": bool(calculate_entropy),
+            "fp32_logits": bool(self.engine_config.fp32_logits),
+        }
+
     def prepare_model_outputs(self, logits, output_args, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         use_remove_padding = unwrap_metadata(use_remove_padding)
@@ -1184,7 +1226,12 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             logits = logits.full_tensor()
         if use_remove_padding:
             labels = labels.squeeze(0)
-            if isinstance(logits, DTensor):
+            if isinstance(logits, FusedLogprobOutput):
+                # VERL_TPU_FUSED_LOGPROB: the LM head already produced log-probs (and entropy) per token.
+                log_probs = logits.log_probs
+                if calculate_entropy:
+                    entropy_rmpad = logits.entropy.squeeze(0)
+            elif isinstance(logits, DTensor):
                 tp_mesh = self.parallel_dims.get_optional_mesh("tp")
                 tp_group = tp_mesh.get_group() if tp_mesh is not None else None
                 log_probs = vocab_parallel_logprobs_from_logits(
@@ -1210,7 +1257,7 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
                     inplace_backward=inplace_backward,
                 )
 
-            if calculate_entropy:
+            if calculate_entropy and not isinstance(logits, FusedLogprobOutput):
                 if not self.engine_config.entropy_checkpointing:
                     if self.engine_config.entropy_from_logits_with_chunking:
                         entropy_rmpad = self.compute_entropy_from_logits(
@@ -1273,9 +1320,16 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             micro_batch = micro_batch.to(get_device_id())
 
         input_ids, extra_inputs, extra_kwargs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        fused_args = self._fused_logprob_args(micro_batch, output_args, forward_only)
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
+            for head in self._fused_logprob_heads:
+                head._verl_fused_logprob_args = fused_args
+            try:
+                logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
+            finally:
+                for head in self._fused_logprob_heads:
+                    head._verl_fused_logprob_args = None
 
             model_output = self.prepare_model_outputs(logits=logits, output_args=output_args, micro_batch=micro_batch)
 

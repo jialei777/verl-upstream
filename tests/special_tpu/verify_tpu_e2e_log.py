@@ -14,6 +14,7 @@
 """Verify the Ray job log of a TPU CI test.
 
 Tests: smoke (TPU platform), raiden_raw (tpu-sync raw transfer, tests/special_tpu/raiden_raw_transfer_test.py),
+fused_logprob (Tokamax fused LM-head log-probs, tests/special_tpu/fused_logprob_tokamax_test.py),
 sft (trainer), grpo (RL, including the Raiden weight-sync parity checks), raiden_sync
 (tests/special_tpu/raiden_sync_test.py).
 
@@ -137,14 +138,22 @@ def verify_raiden_raw(text: str, smoke_test: bool) -> None:
     print("[TPU CI] Raiden raw-transfer test verified.")
 
 
+def verify_fused_logprob(text: str, smoke_test: bool) -> None:
+    """tests/special_tpu/fused_logprob_tokamax_test.py: Tokamax fused log-probs match the unfused math."""
+    if "[fused logprob] PASSED" not in text:
+        sys.exit("[TPU CI] ERROR: Tokamax fused log-prob test did not report PASSED.")
+    print("[TPU CI] Tokamax fused log-prob test verified.")
+
+
 VERIFIERS = {
     "smoke": verify_smoke,
     "raiden_raw": verify_raiden_raw,
+    "fused_logprob": verify_fused_logprob,
     "sft": verify_sft,
     "grpo": verify_grpo,
     "raiden_sync": verify_raiden_sync,
 }
-NO_TRAINING_STEPS = ("smoke", "raiden_raw")
+NO_TRAINING_STEPS = ("smoke", "raiden_raw", "fused_logprob")
 
 
 def main() -> None:

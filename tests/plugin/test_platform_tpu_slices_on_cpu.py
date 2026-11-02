@@ -254,6 +254,25 @@ def test_tpu_replica_rollout_config_folds_dp():
     assert tpu_replica_rollout_config(Cfg()).data_parallel_size == 1
 
 
+def test_tpu_replica_rollout_config_scopes_ep_to_replica():
+    # EP over TP x DP at the config level becomes EP over the replica's TP group.
+    cfg = OmegaConf.create({"data_parallel_size": 4, "tensor_model_parallel_size": 4, "expert_parallel_size": 16})
+    replica_cfg = tpu_replica_rollout_config(cfg)
+    assert replica_cfg.expert_parallel_size == 4 and replica_cfg.data_parallel_size == 1
+    assert cfg.expert_parallel_size == 16
+
+    @dataclasses.dataclass(frozen=True)
+    class Cfg:
+        data_parallel_size: int = 4
+        tensor_model_parallel_size: int = 4
+        expert_parallel_size: int = 16
+
+    assert tpu_replica_rollout_config(Cfg()).expert_parallel_size == 4
+    # EP off stays off.
+    no_ep = OmegaConf.create({"data_parallel_size": 4, "tensor_model_parallel_size": 4, "expert_parallel_size": 1})
+    assert tpu_replica_rollout_config(no_ep).expert_parallel_size == 1
+
+
 def test_slice_objects_are_comparable():
     a = TPUSlice("tpu-group-1", ["10.0.0.1"], 4)
     assert a == TPUSlice("tpu-group-1", ["10.0.0.1"], 4)
