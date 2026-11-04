@@ -5,8 +5,8 @@ FROM rayproject/ray:2.56.0-py312
 
 ARG TORCH_TPU_VERSION=0.2.0
 ARG TPU_SYNC_VERSION=0.0.1.dev20261012084241
-# 10/25/2026 HEAD of torchtitan
-ARG TORCHTITAN_COMMIT=89ef29b5a0d03a6883079ab37ff1bdc498fe3485
+# 11/03/2026 HEAD of torchtitan (jax 0.12.0.1, tokamax 0.0.17)
+ARG TORCHTITAN_COMMIT=8ad0bfcdebd927c2fedef8c1e2155bd859c280f5
 # Optimized Qwen3.5 with Expert parallelism (EP > 1):
 # ARG TORCHTITAN_COMMIT=a7aad99bc17dc4ae36b9d2d6920f3d71fb71e51b
 
@@ -31,7 +31,7 @@ libtpu_links=https://storage.googleapis.com/jax-releases/libtpu_releases.html
 torch_index=https://download.pytorch.org/whl/cpu
 # All packages come from public indexes (PyPI, the PyTorch CPU index, the libtpu release page).
 # jax/jaxlib: the vllm-torchtpu pin; libtpu, tokamax and torchao: torchtitan/experiments/tpu/requirements.txt.
-torch=2.13.0 torchvision=0.28.0 jax=0.11.2 libtpu=0.0.50
+torch=2.13.0 torchvision=0.28.0 jax=0.12.0.1 libtpu=0.0.50
 transformers="transformers>=5.18.0,<5.20.0"
 tensordict="tensordict==0.15.1"
 export PIP_CACHE_DIR=/root/.cache/pip PIP_ROOT_USER_ACTION=ignore
