@@ -380,8 +380,7 @@ def run_case(trainer_wg, sampler_slice: TPUSlice, num_replicas: int, tp_size: in
             assert all(r.global_steps == step for r in replicas), [r.global_steps for r in replicas]
             # Every sync, every rank of every replica: the received tensors equal the checkpoint slice, bit for bit.
             results = [ray.get([w.last_exact_result.remote() for w in r.workers]) for r in replicas]
-            if not report_exact_parity(step, results, labels):  # raises TPUSyncParityError with fail-on-mismatch
-                raise AssertionError(f"{name} step {step}: received tensors differ from the checkpoint")
+            report_exact_parity(step, results, labels)  # raises TPUSyncParityError on any mismatch
             log(
                 f"{name} step {step}: bit-exact, total_sync={metrics['timing_s/tpu-sync/total_sync']:.3f}s "
                 f"p2p={metrics['timing_s/tpu-sync/p2p_transfer']:.3f}s"
