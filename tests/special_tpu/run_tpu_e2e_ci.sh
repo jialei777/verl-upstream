@@ -31,15 +31,18 @@
 #   sft           1 x v6e-4  queue 4chip  e2e_sft_llm_tpu.yml            examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
 #   grpo          2 x v6e-1  queue 2chip  e2e_v1_separate_async_tpu.yml  examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
 #   grpo_4b       2 x v6e-4  queue 8chip  nightly_tpu.yml                examples/tpu/grpo/run_qwen3_4b_torchtitan.sh
+#   tpu_sync      2 x v6e-4  queue 8chip  checkpoint_engine_tpu.yml      tests/special_tpu/tpu_sync_test.py
+#
+# The GRPO tests run with the tpu-sync parity checks on (verify_parity=all) and verify their results in the log.
 #
 # Usage:
-#   bash tests/special_tpu/run_tpu_e2e_ci.sh <tpu_platform|sft|grpo|grpo_4b>
+#   bash tests/special_tpu/run_tpu_e2e_ci.sh <tpu_platform|sft|grpo|grpo_4b|tpu_sync>
 #   bash tests/special_tpu/run_tpu_e2e_ci.sh teardown [test]   # delete this run's RayClusters
 #   bash tests/special_tpu/run_tpu_e2e_ci.sh build_image       # build (or find) the image of examples/tpu/grpo/Dockerfile
 
 set -euo pipefail
 
-USAGE="usage: $0 <tpu_platform|sft|grpo|grpo_4b|teardown|build_image> [test]"
+USAGE="usage: $0 <tpu_platform|sft|grpo|grpo_4b|tpu_sync|teardown|build_image> [test]"
 MODE="${1:?${USAGE}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
@@ -264,6 +267,16 @@ print(json.dumps({
     },
 }))
 ')"
+}
+
+runtime_env_with() {
+    # RUNTIME_ENV plus extra env_vars (KEY=VALUE arguments), for one test's Ray job: a test sets
+    # `local JOB_RUNTIME_ENV="$(runtime_env_with KEY=VALUE ...)"` before submit_and_verify_ray_job.
+    RUNTIME_ENV="${RUNTIME_ENV}" python3 -c '
+import json, os, sys
+env = json.loads(os.environ["RUNTIME_ENV"])
+env["env_vars"].update(kv.split("=", 1) for kv in sys.argv[1:])
+print(json.dumps(env))' "$@"
 }
 
 registry_access_token() {
@@ -598,7 +611,7 @@ submit_and_verify_ray_job() {
         --address "${RAY_ADDRESS}" \
         --submission-id "${sub_id}" \
         --working-dir "${VERL_SRC}" \
-        --runtime-env-json "${RUNTIME_ENV}" \
+        --runtime-env-json "${JOB_RUNTIME_ENV:-${RUNTIME_ENV}}" \
         --no-wait \
         "${submit_opts[@]}" \
         -- "${entrypoint[@]}"
@@ -732,12 +745,20 @@ test_sft() {
         bash examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
 }
 
+# tpu-sync weight-sync checks for the GRPO tests: the step-0 sync is compared bit for bit with the checkpoint vLLM
+# loaded and every later one by weight norms (verify_tpu_e2e_log.py requires both results in the log). The plugin
+# logs them at INFO, so the job runs with VERL_LOGGING_LEVEL=INFO.
+TPU_SYNC_VERIFY_PARITY="+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.tpu-sync.verify_parity=all"
+
 test_grpo() {
-    # The 5-step Qwen3-0.6B GRPO smoke test of examples/tpu/grpo as is (2 x v6e-1, the script's default
+    # The 5-step Qwen3-0.6B GRPO smoke test of examples/tpu/grpo (2 x v6e-1, the script's default
     # N_CHIPS_TRAINER=1 N_CHIPS_ROLLOUT=1): TorchTitan trainer on tpu-group-0, vLLM rollout on tpu-group-1,
-    # tpu-sync weight sync, V1 separate-async trainer.
+    # tpu-sync weight sync with its parity checks, V1 separate-async trainer.
+    local JOB_RUNTIME_ENV
+    JOB_RUNTIME_ENV="$(runtime_env_with VERL_LOGGING_LEVEL=INFO)"
     submit_and_verify_ray_job grpo 45 "--steps 5" -- \
-        env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
+        env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
+        "${TPU_SYNC_VERIFY_PARITY}"
 }
 
 test_grpo_4b() {
@@ -745,9 +766,22 @@ test_grpo_4b() {
     # to GRPO_4B_STEPS steps with validation before training and at the end.
     local steps="${GRPO_4B_STEPS:-20}"
     warm_model_cache "${TPU_CI_DATA_HOME}/assets/hf/Qwen3-4B"
+    local JOB_RUNTIME_ENV
+    JOB_RUNTIME_ENV="$(runtime_env_with VERL_LOGGING_LEVEL=INFO)"
     submit_and_verify_ray_job grpo_4b 120 "--steps ${steps}" -- \
         env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" TOTAL_TRAINING_STEPS="${steps}" TEST_FREQ="${steps}" \
-        bash examples/tpu/grpo/run_qwen3_4b_torchtitan.sh
+        bash examples/tpu/grpo/run_qwen3_4b_torchtitan.sh "${TPU_SYNC_VERIFY_PARITY}"
+}
+
+test_tpu_sync() {
+    # tpu-sync weight sync without vLLM (2 x v6e-4): TorchTitan trainer (GRPO actor config) on tpu-group-0 -> tpu-sync
+    # controller and transport -> fake single-chip rollout workers on tpu-group-1 running the plugin's sampler-side
+    # code; every received tensor is compared bit for bit with its TP slice of the checkpoint (1 x TP4, 2 x TP2,
+    # TP4 keeping the send buffers; 3 syncs each).
+    local JOB_RUNTIME_ENV
+    JOB_RUNTIME_ENV="$(runtime_env_with VERL_LOGGING_LEVEL=INFO)"
+    submit_and_verify_ray_job tpu_sync 30 "" -- \
+        env TPU_SYNC_TEST_MODEL_PATH="${TPU_CI_DATA_HOME}/assets/hf/Qwen3-0.6B" python3 tests/special_tpu/tpu_sync_test.py
 }
 
 provision_test_cluster() {
@@ -756,7 +790,7 @@ provision_test_cluster() {
         tpu_platform) provision_ray_cluster "${test_name}" v6e-1 1 2 8Gi 32 128Gi ;;
         sft) provision_ray_cluster "${test_name}" v6e-4 1 4 16Gi 96 400Gi ;;
         grpo) provision_ray_cluster "${test_name}" v6e-1 2 4 16Gi 32 128Gi ;;
-        grpo_4b) provision_ray_cluster "${test_name}" v6e-4 2 8 32Gi 96 400Gi ;;
+        grpo_4b | tpu_sync) provision_ray_cluster "${test_name}" v6e-4 2 8 32Gi 96 400Gi ;;
         *)
             echo "${USAGE}" >&2
             exit 1
