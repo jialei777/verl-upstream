@@ -28,6 +28,8 @@ This tests:
 - Edge cases
 """
 
+import math
+
 import pytest
 import torch
 
@@ -140,6 +142,7 @@ def test_basic_rollout_correction():
         ("seq_mean_k3", 2.0),
         ("seq_max_k2", 2.0),
         ("seq_max_k3", 2.0),
+        ("seq_mean_abs_exp", 2.0),
     ],
 )
 def test_each_supported_rollout_rs_option(option: str, threshold):
@@ -477,6 +480,77 @@ def test_seq_fraction_high_uses_raw_weights():
     )
 
     assert metrics["rollout_is_seq_fraction_high"] == pytest.approx(0.5)
+
+
+def test_seq_mask_tis_band_and_token_cap():
+    """seq_mask_tis zeroes whole out-of-band sequences, caps tokens at 5, and keeps the response mask."""
+    device = get_device_name() if is_device_available() else "cpu"
+    torch.manual_seed(0)
+    batch_size, seq_length = 4, 6
+    rollout_log_prob = torch.log(torch.rand(batch_size, seq_length, device=device) * 0.9 + 0.05)
+    old_log_prob = rollout_log_prob.clone()
+    old_log_prob[1] += math.log(1.0015)  # geometric mean 1.0015: inside [0.999, 1.002]
+    old_log_prob[2] += math.log(1.01)  # geometric mean 1.01: outside the band
+    old_log_prob[3, 0] += 2.0  # opposite-sign token errors cancel in the geometric mean
+    old_log_prob[3, 1] -= 2.0
+    response_mask = torch.ones(batch_size, seq_length, device=device)
+    response_mask[0, -1] = 0
+
+    weights_proto, modified_response_mask, metrics = compute_rollout_correction_and_rejection_mask(
+        old_log_prob=old_log_prob,
+        rollout_log_prob=rollout_log_prob,
+        response_mask=response_mask,
+        rollout_is="seq_mask_tis",
+        rollout_is_threshold="0.999_1.002",
+        rollout_rs=None,
+    )
+    weights = weights_proto.batch["rollout_is_weights"]
+
+    torch.testing.assert_close(weights[0], response_mask[0])  # identical policies: weight 1, 0 on padding
+    torch.testing.assert_close(weights[1], torch.full((seq_length,), 1.0015, device=device), atol=1e-5, rtol=0)
+    assert torch.all(weights[2] == 0)  # out-of-band sequence gets zero weight ...
+    assert torch.equal(modified_response_mask, response_mask)  # ... but stays in the loss denominator
+    assert weights[3, 0].item() == pytest.approx(5.0, abs=1e-4)  # exp(2) capped at 5
+    assert metrics["rollout_corr/rollout_is_seq_mask_tis_oob_ratio"] == pytest.approx(0.25)
+
+
+def test_seq_mask_tis_requires_band():
+    """seq_mask_tis needs a 'lower_upper' band; a single upper threshold is rejected."""
+    device = get_device_name() if is_device_available() else "cpu"
+    log_prob = torch.zeros(1, 3, device=device)
+    with pytest.raises(ValueError, match="lower_upper"):
+        compute_rollout_correction_and_rejection_mask(
+            old_log_prob=log_prob,
+            rollout_log_prob=log_prob,
+            response_mask=torch.ones_like(log_prob),
+            rollout_is="seq_mask_tis",
+            rollout_is_threshold=1.002,
+            rollout_rs=None,
+        )
+
+
+def test_seq_mean_abs_exp_drops_cancelling_errors():
+    """seq_mean_abs_exp uses |log ratio| per token, so errors that cancel in the geometric mean still reject."""
+    device = get_device_name() if is_device_available() else "cpu"
+    batch_size, seq_length = 2, 6
+    rollout_log_prob = torch.full((batch_size, seq_length), -1.0, device=device)
+    old_log_prob = rollout_log_prob.clone()
+    old_log_prob[1, 0] += 2.0  # mean_t exp(|delta|) = (2 e^2 + 4) / 6 ~ 3.13 > 2.0
+    old_log_prob[1, 1] -= 2.0
+    response_mask = torch.ones(batch_size, seq_length, device=device)
+
+    _, modified_response_mask, metrics = compute_rollout_correction_and_rejection_mask(
+        old_log_prob=old_log_prob,
+        rollout_log_prob=rollout_log_prob,
+        response_mask=response_mask,
+        rollout_is=None,
+        rollout_rs="seq_mean_abs_exp",
+        rollout_rs_threshold=2.0,
+    )
+
+    assert modified_response_mask[0].sum().item() == seq_length  # identical policies are kept
+    assert modified_response_mask[1].sum().item() == 0  # dropped from the loss denominator too
+    assert "rollout_corr/rollout_rs_seq_mean_abs_exp_mean" in metrics
 
 
 if __name__ == "__main__":

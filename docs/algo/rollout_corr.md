@@ -239,6 +239,14 @@ Importance sampling weights aggregation level:
 - `"sequence"`: Per-sequence weight ρ_seq = ∏_t ρ_t
   - Multiplicative aggregation across sequence
   - Typical threshold: 2.0 - 10.0
+- `"seq_mask_tis"`: Sequence-masked truncated IS (tunix / MLPerf DeepSWE `seq-mask-tis`)
+  - Each token keeps its own ratio ρ_t, capped at 5
+  - Every sequence whose geometric-mean ratio `exp(mean_t log ρ_t)` falls outside `[lower, upper]` gets all-zero weights
+  - Requires a `"lower_upper"` `rollout_is_threshold` (MLPerf uses `"0.999_1.002"`)
+  - Like IcePop, it does not modify `response_mask`: rejected sequences stay in the loss denominator, so the loss
+    shrinks with the rejection rate. Watch `rollout_is_seq_mask_tis_oob_ratio`; a systematic trainer/rollout log-prob
+    bias (for example from bf16 kernels) can push many sequences just outside a tight band, in which case widen the
+    lower edge (e.g. `"0.998_1.002"`) or reduce the bias.
 
 All IS weights are safety-bounded to [exp(-20), exp(20)] ≈ [2e-9, 5e8]
 
@@ -279,6 +287,9 @@ Rejection sampling aggregation modes. Supply a comma-separated string (spaces op
 - `seq_mean_k3`: Sequence-level rejection with mean of `exp(log r) - 1 - log r` (upper bound only)
 - `seq_max_k2`: Sequence-level rejection with max of `0.5 * (log r)^2` (upper bound only)
 - `seq_max_k3`: Sequence-level rejection with max of `exp(log r) - 1 - log r` (upper bound only)
+- `seq_mean_abs_exp`: Sequence-level rejection with mean of `exp(|log r|)`, the multiplicative probability error
+  (upper bound only; tunix `seq_logprob_error_threshold`, MLPerf DeepSWE uses `2.0`). Absolute values per token, so
+  opposite-sign disagreements cannot cancel; a token with zero rollout probability rejects the sequence.
 
 ### `rollout_rs_threshold` (str, float, or null)
 
@@ -287,6 +298,7 @@ Threshold specification for rejection sampling.
 - Provide **one entry per option**, separated by commas. A single entry is broadcast to every option.
 - **K1 KL modes (`*k1`)**: Use `"lower_upper"` strings (e.g. `"0.7_1.3"`). Supplying a float implies only the upper bound; the lower bound defaults to its reciprocal.
 - **K2/K3 KL modes (`*k2`/`*k3`)**: Supply positive upper bounds (float or numeric string).
+- **`seq_mean_abs_exp`**: Supply an upper bound greater than 1 (float or numeric string).
 - Set to `null` to disable thresholds entirely (only valid when `rollout_rs` is null).
 
 ### `score_centering` (bool)
