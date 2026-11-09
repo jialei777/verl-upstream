@@ -18,9 +18,13 @@ Tests (see tests/special_tpu/run_tpu_e2e_ci.sh):
     sft      - examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh, SMOKE_TEST=1
     grpo     - examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh (5-step smoke test)
     grpo_4b  - examples/tpu/grpo/run_qwen3_4b_torchtitan.sh (nightly, with validation)
+    tpu_sync - tests/special_tpu/tpu_sync_test.py (tpu-sync weight sync, bit for bit, without vLLM)
+
+The GRPO tests run with the tpu-sync parity checks on (verify_parity=all); their verifiers also require the
+checks' results in the log (see verify_tpu_sync_parity).
 
 Usage:
-    python3 tests/special_tpu/verify_tpu_e2e_log.py <smoke|sft|grpo|grpo_4b> <log_file> [--steps N]
+    python3 tests/special_tpu/verify_tpu_e2e_log.py <smoke|sft|grpo|grpo_4b|tpu_sync> <log_file> [--steps N]
 """
 
 import argparse
@@ -106,8 +110,32 @@ def _rollout_vs_trainer(steps: dict[int, dict[str, float]], name: str) -> list[f
     return _series(steps, f"rollout_corr/{name}") or _series(steps, f"actor/rollout_corr/{name}")
 
 
+def verify_tpu_sync_parity(text: str) -> str:
+    """Check that the tpu-sync parity checks (verify_parity=all) ran on every weight sync and passed.
+
+    verl-hardware-plugin logs the results of its parity checks; with fail-on-mismatch it also stops the run.
+    Requiring them here makes sure the checks actually ran: a config or logging change that silently turned them
+    off would otherwise pass CI.
+    """
+    if "TPU-SYNC PARITY MISMATCH" in text or "TPUSyncParityError" in text:
+        _fail("a tpu-sync parity check failed (see the [TPU-SYNC PARITY ...] lines in the log).")
+    synced = {int(s) for s in re.findall(r"\[TPU-SYNC TELEMETRY \| Orchestrator\] Step (\d+) Completed", text)}
+    if 0 not in synced:
+        _fail("no tpu-sync step-0 weight sync ([TPU-SYNC TELEMETRY | Orchestrator] Step 0) in the log.")
+    if not re.search(r"\[TPU-SYNC PARITY EXACT \| Step 0\] .* 0 mismatched, 0 unresolved", text):
+        _fail("the tpu-sync step-0 exact parity check did not run or did not report 0 mismatched, 0 unresolved.")
+    verified = {int(s) for s in re.findall(r"\[TPU-SYNC PARITY VERIFIED \| Step (\d+)", text)}
+    unverified = sorted(synced - {0} - verified)
+    if unverified:
+        _fail(f"the tpu-sync syncs at steps {unverified} have no [TPU-SYNC PARITY VERIFIED] norm check.")
+    if not re.search(r"timing_s/tpu-sync/total_sync[:\s]+[0-9.eE+-]+", text):
+        _fail("no timing_s/tpu-sync/total_sync metric in the log.")
+    return f"tpu-sync exact parity at step 0, norm parity at steps {sorted(verified)}"
+
+
 def _verify_grpo_common(text: str, args: argparse.Namespace) -> tuple[dict[int, dict[str, float]], str]:
     steps = _training_steps(text, args.steps)
+    parity_summary = verify_tpu_sync_parity(text)
     _check_finite(steps, ["actor/grad_norm", "actor/pg_loss", "critic/rewards/mean"])
     grad_norms = _series(steps, "actor/grad_norm")
     if not grad_norms or max(grad_norms) <= 0.0:
@@ -124,7 +152,7 @@ def _verify_grpo_common(text: str, args: argparse.Namespace) -> tuple[dict[int, 
     if corrs and min(corrs) < 0.9:
         _fail(f"rollout vs trainer log-prob Pearson correlation below 0.9: {[round(c, 4) for c in corrs]}")
     summary = f"max rollout-vs-trainer KL {max(kls):.5f}" + (f", min Pearson {min(corrs):.4f}" if corrs else "")
-    return steps, summary
+    return steps, f"{summary}, {parity_summary}"
 
 
 def verify_grpo(text: str, args: argparse.Namespace) -> None:
@@ -160,7 +188,30 @@ def verify_grpo_4b(text: str, args: argparse.Namespace) -> None:
     )
 
 
-VERIFIERS = {"smoke": verify_smoke, "sft": verify_sft, "grpo": verify_grpo, "grpo_4b": verify_grpo_4b}
+def verify_tpu_sync(text: str, args: argparse.Namespace) -> None:
+    """tests/special_tpu/tpu_sync_test.py: every case and every sync bit-exact (the script exits non-zero otherwise)."""
+    if not re.search(r"\[tpu-sync test\] PASSED: (\d+)/\1 cases", text):
+        _fail("the tpu-sync test did not report PASSED for every case.")
+    exact_syncs = re.findall(r"\[tpu-sync test\] (\S+ release=\S+) step (\d+): bit-exact", text)
+    if not exact_syncs:
+        _fail("the tpu-sync test logged no bit-exact sync.")
+    if "TPU-SYNC PARITY MISMATCH" in text or "TPUSyncParityError" in text:
+        _fail("a tpu-sync parity check of the engine failed (see the [TPU-SYNC PARITY ...] lines in the log).")
+    if not re.search(r"\[TPU-SYNC PARITY EXACT \| Step 0[^\]]*\] .* 0 mismatched, 0 unresolved", text):
+        _fail("the engine's step-0 exact parity check did not run or did not report 0 mismatched, 0 unresolved.")
+    if "[TPU-SYNC PARITY VERIFIED" not in text:
+        _fail("the engine's norm parity check did not run.")
+    cases = sorted({case for case, _ in exact_syncs})
+    print(f"[TPU CI] tpu-sync test verified: {len(exact_syncs)} bit-exact syncs over cases {cases}.")
+
+
+VERIFIERS = {
+    "smoke": verify_smoke,
+    "sft": verify_sft,
+    "grpo": verify_grpo,
+    "grpo_4b": verify_grpo_4b,
+    "tpu_sync": verify_tpu_sync,
+}
 
 
 def main() -> None:
