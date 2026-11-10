@@ -16,8 +16,8 @@
 Tests (see tests/special_tpu/run_tpu_e2e_ci.sh):
     smoke    - tests/special_tpu/tpu_smoke_test.py (1 chip)
     sft      - examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh, SMOKE_TEST=1
-    grpo     - examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh (5-step smoke test)
-    grpo_4b  - examples/tpu/grpo/run_qwen3_4b_torchtitan.sh (nightly, with validation)
+    grpo     - examples/tpu/grpo/run_qwen3_torchtitan.sh MODEL_SIZE=0.6B (5-step smoke test)
+    grpo_4b  - examples/tpu/grpo/run_qwen3_torchtitan.sh MODEL_SIZE=4B (nightly, with validation)
     tpu_sync - tests/special_tpu/tpu_sync_test.py (tpu-sync weight sync, bit for bit, without vLLM)
 
 The GRPO tests run with the tpu-sync parity checks on (verify_parity=all); their verifiers also require the

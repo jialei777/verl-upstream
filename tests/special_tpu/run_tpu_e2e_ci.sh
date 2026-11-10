@@ -29,8 +29,8 @@
 # Tests (one per workflow, see tests/special_tpu/README.md):
 #   tpu_platform  1 x v6e-1  queue 1chip  tpu_unit_tests.yml             tests/special_tpu/tpu_smoke_test.py
 #   sft           1 x v6e-4  queue 4chip  e2e_sft_llm_tpu.yml            examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh
-#   grpo          2 x v6e-1  queue 2chip  e2e_v1_separate_async_tpu.yml  examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh
-#   grpo_4b       2 x v6e-4  queue 8chip  nightly_tpu.yml                examples/tpu/grpo/run_qwen3_4b_torchtitan.sh
+#   grpo          2 x v6e-1  queue 2chip  e2e_v1_separate_async_tpu.yml  examples/tpu/grpo/run_qwen3_torchtitan.sh (MODEL_SIZE=0.6B)
+#   grpo_4b       2 x v6e-4  queue 8chip  nightly_tpu.yml                examples/tpu/grpo/run_qwen3_torchtitan.sh (MODEL_SIZE=4B)
 #   tpu_sync      2 x v6e-4  queue 8chip  checkpoint_engine_tpu.yml      tests/special_tpu/tpu_sync_test.py
 #
 # The GRPO tests run with the tpu-sync parity checks on (verify_parity=all) and verify their results in the log.
@@ -757,7 +757,7 @@ test_grpo() {
     local JOB_RUNTIME_ENV
     JOB_RUNTIME_ENV="$(runtime_env_with VERL_LOGGING_LEVEL=INFO)"
     submit_and_verify_ray_job grpo 45 "--steps 5" -- \
-        env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" bash examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh \
+        env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" MODEL_SIZE=0.6B bash examples/tpu/grpo/run_qwen3_torchtitan.sh \
         "${TPU_SYNC_VERIFY_PARITY}"
 }
 
@@ -769,8 +769,8 @@ test_grpo_4b() {
     local JOB_RUNTIME_ENV
     JOB_RUNTIME_ENV="$(runtime_env_with VERL_LOGGING_LEVEL=INFO)"
     submit_and_verify_ray_job grpo_4b 120 "--steps ${steps}" -- \
-        env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" TOTAL_TRAINING_STEPS="${steps}" TEST_FREQ="${steps}" \
-        bash examples/tpu/grpo/run_qwen3_4b_torchtitan.sh "${TPU_SYNC_VERIFY_PARITY}"
+        env RAY_DATA_HOME="${TPU_CI_DATA_HOME}" MODEL_SIZE=4B TOTAL_TRAINING_STEPS="${steps}" TEST_FREQ="${steps}" \
+        bash examples/tpu/grpo/run_qwen3_torchtitan.sh "${TPU_SYNC_VERIFY_PARITY}"
 }
 
 test_tpu_sync() {
