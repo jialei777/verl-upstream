@@ -38,7 +38,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import ray
 import torch
@@ -187,12 +187,14 @@ class FakeRolloutWorker:
 
         return vLLMTPUSyncWorkerExtension
 
-    # The extension methods that init_tpu_sync_on_worker calls on ``self``.
-    def _get_vllm_model(self):
-        return self._extension()._get_vllm_model(self)
-
-    def _wait_for_tpu_sync_rendezvous(self, rank_val, rendezvous_name=None):
-        return self._extension()._wait_for_tpu_sync_rendezvous(self, rank_val, rendezvous_name)
+    def __getattr__(self, name: str):
+        """The other extension methods that ``init_tpu_sync_on_worker`` calls on ``self`` (``_get_vllm_model``,
+        ``_get_tp_size``, ``_get_model_config``, ``_wait_for_tpu_sync_rendezvous``, ...), bound to this worker, so new
+        helpers in the plugin's ``TPUSyncWorkerMixin`` need no change here."""
+        if name.startswith("__"):
+            raise AttributeError(name)
+        attr = getattr(self._extension(), name)
+        return MethodType(attr, self) if callable(attr) else attr
 
     def init_tpu_sync_on_worker(self, **kwargs) -> bool:
         return self._extension().init_tpu_sync_on_worker(self, **kwargs)
