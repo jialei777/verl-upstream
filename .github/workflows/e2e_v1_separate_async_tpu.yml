@@ -137,7 +137,7 @@ jobs:
       - name: Install the Ray job CLI
         run: |
           python3 -m pip install --quiet "ray[default]==2.56.0"
-      - name: Running the GSM8K GRPO smoke test on 2 TPU v6e chips (examples/tpu/grpo/run_qwen3_0_6b_torchtitan.sh)
+      - name: Running the GSM8K GRPO smoke test on 2 TPU v6e chips (examples/tpu/grpo/run_qwen3_torchtitan.sh, MODEL_SIZE=0.6B)
         run: |
           bash tests/special_tpu/run_tpu_e2e_ci.sh grpo
       - name: Clean up the RayCluster
