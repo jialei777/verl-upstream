@@ -1,0 +1,149 @@
+# SFT on 1 Cloud TPU v6e-4 slice (TPU counterpart of e2e_sft_llm.yml / e2e_sft_llm_ascend.yml).
+#
+# Runs examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh (Qwen3-0.6B, GSM8K multi-turn SFT, TorchTitan FSDP2)
+# in both of its launch modes: torchrun (verl.trainer.sft_trainer, the default) and SFT_TRAINER_MODE=ray
+# (verl.trainer.sft_trainer_ray). See tpu_unit_tests.yml and tests/special_tpu/README.md for how the TPU
+# jobs work. The jobs only run in repositories that set the variable TPU_CI_RUNNER.
+
+name: e2e_sft_llm_tpu
+
+on:
+  push:
+    branches:
+      - main
+      - main-ci
+      - v0.*
+    paths:
+      - "verl/**/*.py"
+      - "verl/trainer/config/**"
+      # Not used on TPU
+      - "!verl/models/mcore/**"
+      - "!verl/workers/engine/automodel/**"
+      - "!verl/workers/engine/megatron/**"
+      - "!verl/workers/engine/mindspeed/**"
+      - "!verl/workers/engine/veomni/**"
+      - "!verl/workers/rollout/sglang_rollout/**"
+      - "!verl/workers/rollout/trtllm_rollout/**"
+      # Entrypoints
+      - "examples/tpu/sft/**"
+      - "tests/special_tpu/**"
+      # The CI image is built from it
+      - "examples/tpu/grpo/Dockerfile"
+      - "!**/*.md"
+      - ".github/workflows/e2e_sft_llm_tpu.yml"
+  pull_request:
+    branches:
+      - main
+      - main-ci
+      - v0.*
+    paths:
+      - "verl/**/*.py"
+      - "verl/trainer/config/**"
+      # Not used on TPU
+      - "!verl/models/mcore/**"
+      - "!verl/workers/engine/automodel/**"
+      - "!verl/workers/engine/megatron/**"
+      - "!verl/workers/engine/mindspeed/**"
+      - "!verl/workers/engine/veomni/**"
+      - "!verl/workers/rollout/sglang_rollout/**"
+      - "!verl/workers/rollout/trtllm_rollout/**"
+      # Entrypoints
+      - "examples/tpu/sft/**"
+      - "tests/special_tpu/**"
+      # The CI image is built from it
+      - "examples/tpu/grpo/Dockerfile"
+      - "!**/*.md"
+      - ".github/workflows/e2e_sft_llm_tpu.yml"
+  workflow_dispatch:
+    inputs:
+      verl_repo:
+        description: "verl repository to test, e.g. a fork (empty: VERL_REPO in tests/special_tpu/gke/tpu-ci.env, verl-project/verl)"
+        required: false
+        default: ""
+        type: string
+      verl_commit:
+        description: "verl full commit id, branch or tag to test (empty: VERL_COMMIT in tests/special_tpu/gke/tpu-ci.env, main)"
+        required: false
+        default: ""
+        type: string
+      plugin_repo:
+        description: "verl-hardware-plugin repository, e.g. a fork (empty: VERL_HARDWARE_PLUGIN_REPO in tests/special_tpu/gke/tpu-ci.env)"
+        required: false
+        default: ""
+        type: string
+      plugin_commit:
+        description: "verl-hardware-plugin full commit id, branch or tag (empty: VERL_HARDWARE_PLUGIN_COMMIT in tests/special_tpu/gke/tpu-ci.env)"
+        required: false
+        default: ""
+        type: string
+
+# Cancel jobs on the same ref if a new one is triggered
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/main-ci' }}
+
+# Declare permissions just read content.
+permissions:
+  contents: read
+
+env:
+  # The self-hosted runners run as root.
+  PIP_ROOT_USER_ACTION: ignore
+  # Give up after waiting this long in the Kueue queue for TPU quota.
+  QUEUE_TIMEOUT_MINS: "90"
+  # Give up if the admitted RayCluster's pods are not all running after this long (TPU node scale-up, or
+  # hosts still held by an earlier CI job).
+  POD_READY_TIMEOUT_MINS: "60"
+  # Empty unless set by hand; the script then uses the plugin repository and commit pinned in tpu-ci.env.
+  VERL_HARDWARE_PLUGIN_REPO: ${{ github.event.inputs.plugin_repo }}
+  VERL_HARDWARE_PLUGIN_COMMIT: ${{ github.event.inputs.plugin_commit }}
+  # Empty unless set by hand; the script then uses VERL_REPO / VERL_COMMIT in tpu-ci.env (verl-project/verl main).
+  VERL_REPO: ${{ github.event.inputs.verl_repo }}
+  VERL_COMMIT: ${{ github.event.inputs.verl_commit }}
+
+jobs:
+  build_image:
+    if: vars.TPU_CI_RUNNER != ''
+    name: Build the TPU CI image (examples/tpu/grpo/Dockerfile)
+    runs-on: ${{ vars.TPU_CI_RUNNER }}
+    timeout-minutes: 120
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      verl_commit: ${{ steps.image.outputs.verl_commit }}
+      plugin_commit: ${{ steps.image.outputs.plugin_commit }}
+    steps:
+      - name: Checkout verl
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build the image, or find it in Artifact Registry if this Dockerfile was built before
+        id: image
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh build_image
+
+  e2e_sft_llm_tpu:
+    needs: build_image
+    if: vars.TPU_CI_RUNNER != ''
+    name: GSM8K SFT Qwen3-0.6B on 1 x TPU v6e-4 (TorchTitan, torchrun + Ray)
+    runs-on: ${{ vars.TPU_CI_RUNNER }}
+    timeout-minutes: 240 # Includes waiting for TPU quota (Kueue) and TPU hosts.
+    env:
+      # Resolved and built by the build_image job: the test runs exactly these commits on that image.
+      TPU_CI_IMAGE: ${{ needs.build_image.outputs.image }}
+      VERL_COMMIT: ${{ needs.build_image.outputs.verl_commit }}
+      VERL_HARDWARE_PLUGIN_COMMIT: ${{ needs.build_image.outputs.plugin_commit }}
+    steps:
+      - name: Checkout verl
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Install the Ray job CLI
+        run: |
+          python3 -m pip install --quiet "ray[default]==2.56.0"
+      - name: Running GSM8K SFT on 4 TPU v6e chips (examples/tpu/sft/run_qwen3_0_6b_torchtitan.sh)
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh sft
+      - name: Clean up the RayCluster
+        if: always()
+        run: |
+          bash tests/special_tpu/run_tpu_e2e_ci.sh teardown sft
