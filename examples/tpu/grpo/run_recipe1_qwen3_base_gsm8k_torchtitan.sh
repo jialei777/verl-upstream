@@ -35,7 +35,12 @@ export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
+# --xla_tpu_bf16_emission_mode=PROMOTE_F32: TPU7x defaults to native bf16 emission for
+# transcendental ops (sigmoid/SiLU/GELU), inflating logits error ~5x vs v6e and skewing greedy
+# evals; PROMOTE_F32 compiles these chains exactly like v6e (whose default already behaves this
+# way, so the flag is a no-op there). Measured TPU7x cost: sampler ~-0.4% tok/s, trainer none.
+# Internal XLA flag: keep it pinned alongside the image's libtpu version.
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
 export TORCH_LOGS="${TORCH_LOGS:-recompiles}"
 export TORCH_DYNAMO_RECOMPILE_LIMIT="${TORCH_DYNAMO_RECOMPILE_LIMIT:-64}"
 

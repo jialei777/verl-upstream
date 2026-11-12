@@ -14,8 +14,13 @@ export VLLM_USE_V1=0
 export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 
-# JAX/XLA Launch Barrier Configuration
-export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
+# JAX/XLA Launch Barrier & bf16 Emission Configuration
+# --xla_tpu_bf16_emission_mode=PROMOTE_F32: TPU7x defaults to native bf16 emission for
+# transcendental ops (sigmoid/SiLU/GELU), inflating logits error ~5x vs v6e and skewing greedy
+# evals; PROMOTE_F32 compiles these chains exactly like v6e (whose default already behaves this
+# way, so the flag is a no-op there). Measured TPU7x cost: sampler ~-0.4% tok/s, trainer none.
+# Internal XLA flag: keep it pinned alongside the image's libtpu version.
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
 
 SMOKE_TEST="${SMOKE_TEST:-0}"
 
