@@ -202,6 +202,9 @@ class FakeRolloutWorker:
     def get_model_weights_stats(self) -> dict:
         return self._extension().get_model_weights_stats(self)
 
+    def describe_vllm_params(self) -> dict:
+        return {}
+
     def _checkpoint_tensors(self) -> dict:
         """Every tensor of the HF checkpoint, full (loaded once)."""
         if self._checkpoint is None:
