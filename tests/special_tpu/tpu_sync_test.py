@@ -368,6 +368,7 @@ def create_replicas(sampler_slice: TPUSlice, num_replicas: int, tp_size: int) ->
 
 
 def run_case(trainer_wg, sampler_slice: TPUSlice, num_replicas: int, tp_size: int, release_buffers: bool) -> None:
+    from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_checkpoint_engine import wait_for_tpu_sync_update
     from verl_hardware_plugin.accelerators.tpu.weight_sync.tpu_sync_parity import report_exact_parity
 
     engine_kwargs = {"verify_parity": "all", "release_buffers_after_sync": release_buffers}
@@ -381,6 +382,8 @@ def run_case(trainer_wg, sampler_slice: TPUSlice, num_replicas: int, tp_size: in
         for step in range(NUM_SYNCS):
             # The engine runs its exact check at step 0 and its norm check at every step.
             metrics = manager.update_weights(global_steps=step)
+            if metrics and metrics.get("tpu-sync/returned_after_d2h"):
+                metrics = {**metrics, **asyncio.run(wait_for_tpu_sync_update(manager))}
             assert metrics and metrics["timing_s/tpu-sync/total_sync"] > 0, metrics
             assert all(r.global_steps == step for r in replicas), [r.global_steps for r in replicas]
             # Every sync, every rank of every replica: the received tensors equal the checkpoint slice, bit for bit.
